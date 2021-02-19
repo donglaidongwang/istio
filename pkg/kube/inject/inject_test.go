@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,790 +16,585 @@ package inject
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gogo/protobuf/types"
+	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	meshapi "istio.io/api/mesh/v1alpha1"
-
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/util/sets"
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
-
-	corev1 "k8s.io/api/core/v1"
+	"istio.io/istio/pkg/kube"
 )
 
-const (
-	// This is the hub to expect in
-	// platform/kube/inject/testdata/frontend.yaml.injected and the
-	// other .injected "want" YAMLs
-	unitTestHub = "docker.io/istio"
-
-	// Tag name should be kept in sync with value in
-	// platform/kube/inject/refresh.sh
-	unitTestTag = "unittest"
-
-	statusReplacement = "sidecar.istio.io/status: '{\"version\":\"\","
-)
-
-var (
-	statusPattern = regexp.MustCompile("sidecar.istio.io/status: '{\"version\":\"([0-9a-f]+)\",")
-)
-
-// InitImageName returns the fully qualified image name for the istio
-// init image given a docker hub and tag and debug flag
-// This is used for testing only
-func InitImageName(hub string, tag string) string {
-	return hub + "/proxy_init:" + tag
-}
-
-// ProxyImageName returns the fully qualified image name for the istio
-// proxy image given a docker hub and tag and whether to use debug or not.
-// This is used for testing
-func ProxyImageName(hub string, tag string) string {
-	// Allow overriding the proxy image.
-	return hub + "/proxyv2:" + tag
-}
-
-func TestImageName(t *testing.T) {
-	want := "docker.io/istio/proxy_init:latest"
-	if got := InitImageName("docker.io/istio", "latest"); got != want {
-		t.Errorf("InitImageName() failed: got %q want %q", got, want)
+// TestInjection tests both the mutating webhook and kube-inject. It does this by sharing the same input and output
+// test files and running through the two different code paths.
+func TestInjection(t *testing.T) {
+	type testCase struct {
+		in            string
+		want          string
+		setFlags      []string
+		inFilePath    string
+		mesh          func(m *meshapi.MeshConfig)
+		skipWebhook   bool
+		expectedError string
+		setup         func()
+		teardown      func()
 	}
-	want = "docker.io/istio/proxyv2:latest"
-	if got := ProxyImageName("docker.io/istio", "latest"); got != want {
-		t.Errorf("ProxyImageName() failed: got %q want %q", got, want)
-	}
-}
-
-func TestIntoResourceFile(t *testing.T) {
-	cases := []struct {
-		in                           string
-		want                         string
-		imagePullPolicy              string
-		duration                     time.Duration
-		includeIPRanges              string
-		excludeIPRanges              string
-		includeInboundPorts          string
-		excludeInboundPorts          string
-		kubevirtInterfaces           string
-		statusPort                   int
-		readinessInitialDelaySeconds uint32
-		readinessPeriodSeconds       uint32
-		readinessFailureThreshold    uint32
-		enableAuth                   bool
-		enableCoreDump               bool
-		privileged                   bool
-		tproxy                       bool
-		podDNSSearchNamespaces       []string
-	}{
-		//"testdata/hello.yaml" is tested in http_test.go (with debug)
+	cases := []testCase{
+		// verify cni
 		{
-			in:                           "hello.yaml",
-			want:                         "hello.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		//verifies that the sidecar will not be injected again for an injected yaml
-		{
-			in:                           "hello.yaml.injected",
-			want:                         "hello.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "hello.yaml",
+			want: "hello.yaml.cni.injected",
+			setFlags: []string{
+				"components.cni.enabled=true",
+				"values.istio_cni.chained=true",
+				"values.global.network=network1",
+			},
 		},
 		{
-			in:                           "hello-mtls-not-ready.yaml",
-			want:                         "hello-mtls-not-ready.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "hello.yaml",
+			want: "hello-tproxy.yaml.injected",
+			mesh: func(m *meshapi.MeshConfig) {
+				m.DefaultConfig.InterceptionMode = meshapi.ProxyConfig_TPROXY
+			},
 		},
 		{
-			in:                           "hello-namespace.yaml",
-			want:                         "hello-namespace.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:       "hello.yaml",
+			want:     "hello-always.yaml.injected",
+			setFlags: []string{"values.global.imagePullPolicy=Always"},
 		},
 		{
-			in:                           "hello-proxy-override.yaml",
-			want:                         "hello-proxy-override.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:       "hello.yaml",
+			want:     "hello-never.yaml.injected",
+			setFlags: []string{"values.global.imagePullPolicy=Never"},
 		},
 		{
-			in:     "hello.yaml",
-			want:   "hello-tproxy.yaml.injected",
-			tproxy: true,
+			in:       "enable-core-dump.yaml",
+			want:     "enable-core-dump.yaml.injected",
+			setFlags: []string{"values.global.proxy.enableCoreDump=true"},
 		},
 		{
-			in:                           "hello.yaml",
-			want:                         "hello-config-map-name.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "frontend.yaml",
-			want:                         "frontend.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello-service.yaml",
-			want:                         "hello-service.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello-multi.yaml",
-			want:                         "hello-multi.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello.yaml",
-			want:                         "hello-always.yaml.injected",
-			imagePullPolicy:              "Always",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello.yaml",
-			want:                         "hello-never.yaml.injected",
-			imagePullPolicy:              "Never",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello-ignore.yaml",
-			want:                         "hello-ignore.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "multi-init.yaml",
-			want:                         "multi-init.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "statefulset.yaml",
-			want:                         "statefulset.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "enable-core-dump.yaml",
-			want:                         "enable-core-dump.yaml.injected",
-			enableCoreDump:               true,
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "auth.yaml",
-			want:                         "auth.yaml.injected",
-			enableAuth:                   true,
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "auth.non-default-service-account.yaml",
-			want:                         "auth.non-default-service-account.yaml.injected",
-			enableAuth:                   true,
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "auth.yaml",
-			want:                         "auth.cert-dir.yaml.injected",
-			enableAuth:                   true,
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "daemonset.yaml",
-			want:                         "daemonset.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "job.yaml",
-			want:                         "job.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "replicaset.yaml",
-			want:                         "replicaset.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "replicationcontroller.yaml",
-			want:                         "replicationcontroller.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "cronjob.yaml",
-			want:                         "cronjob.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "pod.yaml",
-			want:                         "pod.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "hello-host-network.yaml",
-			want:                         "hello-host-network.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "list.yaml",
-			want:                         "list.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "list-frontend.yaml",
-			want:                         "list-frontend.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "deploymentconfig.yaml",
-			want:                         "deploymentconfig.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "deploymentconfig-multi.yaml",
-			want:                         "deploymentconfig-multi.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			in:                           "format-duration.yaml",
-			want:                         "format-duration.yaml.injected",
-			duration:                     42 * time.Second,
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "format-duration.yaml",
+			want: "format-duration.yaml.injected",
+			mesh: func(m *meshapi.MeshConfig) {
+				m.DefaultConfig.DrainDuration = types.DurationProto(time.Second * 23)
+				m.DefaultConfig.ParentShutdownDuration = types.DurationProto(time.Second * 42)
+			},
 		},
 		{
 			// Verifies that parameters are applied properly when no annotations are provided.
-			in:                  "traffic-params.yaml",
-			want:                "traffic-params.yaml.injected",
-			includeIPRanges:     "127.0.0.1/24,10.96.0.1/24",
-			excludeIPRanges:     "10.96.0.2/24,10.96.0.3/24",
-			includeInboundPorts: "1,2,3",
-			excludeInboundPorts: "4,5,6",
-			statusPort:          0,
-		},
-		{
-			// Verifies that empty include lists are applied properly from parameters.
-			in:                           "traffic-params-empty-includes.yaml",
-			want:                         "traffic-params-empty-includes.yaml.injected",
-			includeIPRanges:              "",
-			excludeIPRanges:              "",
-			kubevirtInterfaces:           "",
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			// Verifies that annotation values are applied properly. This also tests that annotation values
-			// override params when specified.
-			in:                           "traffic-annotations.yaml",
-			want:                         "traffic-annotations.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			// Verifies that the wildcard character "*" behaves properly when used in annotations.
-			in:                           "traffic-annotations-wildcards.yaml",
-			want:                         "traffic-annotations-wildcards.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-		},
-		{
-			// Verifies that the wildcard character "*" behaves properly when used in annotations.
-			in:                           "traffic-annotations-empty-includes.yaml",
-			want:                         "traffic-annotations-empty-includes.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "traffic-params.yaml",
+			want: "traffic-params.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.includeIPRanges=127.0.0.1/24,10.96.0.1/24`,
+				`values.global.proxy.excludeIPRanges=10.96.0.2/24,10.96.0.3/24`,
+				`values.global.proxy.excludeInboundPorts=4,5,6`,
+				`values.global.proxy.statusPort=0`,
+			},
 		},
 		{
 			// Verifies that the status params behave properly.
-			in:                           "status_params.yaml",
-			want:                         "status_params.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			kubevirtInterfaces:           DefaultkubevirtInterfaces,
-			statusPort:                   123,
-			readinessInitialDelaySeconds: 100,
-			readinessPeriodSeconds:       200,
-			readinessFailureThreshold:    300,
-		},
-		{
-			// Verifies that the status annotations override the params.
-			in:                           "status_annotations.yaml",
-			want:                         "status_annotations.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "status_params.yaml",
+			want: "status_params.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.statusPort=123`,
+				`values.global.proxy.readinessInitialDelaySeconds=100`,
+				`values.global.proxy.readinessPeriodSeconds=200`,
+				`values.global.proxy.readinessFailureThreshold=300`,
+			},
 		},
 		{
 			// Verifies that the kubevirtInterfaces list are applied properly from parameters..
-			in:                           "kubevirtInterfaces.yaml",
-			want:                         "kubevirtInterfaces.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			kubevirtInterfaces:           "net1",
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			in:   "kubevirtInterfaces.yaml",
+			want: "kubevirtInterfaces.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.statusPort=123`,
+				`values.global.proxy.readinessInitialDelaySeconds=100`,
+				`values.global.proxy.readinessPeriodSeconds=200`,
+				`values.global.proxy.readinessFailureThreshold=300`,
+			},
 		},
 		{
-			// Verifies that the kubevirtInterfaces list are applied properly from parameters..
-			in:                           "kubevirtInterfaces_list.yaml",
-			want:                         "kubevirtInterfaces_list.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			kubevirtInterfaces:           "net1,net2",
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
+			// Verifies that global.imagePullSecrets are applied properly
+			in:         "hello.yaml",
+			want:       "hello-image-secrets-in-values.yaml.injected",
+			inFilePath: "hello-image-secrets-in-values.iop.yaml",
+		},
+		{
+			// Verifies that global.imagePullSecrets are appended properly
+			in:         "hello-image-pull-secret.yaml",
+			want:       "hello-multiple-image-secrets.yaml.injected",
+			inFilePath: "hello-image-secrets-in-values.iop.yaml",
 		},
 		{
 			// Verifies that global.podDNSSearchNamespaces are applied properly
-			in:                           "hello.yaml",
-			want:                         "hello-template-in-values.yaml.injected",
-			includeIPRanges:              DefaultIncludeIPRanges,
-			includeInboundPorts:          DefaultIncludeInboundPorts,
-			kubevirtInterfaces:           "net1,net2",
-			statusPort:                   DefaultStatusPort,
-			readinessInitialDelaySeconds: DefaultReadinessInitialDelaySeconds,
-			readinessPeriodSeconds:       DefaultReadinessPeriodSeconds,
-			readinessFailureThreshold:    DefaultReadinessFailureThreshold,
-			podDNSSearchNamespaces: []string{
-				"global",
-				"{{ valueOrDefault .DeploymentMeta.Namespace \"default\" }}.global",
+			in:         "hello.yaml",
+			want:       "hello-template-in-values.yaml.injected",
+			inFilePath: "hello-template-in-values.iop.yaml",
+		},
+		{
+			// Verifies that global.mountMtlsCerts is applied properly
+			in:       "hello.yaml",
+			want:     "hello-mount-mtls-certs.yaml.injected",
+			setFlags: []string{`values.global.mountMtlsCerts=true`},
+		},
+		{
+			// Verifies that k8s.v1.cni.cncf.io/networks is set to istio-cni when not chained
+			in:   "hello.yaml",
+			want: "hello-cncf-networks.yaml.injected",
+			setFlags: []string{
+				`components.cni.enabled=true`,
+				`values.istio_cni.chained=false`,
 			},
 		},
+		{
+			// Verifies that istio-cni is appended to k8s.v1.cni.cncf.io/networks flat value if set
+			in:   "hello-existing-cncf-networks.yaml",
+			want: "hello-existing-cncf-networks.yaml.injected",
+			setFlags: []string{
+				`components.cni.enabled=true`,
+				`values.istio_cni.chained=false`,
+			},
+		},
+		{
+			// Verifies that istio-cni is appended to k8s.v1.cni.cncf.io/networks JSON value
+			in:   "hello-existing-cncf-networks-json.yaml",
+			want: "hello-existing-cncf-networks-json.yaml.injected",
+			setFlags: []string{
+				`components.cni.enabled=true`,
+				`values.istio_cni.chained=false`,
+			},
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts in MeshConfig puts sidecar in front
+			in:   "hello.yaml",
+			want: "hello.proxyHoldsApplication.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
+			},
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts in MeshConfig puts sidecar in front
+			in:   "hello-probes.yaml",
+			want: "hello-probes.proxyHoldsApplication.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
+			},
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts in proxyconfig sets lifecycle hook
+			in:   "hello-probes-proxyHoldApplication-ProxyConfig.yaml",
+			want: "hello-probes-proxyHoldApplication-ProxyConfig.yaml.injected",
+		},
+		{
+			// Verifies that HoldApplicationUntilProxyStarts=false in proxyconfig 'OR's with MeshConfig setting
+			in:   "hello-probes-noProxyHoldApplication-ProxyConfig.yaml",
+			want: "hello-probes-noProxyHoldApplication-ProxyConfig.yaml.injected",
+			setFlags: []string{
+				`values.global.proxy.holdApplicationUntilProxyStarts=true`,
+			},
+		},
+		{
+			// A test with no pods is not relevant for webhook
+			in:          "hello-service.yaml",
+			want:        "hello-service.yaml.injected",
+			skipWebhook: true,
+		},
+		{
+			// Cronjob is tricky for webhook test since the spec is different. Since the real code will
+			// get a pod anyways, the test isn't too useful for webhook anyways.
+			in:          "cronjob.yaml",
+			want:        "cronjob.yaml.injected",
+			skipWebhook: true,
+		},
+		{
+			in:            "traffic-annotations-bad-includeipranges.yaml",
+			expectedError: "includeipranges",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeipranges.yaml",
+			expectedError: "excludeipranges",
+		},
+		{
+			in:            "traffic-annotations-bad-includeinboundports.yaml",
+			expectedError: "includeinboundports",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeinboundports.yaml",
+			expectedError: "excludeinboundports",
+		},
+		{
+			in:            "traffic-annotations-bad-excludeoutboundports.yaml",
+			expectedError: "excludeoutboundports",
+		},
+		{
+			in:   "hello.yaml",
+			want: "hello-no-seccontext.yaml.injected",
+			setup: func() {
+				features.EnableLegacyFSGroupInjection = false
+				os.Setenv("ENABLE_LEGACY_FSGROUP_INJECTION", "false")
+			},
+			teardown: func() {
+				features.EnableLegacyFSGroupInjection = true
+				os.Setenv("ENABLE_LEGACY_FSGROUP_INJECTION", "true")
+			},
+		},
+		{
+			in:   "proxy-override.yaml",
+			want: "proxy-override.yaml.injected",
+		},
+		{
+			in:   "explicit-security-context.yaml",
+			want: "explicit-security-context.yaml.injected",
+		},
+		{
+			in:   "only-proxy-container.yaml",
+			want: "only-proxy-container.yaml.injected",
+		},
+		{
+			in:   "proxy-override-args.yaml",
+			want: "proxy-override-args.yaml.injected",
+		},
+		{
+			in:         "custom-template.yaml",
+			want:       "custom-template.yaml.injected",
+			inFilePath: "custom-template.iop.yaml",
+		},
+	}
+	// Keep track of tests we add options above
+	// We will search for all test files and skip these ones
+	alreadyTested := sets.NewSet()
+	for _, t := range cases {
+		if t.want != "" {
+			alreadyTested.Insert(t.want)
+		} else {
+			alreadyTested.Insert(t.in + ".injected")
+		}
+	}
+	files, err := ioutil.ReadDir("testdata/inject")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) < 3 {
+		t.Fatalf("Didn't find test files - something must have gone wrong")
+	}
+	// Automatically add any other test files in the folder. This ensures we don't
+	// forget to add to this list, that we don't have duplicates, etc
+	// Keep track of all golden files so we can ensure we don't have unused ones later
+	allOutputFiles := sets.NewSet()
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".injected") {
+			allOutputFiles.Insert(f.Name())
+		}
+		if strings.HasSuffix(f.Name(), ".iop.yaml") {
+			continue
+		}
+		if !strings.HasSuffix(f.Name(), ".yaml") {
+			continue
+		}
+		want := f.Name() + ".injected"
+		if alreadyTested.Contains(want) {
+			continue
+		}
+		cases = append(cases, testCase{in: f.Name(), want: want})
 	}
 
+	// Preload default settings. Computation here is expensive, so this speeds the tests up substantially
+	defaultTemplate, defaultValues, defaultMesh := loadInjectionSettings(t, nil, "")
 	for i, c := range cases {
+		c := c
 		testName := fmt.Sprintf("[%02d] %s", i, c.want)
+		if c.expectedError != "" {
+			testName = fmt.Sprintf("[%02d] %s", i, c.in)
+		}
 		t.Run(testName, func(t *testing.T) {
-			m := mesh.DefaultMeshConfig()
-			if c.duration != 0 {
-				m.DefaultConfig.DrainDuration = types.DurationProto(c.duration)
-				m.DefaultConfig.ParentShutdownDuration = types.DurationProto(c.duration)
-				m.DefaultConfig.ConnectTimeout = types.DurationProto(c.duration)
-			}
-			if c.tproxy {
-				m.DefaultConfig.InterceptionMode = meshapi.ProxyConfig_TPROXY
+			if c.setup != nil {
+				c.setup()
 			} else {
-				m.DefaultConfig.InterceptionMode = meshapi.ProxyConfig_REDIRECT
+				// Tests with custom setup modify global state and cannot run in parallel
+				t.Parallel()
+			}
+			if c.teardown != nil {
+				t.Cleanup(c.teardown)
 			}
 
-			params := &Params{
-				InitImage:                    InitImageName(unitTestHub, unitTestTag),
-				ProxyImage:                   ProxyImageName(unitTestHub, unitTestTag),
-				ImagePullPolicy:              "IfNotPresent",
-				SDSEnabled:                   false,
-				Verbosity:                    DefaultVerbosity,
-				SidecarProxyUID:              DefaultSidecarProxyUID,
-				Version:                      "12345678",
-				EnableCoreDump:               c.enableCoreDump,
-				Privileged:                   c.privileged,
-				Mesh:                         &m,
-				IncludeIPRanges:              c.includeIPRanges,
-				ExcludeIPRanges:              c.excludeIPRanges,
-				IncludeInboundPorts:          c.includeInboundPorts,
-				ExcludeInboundPorts:          c.excludeInboundPorts,
-				KubevirtInterfaces:           c.kubevirtInterfaces,
-				StatusPort:                   c.statusPort,
-				ReadinessInitialDelaySeconds: c.readinessInitialDelaySeconds,
-				ReadinessPeriodSeconds:       c.readinessPeriodSeconds,
-				ReadinessFailureThreshold:    c.readinessFailureThreshold,
-				RewriteAppHTTPProbe:          false,
-				PodDNSSearchNamespaces:       c.podDNSSearchNamespaces,
+			mc, err := mesh.DeepCopyMeshConfig(defaultMesh)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if c.imagePullPolicy != "" {
-				params.ImagePullPolicy = c.imagePullPolicy
+			sidecarTemplate, valuesConfig := defaultTemplate, defaultValues
+			if c.setFlags != nil || c.inFilePath != "" {
+				sidecarTemplate, valuesConfig, mc = loadInjectionSettings(t, c.setFlags, c.inFilePath)
 			}
-			sidecarTemplate := loadSidecarTemplate(t)
-			valuesConfig := getValues(params, t)
+			if c.mesh != nil {
+				c.mesh(mc)
+			}
+
 			inputFilePath := "testdata/inject/" + c.in
 			wantFilePath := "testdata/inject/" + c.want
 			in, err := os.Open(inputFilePath)
 			if err != nil {
 				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
 			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate, valuesConfig, &m, in, &got); err != nil {
-				t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
+			t.Cleanup(func() {
+				_ = in.Close()
+			})
+
+			// First we test kube-inject. This will run exactly what kube-inject does, and write output to the golden files
+			t.Run("kube-inject", func(t *testing.T) {
+				var got bytes.Buffer
+				warn := func(s string) {
+					t.Log(s)
+				}
+				if err = IntoResourceFile(sidecarTemplate.Templates, valuesConfig, "", mc, in, &got, warn); err != nil {
+					if c.expectedError != "" {
+						if !strings.Contains(strings.ToLower(err.Error()), c.expectedError) {
+							t.Fatalf("expected error %q got %q", c.expectedError, err)
+						}
+						return
+					}
+					t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
+				}
+				if c.expectedError != "" {
+					t.Fatalf("expected error but got none")
+				}
+
+				// The version string is a maintenance pain for this test. Strip the version string before comparing.
+				gotBytes := util.StripVersion(got.Bytes())
+				wantBytes := util.ReadGoldenFile(gotBytes, wantFilePath, t)
+
+				util.CompareBytes(gotBytes, wantBytes, wantFilePath, t)
+			})
+
+			// Exit early if we don't need to test webhook. We can skip errors since its redundant
+			// and painful to test here.
+			if c.expectedError != "" || c.skipWebhook {
+				return
 			}
-
-			// The version string is a maintenance pain for this test. Strip the version string before comparing.
-			gotBytes := got.Bytes()
-			wantedBytes := util.ReadGoldenFile(gotBytes, wantFilePath, t)
-
-			wantBytes := stripVersion(wantedBytes)
-			gotBytes = stripVersion(gotBytes)
-
-			util.CompareBytes(gotBytes, wantBytes, wantFilePath, t)
-
-			if util.Refresh() {
-				util.RefreshGoldenFile(gotBytes, wantFilePath, t)
-			}
+			// Next run the webhook test. This one is a bit trickier as the webhook operates
+			// on Pods, but the inputs are Deployments/StatefulSets/etc. As a result, we need
+			// to convert these to pods, then run the injection This test will *not*
+			// overwrite golden files, as we do not have identical textual output as
+			// kube-inject. Instead, we just compare the desired/actual pod specs.
+			t.Run("webhook", func(t *testing.T) {
+				webhook := &Webhook{
+					Config:       sidecarTemplate,
+					meshConfig:   mc,
+					valuesConfig: valuesConfig,
+					revision:     "default",
+				}
+				// Split multi-part yaml documents. Input and output will have the same number of parts.
+				inputYAMLs := splitYamlFile(inputFilePath, t)
+				wantYAMLs := splitYamlFile(wantFilePath, t)
+				for i := 0; i < len(inputYAMLs); i++ {
+					t.Run(fmt.Sprintf("yamlPart[%d]", i), func(t *testing.T) {
+						runWebhook(t, webhook, inputYAMLs[i], wantYAMLs[i], false)
+						t.Run("idempotency", func(t *testing.T) {
+							runWebhook(t, webhook, wantYAMLs[i], wantYAMLs[i], true)
+						})
+					})
+				}
+			})
 		})
 	}
-}
 
-// TestRewriteAppProbe tests the feature for pilot agent to take over app health check traffic.
-func TestRewriteAppProbe(t *testing.T) {
-	cases := []struct {
-		in                  string
-		rewriteAppHTTPProbe bool
-		want                string
-	}{
-		{
-			in:                  "hello-probes.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-probes.yaml.injected",
-		},
-		{
-			in:                  "hello-readiness.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-readiness.yaml.injected",
-		},
-		{
-			in:                  "named_port.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "named_port.yaml.injected",
-		},
-		{
-			in:                  "one_container.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "one_container.yaml.injected",
-		},
-		{
-			in:                  "two_container.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "two_container.yaml.injected",
-		},
-		{
-			in:                  "ready_only.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "ready_only.yaml.injected",
-		},
-		{
-			in:                  "https-probes.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "https-probes.yaml.injected",
-		},
-		{
-			in:                  "hello-probes-with-flag-set-in-annotation.yaml",
-			rewriteAppHTTPProbe: false,
-			want:                "hello-probes-with-flag-set-in-annotation.yaml.injected",
-		},
-		{
-			in:                  "hello-probes-with-flag-unset-in-annotation.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "hello-probes-with-flag-unset-in-annotation.yaml.injected",
-		},
-		{
-			in:                  "ready_live.yaml",
-			rewriteAppHTTPProbe: true,
-			want:                "ready_live.yaml.injected",
-		},
-		// TODO(incfly): add more test case covering different -statusPort=123, --statusPort=123
-		// No statusport, --statusPort 123.
-	}
-
-	for i, c := range cases {
-		testName := fmt.Sprintf("[%02d] %s", i, c.want)
-		t.Run(testName, func(t *testing.T) {
-			m := mesh.DefaultMeshConfig()
-			params := &Params{
-				InitImage:                    InitImageName(unitTestHub, unitTestTag),
-				ProxyImage:                   ProxyImageName(unitTestHub, unitTestTag),
-				ImagePullPolicy:              "IfNotPresent",
-				SidecarProxyUID:              DefaultSidecarProxyUID,
-				Version:                      "12345678",
-				StatusPort:                   DefaultStatusPort,
-				ReadinessInitialDelaySeconds: DefaultReadinessPeriodSeconds,
-				ReadinessPeriodSeconds:       DefaultReadinessFailureThreshold,
-				ReadinessFailureThreshold:    DefaultReadinessFailureThreshold,
-				RewriteAppHTTPProbe:          c.rewriteAppHTTPProbe,
-			}
-			sidecarTemplate := loadSidecarTemplate(t)
-			valuesConfig := getValues(params, t)
-			inputFilePath := "testdata/inject/app_probe/" + c.in
-			wantFilePath := "testdata/inject/app_probe/" + c.want
-			in, err := os.Open(inputFilePath)
-			if err != nil {
-				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
-			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate, valuesConfig, &m, in, &got); err != nil {
-				t.Fatalf("IntoResourceFile(%v) returned an error: %v", inputFilePath, err)
-			}
-
-			// The version string is a maintenance pain for this test. Strip the version string before comparing.
-			gotBytes := got.Bytes()
-			wantedBytes := util.ReadGoldenFile(gotBytes, wantFilePath, t)
-
-			wantBytes := stripVersion(wantedBytes)
-			gotBytes = stripVersion(gotBytes)
-
-			util.CompareBytes(gotBytes, wantBytes, wantFilePath, t)
-		})
-	}
-}
-
-func stripVersion(yaml []byte) []byte {
-	return statusPattern.ReplaceAllLiteral(yaml, []byte(statusReplacement))
-}
-
-func TestInvalidParams(t *testing.T) {
-	cases := []struct {
-		annotation    string
-		paramModifier func(p *Params)
-	}{
-		{
-			annotation: "includeipranges",
-			paramModifier: func(p *Params) {
-				p.IncludeIPRanges = "bad"
-			},
-		},
-		{
-			annotation: "excludeipranges",
-			paramModifier: func(p *Params) {
-				p.ExcludeIPRanges = "*"
-			},
-		},
-		{
-			annotation: "includeinboundports",
-			paramModifier: func(p *Params) {
-				p.IncludeInboundPorts = "bad"
-			},
-		},
-		{
-			annotation: "excludeinboundports",
-			paramModifier: func(p *Params) {
-				p.ExcludeInboundPorts = "*"
-			},
-		},
-	}
-
+	// Make sure we don't have any stale test data leftover, as it can cause confusion.
 	for _, c := range cases {
-		t.Run(c.annotation, func(t *testing.T) {
-			params := newTestParams()
-			c.paramModifier(params)
-
-			if err := params.Validate(); err == nil {
-				t.Fatalf("expected error")
-			} else if !strings.Contains(strings.ToLower(err.Error()), c.annotation) {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
+		delete(allOutputFiles, c.want)
+	}
+	if len(allOutputFiles) != 0 {
+		t.Fatalf("stale golden files found: %v", allOutputFiles.UnsortedList())
 	}
 }
 
-func TestInvalidAnnotations(t *testing.T) {
-	cases := []struct {
-		annotation string
-		in         string
-	}{
-		{
-			annotation: "includeipranges",
-			in:         "traffic-annotations-bad-includeipranges.yaml",
+func testInjectionTemplate(t *testing.T, template, input, expected string) {
+	t.Helper()
+	webhook := &Webhook{
+		Config: &Config{
+			Templates:        map[string]string{SidecarTemplateName: template},
+			Policy:           InjectionPolicyEnabled,
+			DefaultTemplates: []string{SidecarTemplateName},
 		},
-		{
-			annotation: "excludeipranges",
-			in:         "traffic-annotations-bad-excludeipranges.yaml",
-		},
-		{
-			annotation: "includeinboundports",
-			in:         "traffic-annotations-bad-includeinboundports.yaml",
-		},
-		{
-			annotation: "excludeinboundports",
-			in:         "traffic-annotations-bad-excludeinboundports.yaml",
-		},
-		{
-			annotation: "excludeoutboundports",
-			in:         "traffic-annotations-bad-excludeoutboundports.yaml",
+	}
+	runWebhook(t, webhook, []byte(input), []byte(expected), false)
+}
+
+func TestMultipleInjectionTemplates(t *testing.T) {
+	webhook := &Webhook{
+		Config: &Config{
+			Templates: map[string]string{
+				"sidecar": `
+spec:
+  containers:
+  - name: istio-proxy
+    image: proxy
+`,
+				"init": `
+spec:
+ initContainers:
+ - name: istio-init
+   image: proxy
+`,
+			},
+			Aliases: map[string][]string{"both": {"sidecar", "init"}},
+			Policy:  InjectionPolicyEnabled,
 		},
 	}
 
-	for _, c := range cases {
-		t.Run(c.annotation, func(t *testing.T) {
-			params := newTestParams()
-			sidecarTemplate := loadSidecarTemplate(t)
-			valuesConfig := getValues(params, t)
-			inputFilePath := "testdata/inject/" + c.in
-			in, err := os.Open(inputFilePath)
-			if err != nil {
-				t.Fatalf("Failed to open %q: %v", inputFilePath, err)
-			}
-			defer func() { _ = in.Close() }()
-			var got bytes.Buffer
-			if err = IntoResourceFile(sidecarTemplate, valuesConfig, params.Mesh, in, &got); err == nil {
-				t.Fatalf("expected error")
-			} else if !strings.Contains(strings.ToLower(err.Error()), c.annotation) {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
+	input := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  annotations:
+    inject.istio.io/templates: sidecar,init
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`
+	inputAlias := `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  annotations:
+    inject.istio.io/templates: both
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`
+	// nolint: lll
+	expected := `
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    inject.istio.io/templates: %s
+    prometheus.io/path: /stats/prometheus
+    prometheus.io/port: "0"
+    prometheus.io/scrape: "true"
+    sidecar.istio.io/status: '{"version":"","initContainers":["istio-init"],"containers":["istio-proxy"],"volumes":["istio-envoy","istio-data","istio-podinfo","istio-token","istiod-ca-cert"],"imagePullSecrets":null}'
+  name: hello
+spec:
+  initContainers:
+  - name: istio-init
+    image: proxy
+  containers:
+    - name: hello
+      image: fake.docker.io/google-samples/hello-go-gke:1.0
+    - name: istio-proxy
+      image: proxy
+`
+	runWebhook(t, webhook, []byte(input), []byte(fmt.Sprintf(expected, "sidecar,init")), false)
+	runWebhook(t, webhook, []byte(inputAlias), []byte(fmt.Sprintf(expected, "both")), false)
+}
+
+// TestStrategicMerge ensures we can use https://github.com/kubernetes/community/blob/master/contributors/devel/sig-api-machinery/strategic-merge-patch.md
+// directives in the injection template
+func TestStrategicMerge(t *testing.T) {
+	testInjectionTemplate(t,
+		`
+metadata:
+  labels:
+    $patch: replace
+    foo: bar
+spec:
+  containers:
+  - name: injected
+    image: "fake.docker.io/google-samples/hello-go-gke:1.1"
+`,
+		`
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+  labels:
+    key: value
+spec:
+  containers:
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`,
+
+		// We expect resources to only have limits, since we had the "replace" directive.
+		// nolint: lll
+		`
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    prometheus.io/path: /stats/prometheus
+    prometheus.io/port: "0"
+    prometheus.io/scrape: "true"
+  labels:
+    foo: bar
+  name: hello
+spec:
+  containers:
+  - name: injected
+    image: "fake.docker.io/google-samples/hello-go-gke:1.1"
+  - name: hello
+    image: "fake.docker.io/google-samples/hello-go-gke:1.0"
+`)
+}
+
+func runWebhook(t *testing.T, webhook *Webhook, inputYAML []byte, wantYAML []byte, ignoreIstioMetaJSONAnnotationsEnv bool) {
+	// Convert the input YAML to a deployment.
+	inputRaw, err := FromRawToObject(inputYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputPod := objectToPod(t, inputRaw)
+
+	// Convert the wanted YAML to a deployment.
+	wantRaw, err := FromRawToObject(wantYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPod := objectToPod(t, wantRaw)
+
+	// Generate the patch.  At runtime, the webhook would actually generate the patch against the
+	// pod configuration. But since our input files are deployments, rather than actual pod instances,
+	// we have to apply the patch to the template portion of the deployment only.
+	templateJSON := convertToJSON(inputPod, t)
+	got := webhook.inject(&kube.AdmissionReview{
+		Request: &kube.AdmissionRequest{
+			Object: runtime.RawExtension{
+				Raw: templateJSON,
+			},
+			Namespace: jsonToUnstructured(inputYAML, t).GetNamespace(),
+		},
+	}, "")
+	var gotPod *corev1.Pod
+	// Apply the generated patch to the template.
+	if got.Patch != nil {
+		patchedPod := &corev1.Pod{}
+		patch := prettyJSON(got.Patch, t)
+		patchedTemplateJSON := applyJSONPatch(templateJSON, patch, t)
+		if err := json.Unmarshal(patchedTemplateJSON, patchedPod); err != nil {
+			t.Fatal(err)
+		}
+		gotPod = patchedPod
+	} else {
+		gotPod = inputPod
+	}
+
+	if err := normalizeAndCompareDeployments(gotPod, wantPod, ignoreIstioMetaJSONAnnotationsEnv, t); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -883,22 +678,135 @@ func TestSkipUDPPorts(t *testing.T) {
 	}
 }
 
-func newTestParams() *Params {
-	m := mesh.DefaultMeshConfig()
-	return &Params{
-		InitImage:           InitImageName(unitTestHub, unitTestTag),
-		ProxyImage:          ProxyImageName(unitTestHub, unitTestTag),
-		ImagePullPolicy:     "IfNotPresent",
-		SDSEnabled:          false,
-		Verbosity:           DefaultVerbosity,
-		SidecarProxyUID:     DefaultSidecarProxyUID,
-		Version:             "12345678",
-		EnableCoreDump:      false,
-		Mesh:                &m,
-		DebugMode:           false,
-		IncludeIPRanges:     DefaultIncludeIPRanges,
-		ExcludeIPRanges:     "",
-		IncludeInboundPorts: DefaultIncludeInboundPorts,
-		ExcludeInboundPorts: "",
+func TestCleanProxyConfig(t *testing.T) {
+	overrides := mesh.DefaultProxyConfig()
+	overrides.ConfigPath = "/foo/bar"
+	overrides.DrainDuration = types.DurationProto(7 * time.Second)
+	overrides.ProxyMetadata = map[string]string{
+		"foo": "barr",
+	}
+	explicit := mesh.DefaultProxyConfig()
+	explicit.ConfigPath = constants.ConfigPathDir
+	explicit.DrainDuration = types.DurationProto(45 * time.Second)
+	cases := []struct {
+		name   string
+		proxy  meshapi.ProxyConfig
+		expect string
+	}{
+		{
+			"default",
+			mesh.DefaultProxyConfig(),
+			`{}`,
+		},
+		{
+			"explicit default",
+			explicit,
+			`{}`,
+		},
+		{
+			"overrides",
+			overrides,
+			`{"configPath":"/foo/bar","drainDuration":"7s","proxyMetadata":{"foo":"barr"}}`,
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := protoToJSON(&tt.proxy)
+			if got != tt.expect {
+				t.Fatalf("incorrect output: got %v, expected %v", got, tt.expect)
+			}
+			roundTrip, err := mesh.ApplyProxyConfig(got, mesh.DefaultMeshConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cmp.Equal(*roundTrip.GetDefaultConfig(), tt.proxy) {
+				t.Fatalf("round trip is not identical: got \n%+v, expected \n%+v", *roundTrip.GetDefaultConfig(), tt.proxy)
+			}
+		})
+	}
+}
+
+func TestAppendMultusNetwork(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "empty",
+			in:   "",
+			want: "istio-cni",
+		},
+		{
+			name: "flat-single",
+			in:   "macvlan-conf-1",
+			want: "macvlan-conf-1, istio-cni",
+		},
+		{
+			name: "flat-multiple",
+			in:   "macvlan-conf-1, macvlan-conf-2",
+			want: "macvlan-conf-1, macvlan-conf-2, istio-cni",
+		},
+		{
+			name: "json-single",
+			in:   `[{"name": "macvlan-conf-1"}]`,
+			want: `[{"name": "macvlan-conf-1"}, {"name": "istio-cni"}]`,
+		},
+		{
+			name: "json-multiple",
+			in:   `[{"name": "macvlan-conf-1"}, {"name": "macvlan-conf-2"}]`,
+			want: `[{"name": "macvlan-conf-1"}, {"name": "macvlan-conf-2"}, {"name": "istio-cni"}]`,
+		},
+		{
+			name: "json-multiline",
+			in: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"}
+                   ]`,
+			want: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"}
+                   , {"name": "istio-cni"}]`,
+		},
+		{
+			name: "json-multiline-additional-fields",
+			in: `[
+                   {"name": "macvlan-conf-1", "another-field": "another-value"},
+                   {"name": "macvlan-conf-2"}
+                   ]`,
+			want: `[
+                   {"name": "macvlan-conf-1", "another-field": "another-value"},
+                   {"name": "macvlan-conf-2"}
+                   , {"name": "istio-cni"}]`,
+		},
+		{
+			name: "json-preconfigured-istio-cni",
+			in: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"},
+                   {"name": "istio-cni", "config": "additional-config"},
+                   ]`,
+			want: `[
+                   {"name": "macvlan-conf-1"},
+                   {"name": "macvlan-conf-2"},
+                   {"name": "istio-cni", "config": "additional-config"},
+                   ]`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			actual := appendMultusNetwork(tc.in, "istio-cni")
+			if actual != tc.want {
+				t.Fatalf("Unexpected result.\nExpected:\n%v\nActual:\n%v", tc.want, actual)
+			}
+			t.Run("idempotency", func(t *testing.T) {
+				actual := appendMultusNetwork(actual, "istio-cni")
+				if actual != tc.want {
+					t.Fatalf("Function is not idempotent.\nExpected:\n%v\nActual:\n%v", tc.want, actual)
+				}
+			})
+		})
 	}
 }

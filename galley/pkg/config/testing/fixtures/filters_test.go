@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,23 +19,23 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/resource"
 	"istio.io/istio/galley/pkg/config/testing/data"
 	"istio.io/istio/galley/pkg/config/testing/fixtures"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/resource"
 )
 
 func TestNoVersions(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	events := []event.Event{data.Event1Col1AddItem1}
-	g.Expect(events[0].Entry.Metadata.Version).NotTo(Equal(resource.Version("")))
+	g.Expect(events[0].Resource.Metadata.Version).NotTo(Equal(resource.Version("")))
 	events = fixtures.NoVersions(events)
-	g.Expect(events[0].Entry.Metadata.Version).To(Equal(resource.Version("")))
+	g.Expect(events[0].Resource.Metadata.Version).To(Equal(resource.Version("")))
 }
 
 func TestNoFullSync(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	events := []event.Event{data.Event1Col1AddItem1, data.Event1Col1Synced, data.Event2Col1AddItem2}
 	events = fixtures.NoFullSync(events)
@@ -45,7 +45,7 @@ func TestNoFullSync(t *testing.T) {
 }
 
 func TestSort(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	events := []event.Event{data.Event2Col1AddItem2, data.Event1Col1Synced, data.Event1Col1AddItem1}
 	events = fixtures.Sort(events)
@@ -55,7 +55,7 @@ func TestSort(t *testing.T) {
 }
 
 func TestChain(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	events := []event.Event{data.Event2Col1AddItem2, data.Event1Col1Synced, data.Event1Col1AddItem1}
 	fn := fixtures.Chain(fixtures.Sort, fixtures.NoFullSync, fixtures.NoVersions)
@@ -65,8 +65,8 @@ func TestChain(t *testing.T) {
 		data.Event1Col1AddItem1.Clone(),
 		data.Event2Col1AddItem2.Clone(),
 	}
-	expected[0].Entry.Metadata.Version = resource.Version("")
-	expected[1].Entry.Metadata.Version = resource.Version("")
+	expected[0].Resource.Metadata.Version = resource.Version("")
+	expected[1].Resource.Metadata.Version = resource.Version("")
 
 	g.Expect(events).To(Equal(expected))
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,84 +15,14 @@
 package kubeyaml
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
 )
-
-var splitCases = []struct {
-	merged string
-	split  []string
-}{
-	{
-		merged: "",
-		split:  nil,
-	},
-	{
-		merged: `yaml: foo`,
-		split: []string{
-			`yaml: foo`,
-		},
-	},
-	{
-		merged: `
-yaml: foo
----
-bar: boo
-`,
-		split: []string{
-			`
-yaml: foo
-`,
-			`bar: boo
-`,
-		},
-	},
-	{
-		merged: `
-yaml: foo
----
----
-bar: boo
-`,
-		split: []string{
-			`
-yaml: foo
-`,
-			`bar: boo
-`,
-		},
-	},
-}
-
-func TestSplit(t *testing.T) {
-	for i, c := range splitCases {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			g := NewGomegaWithT(t)
-
-			actual := Split([]byte(c.merged))
-
-			var exp [][]byte
-			for _, e := range c.split {
-				exp = append(exp, []byte(e))
-			}
-			g.Expect(actual).To(Equal(exp))
-		})
-	}
-}
-
-func TestSplitString(t *testing.T) {
-	for i, c := range splitCases {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			g := NewGomegaWithT(t)
-
-			actual := SplitString(c.merged)
-
-			g.Expect(actual).To(Equal(c.split))
-		})
-	}
-}
 
 var joinCases = []struct {
 	merged string
@@ -153,7 +83,7 @@ yaml: foo`,
 func TestJoinBytes(t *testing.T) {
 	for i, c := range joinCases {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 
 			var by [][]byte
 			for _, s := range c.split {
@@ -169,11 +99,48 @@ func TestJoinBytes(t *testing.T) {
 func TestJoinString(t *testing.T) {
 	for i, c := range joinCases {
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 
 			actual := JoinString(c.split...)
 
 			g.Expect(actual).To(Equal(c.merged))
+		})
+	}
+}
+
+func TestLineNumber(t *testing.T) {
+	testCases := []struct {
+		input       string
+		lineNumbers []int
+	}{
+		{
+			input:       "foo: bar\n---\nfoo: baz",
+			lineNumbers: []int{1, 3},
+		},
+		{
+			input:       "\n\nfoo: bar\n---\n\n\nfoo: baz",
+			lineNumbers: []int{3, 7},
+		},
+		{
+			input:       "---\n\nfoo: bar\n---\n\n\nfoo: baz",
+			lineNumbers: []int{3, 7},
+		},
+	}
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			g := NewWithT(t)
+
+			reader := bufio.NewReader(strings.NewReader(tc.input))
+			decoder := NewYAMLReader(reader)
+			var expectedLineNumbers []int
+			for {
+				_, line, err := decoder.Read()
+				if err == io.EOF {
+					break
+				}
+				expectedLineNumbers = append(expectedLineNumbers, line)
+			}
+			g.Expect(expectedLineNumbers).To(Equal(tc.lineNumbers))
 		})
 	}
 }

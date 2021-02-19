@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,24 +21,21 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 	"time"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/gogo/protobuf/types"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pkg/bootstrap"
 	"istio.io/pkg/env"
 	"istio.io/pkg/log"
-
-	"istio.io/istio/pkg/bootstrap"
 )
 
 const (
 	// epochFileTemplate is a template for the root config JSON
 	epochFileTemplate = "envoy-rev%d.json"
-
-	// drainFile is the location of the bootstrap config used for draining on istio-proxy termination
-	drainFile = "/var/lib/istio/envoy/envoy_bootstrap_drain.json"
 )
 
 type envoy struct {
@@ -52,16 +49,14 @@ type ProxyConfig struct {
 	LogLevel            string
 	ComponentLogLevel   string
 	PilotSubjectAltName []string
-	MixerSubjectAltName []string
 	NodeIPs             []string
-	DNSRefreshRate      string
-	PodName             string
-	PodNamespace        string
-	PodIP               net.IP
-	SDSUDSPath          string
-	SDSTokenPath        string
-	ControlPlaneAuth    bool
-	DisableReportCalls  bool
+	STSPort             int
+	OutlierLogPath      string
+	PilotCertProvider   string
+	ProvCert            string
+	Sidecar             bool
+	ProxyViaAgent       bool
+	LogAsJSON           bool
 }
 
 // NewProxy creates an instance of the proxy control commands
@@ -98,20 +93,40 @@ func (e *envoy) IsLive() bool {
 	return false
 }
 
+func (e *envoy) Drain() error {
+	adminPort := uint32(e.Config.ProxyAdminPort)
+
+	err := DrainListeners(adminPort, e.Sidecar)
+	if err != nil {
+		log.Infof("failed draining listeners for Envoy on port %d: %v", adminPort, err)
+	}
+	return err
+}
+
 func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
 	proxyLocalAddressType := "v4"
 	if isIPv6Proxy(e.NodeIPs) {
 		proxyLocalAddressType = "v6"
 	}
-	startupArgs := []string{"-c", fname,
+	startupArgs := []string{
+		"-c", fname,
 		"--restart-epoch", fmt.Sprint(epoch),
 		"--drain-time-s", fmt.Sprint(int(convertDuration(e.Config.DrainDuration) / time.Second)),
 		"--parent-shutdown-time-s", fmt.Sprint(int(convertDuration(e.Config.ParentShutdownDuration) / time.Second)),
 		"--service-cluster", e.Config.ServiceCluster,
 		"--service-node", e.Node,
-		"--max-obj-name-len", fmt.Sprint(e.Config.StatNameLength),
 		"--local-address-ip-version", proxyLocalAddressType,
-		"--log-format", fmt.Sprintf("[Envoy (Epoch %d)] ", epoch) + "[%Y-%m-%d %T.%e][%t][%l][%n] %v",
+		"--bootstrap-version", "3",
+	}
+	if e.ProxyConfig.LogAsJSON {
+		startupArgs = append(startupArgs,
+			"--log-format",
+			`{"level":"%l","time":"%Y-%m-%dT%T.%fZ","scope":"envoy %n","msg":"%_"}`,
+		)
+	} else {
+		// format is like `2020-04-07T16:52:30.471425Z     info    envoy config   ...message..
+		// this matches Istio log format
+		startupArgs = append(startupArgs, "--log-format", "%Y-%m-%dT%T.%fZ\t%l\tenvoy %n\t%v")
 	}
 
 	startupArgs = append(startupArgs, e.extraArgs...)
@@ -125,8 +140,8 @@ func (e *envoy) args(fname string, epoch int, bootstrapConfig string) []string {
 		}
 	}
 
-	if e.Config.Concurrency > 0 {
-		startupArgs = append(startupArgs, "--concurrency", fmt.Sprint(e.Config.Concurrency))
+	if e.Config.Concurrency.GetValue() > 0 {
+		startupArgs = append(startupArgs, "--concurrency", fmt.Sprint(e.Config.Concurrency.GetValue()))
 	}
 
 	return startupArgs
@@ -139,33 +154,27 @@ func (e *envoy) Run(config interface{}, epoch int, abort <-chan error) error {
 	// Note: the cert checking still works, the generated file is updated if certs are changed.
 	// We just don't save the generated file, but use a custom one instead. Pilot will keep
 	// monitoring the certs and restart if the content of the certs changes.
-	if _, ok := config.(DrainConfig); ok {
-		// We are doing a graceful termination, apply an empty config to drain all connections
-		fname = drainFile
-	} else if len(e.Config.CustomConfigFile) > 0 {
+	if len(e.Config.CustomConfigFile) > 0 {
 		// there is a custom configuration. Don't write our own config - but keep watching the certs.
 		fname = e.Config.CustomConfigFile
 	} else {
+		discHost := strings.Split(e.Config.DiscoveryAddress, ":")[0]
 		out, err := bootstrap.New(bootstrap.Config{
 			Node:                e.Node,
-			DNSRefreshRate:      e.DNSRefreshRate,
 			Proxy:               &e.Config,
 			PilotSubjectAltName: e.PilotSubjectAltName,
-			MixerSubjectAltName: e.MixerSubjectAltName,
 			LocalEnv:            os.Environ(),
 			NodeIPs:             e.NodeIPs,
-			PodName:             e.PodName,
-			PodNamespace:        e.PodNamespace,
-			PodIP:               e.PodIP,
-			SDSUDSPath:          e.SDSUDSPath,
-			SDSTokenPath:        e.SDSTokenPath,
-			ControlPlaneAuth:    e.ControlPlaneAuth,
-			DisableReportCalls:  e.DisableReportCalls,
+			STSPort:             e.STSPort,
+			ProxyViaAgent:       e.ProxyViaAgent,
+			OutlierLogPath:      e.OutlierLogPath,
+			PilotCertProvider:   e.PilotCertProvider,
+			ProvCert:            e.ProvCert,
+			DiscoveryHost:       discHost,
 		}).CreateFileForEpoch(epoch)
 		if err != nil {
-			log.Errora("Failed to generate bootstrap config: ", err)
+			log.Error("Failed to generate bootstrap config: ", err)
 			os.Exit(1) // Prevent infinite loop attempting to write the file, let k8s/systemd report
-			return err
 		}
 		fname = out
 	}
@@ -199,6 +208,10 @@ func (e *envoy) Run(config interface{}, epoch int, abort <-chan error) error {
 }
 
 func (e *envoy) Cleanup(epoch int) {
+	// should return when use the parameter "--templateFile=/path/xxx.tmpl".
+	if e.Config.CustomConfigFile != "" {
+		return
+	}
 	filePath := configFile(e.Config.ConfigPath, epoch)
 	if err := os.Remove(filePath); err != nil {
 		log.Warnf("Failed to delete config file %s for %d, %v", filePath, epoch, err)

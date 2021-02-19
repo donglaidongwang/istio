@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,38 +16,43 @@ package rt
 
 import (
 	"github.com/gogo/protobuf/proto"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"istio.io/istio/galley/pkg/config/meta/schema"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	resource2 "istio.io/istio/pkg/config/schema/resource"
 )
 
-// ToResourceEntry converts the given object and proto to a resource.Entry
-func ToResourceEntry(object metav1.Object, r *schema.KubeResource, item proto.Message) *resource.Entry {
+// ToResource converts the given object and proto to a resource.Instance
+func ToResource(object metav1.Object, schema collection.Schema, item proto.Message, source resource.Reference, fieldMap map[string]int) *resource.Instance {
 	var o *Origin
 
-	name := resource.NewName(object.GetNamespace(), object.GetName())
+	name := resource.NewFullName(resource.Namespace(object.GetNamespace()), resource.LocalName(object.GetName()))
 	version := resource.Version(object.GetResourceVersion())
 
-	if r != nil {
+	var resourceSchema resource2.Schema
+	if schema != nil {
+		resourceSchema = schema.Resource()
 		o = &Origin{
-			Name:       name,
-			Collection: r.Collection.Name,
-			Kind:       r.Kind,
+			FullName:   name,
+			Collection: schema.Name(),
+			Kind:       schema.Resource().Kind(),
 			Version:    version,
+			Ref:        source,
+			FieldsMap:  fieldMap,
 		}
 	}
 
-	return &resource.Entry{
+	return &resource.Instance{
 		Metadata: resource.Metadata{
-			Name:        name,
+			Schema:      resourceSchema,
+			FullName:    name,
 			Version:     version,
 			Annotations: object.GetAnnotations(),
 			Labels:      object.GetLabels(),
 			CreateTime:  object.GetCreationTimestamp().Time,
 		},
-		Item:   item,
-		Origin: o,
+		Message: item,
+		Origin:  o,
 	}
 }

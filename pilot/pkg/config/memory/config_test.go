@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,15 +19,15 @@ import (
 
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/test/mock"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 func TestStoreInvariant(t *testing.T) {
-	store := memory.Make(mock.Types)
+	store := memory.Make(collections.Mocks)
 	mock.CheckMapInvariant(store, t, "some-namespace", 10)
 }
 
 func TestIstioConfig(t *testing.T) {
-	store := memory.Make(schemas.Istio)
+	store := memory.Make(collections.Pilot)
 	mock.CheckIstioConfigTypes(store, "some-namespace", t)
 }

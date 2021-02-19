@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,8 +23,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
 	"istio.io/istio/istioctl/pkg/util/clusters"
 	protio "istio.io/istio/istioctl/pkg/util/proto"
@@ -159,7 +159,6 @@ func (c *ConfigWriter) PrintEndpoints(filter EndpointFilter) error {
 				break
 			}
 		}
-
 	}
 	out, err := json.MarshalIndent(filteredClusters, "", "    ")
 	if err != nil {

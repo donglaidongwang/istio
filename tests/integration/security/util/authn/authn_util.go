@@ -1,4 +1,5 @@
-// Copyright 2019 Istio Authors
+// +build integ
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,52 +17,85 @@ package authn
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/test/echo/common/response"
+	"istio.io/istio/pkg/test/framework"
+	"istio.io/istio/pkg/test/framework/components/echo"
+	"istio.io/istio/pkg/test/framework/components/istio/ingress"
 	"istio.io/istio/tests/integration/security/util/connection"
 )
 
 type TestCase struct {
-	Name                string
-	Request             connection.Checker
-	ExpectAuthenticated bool
+	Name               string
+	Request            connection.Checker
+	ExpectResponseCode string
+	// Use empty value to express the header with such key must not exist.
+	ExpectHeaders map[string]string
 }
 
 func (c *TestCase) String() string {
-	want := "deny"
-	if c.ExpectAuthenticated {
-		want = "allow"
-	}
-	return fmt.Sprintf("%s to %s%s expected %s",
+	return fmt.Sprintf("%s to %s%s expected code %s, headers %v",
 		c.Request.From.Config().Service,
 		c.Request.Options.Target.Config().Service,
 		c.Request.Options.Path,
-		want)
+		c.ExpectResponseCode,
+		c.ExpectHeaders)
 }
 
-// CheckAuthn checks a request based on ExpectAuthenticated (true: resp code 200; false: resp code 401 ).
+// CheckAuthn checks a request based on ExpectResponseCode.
 func (c *TestCase) CheckAuthn() error {
 	results, err := c.Request.From.Call(c.Request.Options)
-	if c.ExpectAuthenticated {
-		if err == nil {
-			err = results.CheckOK()
-		}
-		if err != nil {
-			return fmt.Errorf("%s: got %s", c, err.Error())
-		}
-	} else {
-		if err != nil {
-			return fmt.Errorf("%s: got %s", c, err.Error())
-		}
-		errMsg := ""
-		if len(results) == 0 {
-			errMsg = "no response"
-		}
-		if results[0].Code != "401" {
-			errMsg = fmt.Sprintf("code %s", results[0].Code)
-		}
-		if errMsg != "" {
-			return fmt.Errorf("%s: got %s", c, errMsg)
+	if len(results) == 0 {
+		return fmt.Errorf("%s: no response", c)
+	}
+	if results[0].Code != c.ExpectResponseCode {
+		return fmt.Errorf("%s: got response code %s, err %v", c, results[0].Code, err)
+	}
+	// Checking if echo backend see header with the given value by finding them in response body
+	// (given the current behavior of echo convert all headers into key=value in the response body)
+	for k, v := range c.ExpectHeaders {
+		matcher := fmt.Sprintf("%s=%s", k, v)
+		if len(v) == 0 {
+			if strings.Contains(results[0].Body, matcher) {
+				return fmt.Errorf("%s: expect header %s does not exist, got response\n%s", c, k, results[0].Body)
+			}
+		} else {
+			if !strings.Contains(results[0].Body, matcher) {
+				return fmt.Errorf("%s: expect header %s=%s in body, got response\n%s", c, k, v, results[0].Body)
+			}
 		}
 	}
+	if c.ExpectResponseCode == response.StatusCodeOK && c.Request.DestClusters.IsMulticluster() {
+		return results.CheckReachedClusters(c.Request.DestClusters)
+	}
 	return nil
+}
+
+// CheckIngressOrFail checks a request for the ingress gateway.
+func CheckIngressOrFail(ctx framework.TestContext, ingr ingress.Instance, host string, path string,
+	headers map[string][]string, token string, expectResponseCode int) {
+	if headers == nil {
+		headers = map[string][]string{
+			"Host": {host},
+		}
+	} else {
+		headers["Host"] = []string{host}
+	}
+	opts := echo.CallOptions{
+		Port: &echo.Port{
+			Protocol: protocol.HTTP,
+		},
+		Path:      path,
+		Headers:   headers,
+		Validator: echo.ExpectCode(strconv.Itoa(expectResponseCode)),
+	}
+	if len(token) != 0 {
+		opts.Headers["Authorization"] = []string{
+			fmt.Sprintf("Bearer %s", token),
+		}
+	}
+	ingr.CallEchoWithRetryOrFail(ctx, opts)
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,50 +19,109 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/jsonpb"
 	structpb "github.com/golang/protobuf/ptypes/struct"
 	"github.com/stretchr/testify/assert"
 
-	"istio.io/istio/pkg/config/labels"
-
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pilot/pkg/serviceregistry/mock"
+	"istio.io/istio/pkg/config/host"
 )
 
 func TestNodeMetadata(t *testing.T) {
 	tests := []struct {
 		name  string
-		in    model.NodeMetadata
+		in    model.BootstrapNodeMetadata
 		out   string
-		inOut model.NodeMetadata
+		inOut model.BootstrapNodeMetadata
 	}{
 		{
 			"empty",
-			model.NodeMetadata{},
+			model.BootstrapNodeMetadata{},
 			"{}",
-			model.NodeMetadata{Raw: map[string]interface{}{}},
+			model.BootstrapNodeMetadata{NodeMetadata: model.NodeMetadata{Raw: map[string]interface{}{}}},
 		},
 		{
 			"csvlists",
-			model.NodeMetadata{InstanceIPs: []string{"abc", "1.2.3.4"}},
+			model.BootstrapNodeMetadata{NodeMetadata: model.NodeMetadata{InstanceIPs: []string{"abc", "1.2.3.4"}}},
 			`{"INSTANCE_IPS":"abc,1.2.3.4"}`,
-			model.NodeMetadata{
-				InstanceIPs: []string{"abc", "1.2.3.4"},
-				Raw: map[string]interface{}{
-					"INSTANCE_IPS": "abc,1.2.3.4",
-				}},
+			model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					InstanceIPs: []string{"abc", "1.2.3.4"},
+					Raw: map[string]interface{}{
+						"INSTANCE_IPS": "abc,1.2.3.4",
+					},
+				},
+			},
 		},
 		{
 			"labels",
-			model.NodeMetadata{Labels: map[string]string{"foo": "bar"}},
+			model.BootstrapNodeMetadata{NodeMetadata: model.NodeMetadata{Labels: map[string]string{"foo": "bar"}}},
 			`{"LABELS":{"foo":"bar"}}`,
-			model.NodeMetadata{Labels: map[string]string{"foo": "bar"},
-				Raw: map[string]interface{}{
-					"LABELS": map[string]interface{}{
-						"foo": "bar",
+			model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					Labels: map[string]string{"foo": "bar"},
+					Raw: map[string]interface{}{
+						"LABELS": map[string]interface{}{
+							"foo": "bar",
+						},
 					},
-				}},
+				},
+			},
+		},
+		{
+			"proxy config",
+			model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					ProxyConfig: (*model.NodeMetaProxyConfig)(&meshconfig.ProxyConfig{
+						ConfigPath:             "foo",
+						DrainDuration:          types.DurationProto(time.Second * 5),
+						ControlPlaneAuthPolicy: meshconfig.AuthenticationPolicy_MUTUAL_TLS,
+						EnvoyAccessLogService: &meshconfig.RemoteService{
+							Address: "address",
+							TlsSettings: &v1alpha3.ClientTLSSettings{
+								SubjectAltNames: []string{"san"},
+							},
+						},
+					}),
+				},
+			},
+			// nolint: lll
+			`{"PROXY_CONFIG":{"configPath":"foo","drainDuration":"5s","controlPlaneAuthPolicy":"MUTUAL_TLS","envoyAccessLogService":{"address":"address","tlsSettings":{"subjectAltNames":["san"]}}}}`,
+			model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					ProxyConfig: (*model.NodeMetaProxyConfig)(&meshconfig.ProxyConfig{
+						ConfigPath:             "foo",
+						DrainDuration:          types.DurationProto(time.Second * 5),
+						ControlPlaneAuthPolicy: meshconfig.AuthenticationPolicy_MUTUAL_TLS,
+						EnvoyAccessLogService: &meshconfig.RemoteService{
+							Address: "address",
+							TlsSettings: &v1alpha3.ClientTLSSettings{
+								SubjectAltNames: []string{"san"},
+							},
+						},
+					}),
+					Raw: map[string]interface{}{
+						"PROXY_CONFIG": map[string]interface{}{
+							"drainDuration":          "5s",
+							"configPath":             "foo",
+							"controlPlaneAuthPolicy": "MUTUAL_TLS",
+							"envoyAccessLogService": map[string]interface{}{
+								"address": "address",
+								"tlsSettings": map[string]interface{}{
+									"subjectAltNames": []interface{}{"san"},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -74,7 +133,7 @@ func TestNodeMetadata(t *testing.T) {
 			if string(j) != tt.out {
 				t.Errorf("Got json '%s', expected '%s'", string(j), tt.out)
 			}
-			var meta model.NodeMetadata
+			var meta model.BootstrapNodeMetadata
 			if err := json.Unmarshal(j, &meta); err != nil {
 				t.Fatalf("failed to unmarshal: %v", err)
 			}
@@ -149,13 +208,46 @@ func TestPodPortList(t *testing.T) {
 	}
 }
 
+func TestStringBool(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		expect string
+	}{
+		{"1", `"1"`, `"true"`},
+		{"0", `"0"`, `"false"`},
+		{"false", `"false"`, `"false"`},
+		{"true", `"true"`, `"true"`},
+		{"invalid input", `"foo"`, ``},
+		{"no quotes", `true`, ``},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var out model.StringBool
+			if err := json.Unmarshal([]byte(tt.in), &out); err != nil {
+				if tt.expect == "" {
+					return
+				}
+				t.Fatal(err)
+			}
+			b, err := json.Marshal(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(string(b), tt.expect) {
+				t.Fatalf("Expected %v, got %v", tt.expect, string(b))
+			}
+		})
+	}
+}
+
 func TestServiceNode(t *testing.T) {
 	cases := []struct {
 		in  *model.Proxy
 		out string
 	}{
 		{
-			in:  &memory.HelloProxyV0,
+			in:  &mock.HelloProxyV0,
 			out: "sidecar~10.1.1.0~v0.default~default.svc.cluster.local",
 		},
 		{
@@ -190,7 +282,6 @@ func TestServiceNode(t *testing.T) {
 			t.Errorf("%#v.ServiceNode() => Got %s, want %s", node.in, out, node.out)
 		}
 		in, err := model.ParseServiceNodeWithMetadata(node.out, node.in.Metadata)
-
 		if err != nil {
 			t.Errorf("ParseServiceNode(%q) => Got error %v", node.out, err)
 		}
@@ -204,21 +295,25 @@ func TestParseMetadata(t *testing.T) {
 	cases := []struct {
 		name     string
 		metadata map[string]interface{}
-		out      model.Proxy
+		out      *model.Proxy
 	}{
 		{
 			name: "Basic Case",
-			out: model.Proxy{Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
-				Metadata: &model.NodeMetadata{Raw: map[string]interface{}{}}},
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+				Metadata: &model.NodeMetadata{Raw: map[string]interface{}{}},
+			},
 		},
 		{
 			name:     "Capture Arbitrary Metadata",
 			metadata: map[string]interface{}{"foo": "bar"},
-			out: model.Proxy{Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
 				Metadata: &model.NodeMetadata{
 					Raw: map[string]interface{}{
 						"foo": "bar",
-					}},
+					},
+				},
 			},
 		},
 		{
@@ -228,23 +323,23 @@ func TestParseMetadata(t *testing.T) {
 					"foo": "bar",
 				},
 			},
-			out: model.Proxy{Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
 				Metadata: &model.NodeMetadata{
 					Raw: map[string]interface{}{
 						"LABELS": map[string]interface{}{"foo": "bar"},
 					},
 					Labels: map[string]string{"foo": "bar"},
 				},
-				WorkloadLabels: labels.Collection{map[string]string{
-					"foo": "bar",
-				}}},
+			},
 		},
 		{
 			name: "Capture Pod Ports",
 			metadata: map[string]interface{}{
 				"POD_PORTS": `[{"name":"http","containerPort":8080,"protocol":"TCP"},{"name":"grpc","containerPort":8079,"protocol":"TCP"}]`,
 			},
-			out: model.Proxy{Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
+			out: &model.Proxy{
+				Type: "sidecar", IPAddresses: []string{"1.1.1.1"}, DNSDomain: "domain", ID: "id", IstioVersion: model.MaxIstioVersion,
 				Metadata: &model.NodeMetadata{
 					Raw: map[string]interface{}{
 						"POD_PORTS": `[{"name":"http","containerPort":8080,"protocol":"TCP"},{"name":"grpc","containerPort":8079,"protocol":"TCP"}]`,
@@ -252,7 +347,8 @@ func TestParseMetadata(t *testing.T) {
 					PodPorts: []model.PodPort{
 						{"http", 8080, "TCP"},
 						{"grpc", 8079, "TCP"},
-					}},
+					},
+				},
 			},
 		},
 	}
@@ -273,8 +369,8 @@ func TestParseMetadata(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to parse service node: %v", err)
 			}
-			if !reflect.DeepEqual(&tt.out, node) {
-				t.Errorf("Got \n%v, want \n%v", node, &tt.out)
+			if !reflect.DeepEqual(*tt.out.Metadata, *node.Metadata) {
+				t.Errorf("Got \n%v, want \n%v", *node.Metadata, *tt.out.Metadata)
 			}
 		})
 	}
@@ -341,6 +437,18 @@ func TestProxyVersion_Compare(t *testing.T) {
 			args:   args{&model.IstioVersion{Major: 2, Minor: 1, Patch: 1}},
 			want:   -1,
 		},
+		{
+			name:   "ignore minor",
+			fields: fields{Major: 2, Minor: 1, Patch: 11},
+			args:   args{&model.IstioVersion{Major: 2, Minor: -1, Patch: 1}},
+			want:   0,
+		},
+		{
+			name:   "ignore patch",
+			fields: fields{Major: 2, Minor: 1, Patch: 11},
+			args:   args{&model.IstioVersion{Major: 2, Minor: 1, Patch: -1}},
+			want:   0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -373,16 +481,26 @@ func Test_parseIstioVersion(t *testing.T) {
 		{
 			name: "major.minor",
 			args: args{ver: "1.2"},
-			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 0},
+			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 65535},
+		},
+		{
+			name: "dev",
+			args: args{ver: "1.5-alpha.f70faea2aa817eeec0b08f6cc3b5078e5dcf3beb"},
+			want: &model.IstioVersion{Major: 1, Minor: 5, Patch: 65535},
 		},
 		{
 			name: "release-major.minor-date",
 			args: args{ver: "release-1.2-123214234"},
-			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 0},
+			want: &model.IstioVersion{Major: 1, Minor: 2, Patch: 65535},
 		},
 		{
 			name: "master-date",
 			args: args{ver: "master-123214234"},
+			want: model.MaxIstioVersion,
+		},
+		{
+			name: "master-sha",
+			args: args{ver: "master-0b94e017f5b6c7c4598a4da42ea9d45eeb099e5f"},
 			want: model.MaxIstioVersion,
 		},
 		{
@@ -400,6 +518,94 @@ func Test_parseIstioVersion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := model.ParseIstioVersion(tt.args.ver); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("parseIstioVersion() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetServiceInstances(t *testing.T) {
+	tnow := time.Now()
+	instances := []*model.ServiceInstance{
+		{
+			Service: &model.Service{
+				CreationTime: tnow.Add(1 * time.Second),
+				Hostname:     host.Name("test1.com"),
+			},
+		},
+		{
+			Service: &model.Service{
+				CreationTime: tnow,
+				Hostname:     host.Name("test3.com"),
+			},
+		},
+		{
+			Service: &model.Service{
+				CreationTime: tnow,
+				Hostname:     host.Name("test2.com"),
+			},
+		},
+	}
+
+	serviceDiscovery := memory.NewServiceDiscovery(nil)
+	serviceDiscovery.WantGetProxyServiceInstances = instances
+
+	env := &model.Environment{
+		ServiceDiscovery: serviceDiscovery,
+	}
+
+	proxy := &model.Proxy{}
+	proxy.SetServiceInstances(env)
+
+	assert.Equal(t, len(proxy.ServiceInstances), 3)
+	assert.Equal(t, proxy.ServiceInstances[0].Service.Hostname, host.Name("test2.com"))
+	assert.Equal(t, proxy.ServiceInstances[1].Service.Hostname, host.Name("test3.com"))
+	assert.Equal(t, proxy.ServiceInstances[2].Service.Hostname, host.Name("test1.com"))
+}
+
+func TestGlobalUnicastIP(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     []string
+		expect string
+	}{
+		{
+			name:   "single IPv4 (k8s)",
+			in:     []string{"10.0.4.16"},
+			expect: "10.0.4.16",
+		},
+		{
+			name:   "single IPv6 (k8s)",
+			in:     []string{"fc00:f853:ccd:e793::1"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+		{
+			name:   "multi IPv4 [1st] (VM)",
+			in:     []string{"10.128.0.51", "fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "10.128.0.51",
+		},
+		{
+			name:   "multi IPv6 [1st] (VM)",
+			in:     []string{"fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "10.128.0.51", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+		{
+			name:   "multi IPv4 [2nd] (VM)",
+			in:     []string{"127.0.0.1", "10.128.0.51", "fc00:f853:ccd:e793::1", "172.17.0.1", "fe80::42:35ff:fec1:7436", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "10.128.0.51",
+		},
+		{
+			name:   "multi IPv6 [2nd] (VM)",
+			in:     []string{"fe80::42:35ff:fec1:7436", "fc00:f853:ccd:e793::1", "172.17.0.1", "10.128.0.51", "fe80::345d:33ff:fe54:5c8e"},
+			expect: "fc00:f853:ccd:e793::1",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			var node model.Proxy
+			node.IPAddresses = tt.in
+			node.DiscoverIPVersions()
+			if got := node.GlobalUnicastIP; got != tt.expect {
+				t.Errorf("GlobalUnicastIP = %v, want %v", got, tt.expect)
 			}
 		})
 	}

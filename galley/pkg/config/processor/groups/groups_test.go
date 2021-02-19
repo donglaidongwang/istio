@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,18 +19,11 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"istio.io/istio/galley/pkg/config/meta/metadata"
 	"istio.io/istio/galley/pkg/config/processor/groups"
 )
 
 func TestDefault(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 	actual := groups.IndexFunction("bogus", nil)
 	g.Expect(actual).To(Equal(groups.Default))
-}
-
-func TestSyntheticServiceEntry(t *testing.T) {
-	g := NewGomegaWithT(t)
-	actual := groups.IndexFunction(metadata.IstioNetworkingV1Alpha3SyntheticServiceentries.String(), nil)
-	g.Expect(actual).To(Equal(groups.SyntheticServiceEntry))
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +39,6 @@ func (c Collection) HasSubsetOf(that Instance) bool {
 // IsSupersetOf returns true if the input labels are a subset set of any set of labels in a
 // collection
 func (c Collection) IsSupersetOf(that Instance) bool {
-
 	if len(c) == 0 {
 		return len(that) == 0
 	}

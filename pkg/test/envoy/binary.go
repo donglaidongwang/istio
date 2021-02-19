@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,9 +24,7 @@ import (
 	"istio.io/istio/pkg/test/env"
 )
 
-var (
-	envoyFileNamePattern = regexp.MustCompile("^envoy$|^envoy-[a-f0-9]+$|^envoy-debug-[a-f0-9]+$")
-)
+var envoyFileNamePattern = regexp.MustCompile("^envoy$|^envoy-[a-f0-9]+$|^envoy-debug-[a-f0-9]+$")
 
 // FindBinary searches for an Envoy debug binary under ISTIO_OUT. If the ISTIO_OUT environment variable
 // is not set, the default location under GOPATH is assumed. If ISTIO_OUT contains multiple debug binaries,
@@ -60,7 +58,7 @@ func FindBinaryOrFail(t test.Failer) string {
 
 func findBinaries() ([]string, error) {
 	binPaths := make([]string, 0)
-	err := filepath.Walk(env.IstioOut, func(path string, f os.FileInfo, err error) error {
+	err := filepath.Walk(env.LocalOut, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
 package mock
 
 import (
-	"istio.io/istio/galley/pkg/source/kube/client"
-
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+
+	"istio.io/istio/galley/pkg/config/source/kube"
 )
 
-var _ client.Interfaces = &Kube{}
+var _ kube.Interfaces = &Kube{}
 
 // Kube is a mock implementation of galley/pkg/common/Kube
 type Kube struct {

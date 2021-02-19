@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashicorp/go-multierror"
+
 	"istio.io/istio/pkg/config/host"
 )
 
@@ -35,8 +37,8 @@ type JwksInfo struct {
 const (
 	attrRequestHeader    = "request.headers"        // header name is surrounded by brackets, e.g. "request.headers[User-Agent]".
 	attrSrcIP            = "source.ip"              // supports both single ip and cidr, e.g. "10.1.2.3" or "10.1.0.0/16".
+	attrRemoteIP         = "remote.ip"              // original client ip determined from x-forwarded-for or proxy protocol.
 	attrSrcNamespace     = "source.namespace"       // e.g. "default".
-	attrSrcUser          = "source.user"            // source identity, e.g. "cluster.local/ns/default/sa/productpage".
 	attrSrcPrincipal     = "source.principal"       // source identity, e,g, "cluster.local/ns/default/sa/productpage".
 	attrRequestPrincipal = "request.auth.principal" // authenticated principal of the request.
 	attrRequestAudiences = "request.auth.audiences" // intended audience(s) for this authentication information.
@@ -57,9 +59,6 @@ const (
 // Port number is extracted from URI if available (i.e from postfix :<port>, eg. ":80"), or assigned
 // to a default value based on URI scheme (80 for http and 443 for https).
 // Port name is set to URI scheme value.
-// Note: this is to replace [buildJWKSURIClusterNameAndAddress]
-// (https://github.com/istio/istio/blob/master/pilot/pkg/proxy/envoy/v1/mixer.go#L401),
-// which is used for the old EUC policy.
 func ParseJwksURI(jwksURI string) (JwksInfo, error) {
 	u, err := url.Parse(jwksURI)
 	if err != nil {
@@ -89,14 +88,27 @@ func ParseJwksURI(jwksURI string) (JwksInfo, error) {
 	return info, nil
 }
 
+func CheckEmptyValues(key string, values []string) error {
+	for _, value := range values {
+		if value == "" {
+			return fmt.Errorf("empty value not allowed, found in %s", key)
+		}
+	}
+	return nil
+}
+
 func ValidateAttribute(key string, values []string) error {
+	if err := CheckEmptyValues(key, values); err != nil {
+		return err
+	}
 	switch {
 	case hasPrefix(key, attrRequestHeader):
 		return validateMapKey(key)
 	case isEqual(key, attrSrcIP):
-		return validateIPs(values)
+		return ValidateIPs(values)
+	case isEqual(key, attrRemoteIP):
+		return ValidateIPs(values)
 	case isEqual(key, attrSrcNamespace):
-	case isEqual(key, attrSrcUser):
 	case isEqual(key, attrSrcPrincipal):
 	case isEqual(key, attrRequestPrincipal):
 	case isEqual(key, attrRequestAudiences):
@@ -104,15 +116,20 @@ func ValidateAttribute(key string, values []string) error {
 	case hasPrefix(key, attrRequestClaims):
 		return validateMapKey(key)
 	case isEqual(key, attrDestIP):
-		return validateIPs(values)
+		return ValidateIPs(values)
 	case isEqual(key, attrDestPort):
-		return validatePorts(values)
-	case hasPrefix(key, attrDestLabel) || isEqual(key, attrDestName, attrDestNamespace, attrDestUser):
-		return fmt.Errorf("deprecated attribute (%s): only supported in v1alpha1", key)
+		return ValidatePorts(values)
 	case isEqual(key, attrConnSNI):
 	case hasPrefix(key, attrExperimental):
+		return validateMapKey(key)
+	case isEqual(key, attrDestNamespace):
+		return fmt.Errorf("attribute %s is replaced by the metadata.namespace", key)
+	case hasPrefix(key, attrDestLabel):
+		return fmt.Errorf("attribute %s is replaced by the workload selector", key)
+	case isEqual(key, attrDestName, attrDestUser):
+		return fmt.Errorf("deprecated attribute %s: only supported in v1alpha1", key)
 	default:
-		return fmt.Errorf("unknown attribute (%s)", key)
+		return fmt.Errorf("unknown attribute: %s", key)
 	}
 	return nil
 }
@@ -130,29 +147,31 @@ func hasPrefix(key string, prefix string) bool {
 	return strings.HasPrefix(key, prefix)
 }
 
-func validateIPs(ips []string) error {
+func ValidateIPs(ips []string) error {
+	var errs *multierror.Error
 	for _, v := range ips {
 		if strings.Contains(v, "/") {
 			if _, _, err := net.ParseCIDR(v); err != nil {
-				return fmt.Errorf("bad CIDR range (%s): %v", v, err)
+				errs = multierror.Append(errs, fmt.Errorf("bad CIDR range (%s): %v", v, err))
 			}
 		} else {
 			if ip := net.ParseIP(v); ip == nil {
-				return fmt.Errorf("bad IP address (%s)", v)
+				errs = multierror.Append(errs, fmt.Errorf("bad IP address (%s)", v))
 			}
 		}
 	}
-	return nil
+	return errs.ErrorOrNil()
 }
 
-func validatePorts(ports []string) error {
+func ValidatePorts(ports []string) error {
+	var errs *multierror.Error
 	for _, port := range ports {
 		p, err := strconv.ParseUint(port, 10, 32)
 		if err != nil || p > 65535 {
-			return fmt.Errorf("bad port (%s): %v", port, err)
+			errs = multierror.Append(errs, fmt.Errorf("bad port (%s): %v", port, err))
 		}
 	}
-	return nil
+	return errs.ErrorOrNil()
 }
 
 func validateMapKey(key string) error {

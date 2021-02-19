@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,9 @@
 
 package diag
 
-import "sort"
+import (
+	"sort"
+)
 
 // Messages is a slice of Message items.
 type Messages []Message
@@ -24,7 +26,7 @@ func (ms *Messages) Add(m Message) {
 	*ms = append(*ms, m)
 }
 
-// Sort the message lexicographically by level, code, origin, then string.
+// Sort the message lexicographically by level, code, resource origin name, then string.
 func (ms *Messages) Sort() {
 	sort.Slice(*ms, func(i, j int) bool {
 		a, b := (*ms)[i], (*ms)[j]
@@ -33,21 +35,51 @@ func (ms *Messages) Sort() {
 			return a.Type.Level().sortOrder < b.Type.Level().sortOrder
 		case a.Type.Code() != b.Type.Code():
 			return a.Type.Code() < b.Type.Code()
-		case a.Origin == nil && b.Origin != nil:
+		case a.Resource == nil && b.Resource != nil:
 			return true
-		case a.Origin != nil && b.Origin == nil:
+		case a.Resource != nil && b.Resource == nil:
 			return false
-		case a.Origin != nil && b.Origin != nil && a.Origin.FriendlyName() != b.Origin.FriendlyName():
-			return a.Origin.FriendlyName() < b.Origin.FriendlyName()
+		case a.Resource != nil && b.Resource != nil && a.Resource.Origin.Comparator() != b.Resource.Origin.Comparator():
+			return a.Resource.Origin.Comparator() < b.Resource.Origin.Comparator()
 		default:
 			return a.String() < b.String()
 		}
 	})
 }
 
-// Return a different sorted Messages struct
-func (ms *Messages) SortedCopy() Messages {
+// SortedDedupedCopy returns a different sorted (and deduped) Messages struct.
+func (ms *Messages) SortedDedupedCopy() Messages {
 	newMs := append((*ms)[:0:0], *ms...)
 	newMs.Sort()
-	return newMs
+
+	// Take advantage of the fact that the list is already sorted to dedupe
+	// messages (any duplicates should be adjacent).
+	var deduped Messages
+	for _, m := range newMs {
+		// Two messages are duplicates if they have the same string representation.
+		if len(deduped) != 0 && deduped[len(deduped)-1].String() == m.String() {
+			continue
+		}
+		deduped = append(deduped, m)
+	}
+	return deduped
+}
+
+// SetDocRef sets the doc URL reference tracker for the messages
+func (ms *Messages) SetDocRef(docRef string) *Messages {
+	for i := range *ms {
+		(*ms)[i].DocRef = docRef
+	}
+	return ms
+}
+
+// FilterOutLowerThan only keeps messages at or above the specified output level
+func (ms *Messages) FilterOutLowerThan(outputLevel Level) Messages {
+	outputMessages := Messages{}
+	for _, m := range *ms {
+		if m.Type.Level().IsWorseThanOrEqualTo(outputLevel) {
+			outputMessages = append(outputMessages, m)
+		}
+	}
+	return outputMessages
 }

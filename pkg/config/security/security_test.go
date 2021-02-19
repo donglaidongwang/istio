@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -94,6 +94,11 @@ func TestValidateCondition(t *testing.T) {
 		wantError bool
 	}{
 		{
+			key:       "request.headers[:authority]",
+			values:    []string{"productpage", ""},
+			wantError: true,
+		},
+		{
 			key:    "request.headers[:authority]",
 			values: []string{"productpage"},
 		},
@@ -112,22 +117,38 @@ func TestValidateCondition(t *testing.T) {
 			wantError: true,
 		},
 		{
-			key: "source.namespace",
+			key:    "remote.ip",
+			values: []string{"1.2.3.4", "5.6.7.0/24"},
 		},
 		{
-			key: "source.user",
+			key:       "remote.ip",
+			values:    []string{"a.b.c.d"},
+			wantError: true,
 		},
 		{
-			key: "source.principal",
+			key:    "source.namespace",
+			values: []string{"value"},
 		},
 		{
-			key: "request.auth.principal",
+			key:       "source.user",
+			values:    []string{"value"},
+			wantError: true,
 		},
 		{
-			key: "request.auth.audiences",
+			key:    "source.principal",
+			values: []string{"value"},
 		},
 		{
-			key: "request.auth.presenter",
+			key:    "request.auth.principal",
+			values: []string{"value"},
+		},
+		{
+			key:    "request.auth.audiences",
+			values: []string{"value"},
+		},
+		{
+			key:    "request.auth.presenter",
+			values: []string{"value"},
 		},
 		{
 			key:    "request.auth.claims[id]",
@@ -135,6 +156,7 @@ func TestValidateCondition(t *testing.T) {
 		},
 		{
 			key:       "request.auth.claims[]",
+			values:    []string{"value"},
 			wantError: true,
 		},
 		{
@@ -157,25 +179,36 @@ func TestValidateCondition(t *testing.T) {
 		},
 		{
 			key:       "destination.labels[app]",
+			values:    []string{"value"},
 			wantError: true,
 		},
 		{
 			key:       "destination.name",
+			values:    []string{"value"},
 			wantError: true,
 		},
 		{
 			key:       "destination.namespace",
+			values:    []string{"value"},
 			wantError: true,
 		},
 		{
-			key:       "destination.use",
+			key:       "destination.user",
+			values:    []string{"value"},
 			wantError: true,
 		},
 		{
-			key: "connection.sni",
+			key:    "connection.sni",
+			values: []string{"value"},
 		},
 		{
-			key: "experimental.envoy.filters.a.b[c]",
+			key:    "experimental.envoy.filters.a.b[c]",
+			values: []string{"value"},
+		},
+		{
+			key:       "experimental.envoy.filters.a.b.x",
+			values:    []string{"value"},
+			wantError: true,
 		},
 	}
 	for _, c := range cases {

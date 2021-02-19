@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,11 @@ package configdump
 import (
 	"sort"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	"github.com/golang/protobuf/ptypes"
+
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 )
 
 // GetDynamicListenerDump retrieves a listener dump with just dynamic active listeners in it
@@ -27,17 +30,42 @@ func (w *Wrapper) GetDynamicListenerDump(stripVersions bool) (*adminapi.Listener
 	if err != nil {
 		return nil, err
 	}
-	dal := listenerDump.GetDynamicActiveListeners()
+
+	dal := make([]*adminapi.ListenersConfigDump_DynamicListener, 0)
+	for _, l := range listenerDump.DynamicListeners {
+		// If a listener was reloaded, it would contain both the active and draining state
+		// delete the draining state for proper comparison
+		l.DrainingState = nil
+		if l.ActiveState != nil {
+			dal = append(dal, l)
+		}
+	}
+
+	// Support v2 or v3 in config dump. See ads.go:RequestedTypes for more info.
+	for i := range dal {
+		dal[i].ActiveState.Listener.TypeUrl = v3.ListenerType
+	}
 	sort.Slice(dal, func(i, j int) bool {
-		return dal[i].Listener.Name < dal[j].Listener.Name
+		l := &listener.Listener{}
+		err = ptypes.UnmarshalAny(dal[i].ActiveState.Listener, l)
+		if err != nil {
+			return false
+		}
+		name := l.Name
+		err = ptypes.UnmarshalAny(dal[j].ActiveState.Listener, l)
+		if err != nil {
+			return false
+		}
+		return name < l.Name
 	})
 	if stripVersions {
 		for i := range dal {
-			dal[i].VersionInfo = ""
-			dal[i].LastUpdated = nil
+			dal[i].ActiveState.VersionInfo = ""
+			dal[i].ActiveState.LastUpdated = nil
+			dal[i].Name = "" // In Istio 1.5, Envoy creates this; suppress it
 		}
 	}
-	return &adminapi.ListenersConfigDump{DynamicActiveListeners: dal}, nil
+	return &adminapi.ListenersConfigDump{DynamicListeners: dal}, nil
 }
 
 // GetListenerConfigDump retrieves the listener config dump from the ConfigDump
@@ -47,7 +75,7 @@ func (w *Wrapper) GetListenerConfigDump() (*adminapi.ListenersConfigDump, error)
 		return nil, err
 	}
 	listenerDump := &adminapi.ListenersConfigDump{}
-	err = ptypes.UnmarshalAny(&listenerDumpAny, listenerDump)
+	err = ptypes.UnmarshalAny(listenerDumpAny, listenerDump)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-# K8s object with invalid Istio annotations
+# K8s object with unknown Istio annotations
 apiVersion: v1
 kind: Service
 metadata:
@@ -18,6 +18,21 @@ spec:
   selector:
     app: httpbin
 ---
+# K8s object with invalid Istio annotations
+apiVersion: v1
+kind: Pod
+metadata:
+  name: invalid-annotations
+  annotations:
+    # Validation checks this is an int - this should be invalid
+    readiness.status.sidecar.istio.io/initialDelaySeconds: bar
+    # Validation checks this is an int - this should be valid
+    readiness.status.sidecar.istio.io/periodSeconds: "10"
+spec:
+  containers:
+    - name: "foo"
+      command: ['curl']
+---
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,8 +40,6 @@ metadata:
   labels:
     app: details
   annotations:
-    # annotation is known, but doesn't go on a Service
-    policy.istio.io/lang: golang
     # Annotation that Istio doesn't know about, but isn't an Istio annotation, thus ignored
     kubernetes.io/psp: my-privileged-psp
 spec:
@@ -95,3 +108,12 @@ spec:
     spec:
       containers:
       - name: fortio
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  annotations:
+    # Sidecar injector annotation does not belong to Namespace
+    sidecar.istio.io/inject: "true"
+spec: {}

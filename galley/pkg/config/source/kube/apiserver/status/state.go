@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@ package status
 import (
 	"sync"
 
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
 )
 
 // use a sentinel value as the last item in a work queue. This allows doing a simple null check on the next to
@@ -84,7 +84,7 @@ func newState() *state {
 
 // set the last observed state of a resource status, based on the watch events. This can trigger creation of new
 // work, if the state is not as expected.
-func (s *state) setObserved(col collection.Name, res resource.Name, version resource.Version, status interface{}) {
+func (s *state) setObserved(col collection.Name, res resource.FullName, version resource.Version, status interface{}) {
 	s.mu.Lock()
 	k := key{col: col, res: res}
 

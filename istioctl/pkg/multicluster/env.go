@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,22 +18,26 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"time"
 
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/clientcmd/api"
 
 	"istio.io/istio/pkg/kube"
 )
 
+type ConditionFunc func() (done bool, err error)
+
 type Environment interface {
 	GetConfig() *api.Config
-	CreateClientSet(context string) (kubernetes.Interface, error)
+	CreateClient(context string) (kube.ExtendedClient, error)
 	Stdout() io.Writer
 	Stderr() io.Writer
 	ReadFile(filename string) ([]byte, error)
 	Printf(format string, a ...interface{})
 	Errorf(format string, a ...interface{})
+	Poll(interval, timeout time.Duration, condition ConditionFunc) error
 }
 
 type KubeEnvironment struct {
@@ -43,13 +47,18 @@ type KubeEnvironment struct {
 	kubeconfig string
 }
 
-func (e *KubeEnvironment) CreateClientSet(context string) (kubernetes.Interface, error) {
-	return kube.CreateClientset(e.kubeconfig, context)
+func (e *KubeEnvironment) CreateClient(context string) (kube.ExtendedClient, error) {
+	cfg, err := kube.BuildClientConfig(e.kubeconfig, context)
+	if err != nil {
+		return nil, err
+	}
+	return kube.NewExtendedClient(kube.NewClientConfigForRestConfig(cfg), "")
 }
 
 func (e *KubeEnvironment) Printf(format string, a ...interface{}) {
 	_, _ = fmt.Fprintf(e.stdout, format, a...)
 }
+
 func (e *KubeEnvironment) Errorf(format string, a ...interface{}) {
 	_, _ = fmt.Fprintf(e.stderr, format, a...)
 }
@@ -58,6 +67,11 @@ func (e *KubeEnvironment) GetConfig() *api.Config                   { return e.c
 func (e *KubeEnvironment) Stdout() io.Writer                        { return e.stdout }
 func (e *KubeEnvironment) Stderr() io.Writer                        { return e.stderr }
 func (e *KubeEnvironment) ReadFile(filename string) ([]byte, error) { return ioutil.ReadFile(filename) }
+func (e *KubeEnvironment) Poll(interval, timeout time.Duration, condition ConditionFunc) error {
+	return wait.Poll(interval, timeout, func() (bool, error) {
+		return condition()
+	})
+}
 
 var _ Environment = (*KubeEnvironment)(nil)
 

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,20 @@
 package direct
 
 import (
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/meta/schema"
 	"istio.io/istio/galley/pkg/config/processing/transformer"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/schema"
 )
 
 // GetProviders creates a transformer provider for each direct transform in the metadata
 func GetProviders(m *schema.Metadata) transformer.Providers {
 	var result []transformer.Provider
 
+	cols := m.AllCollections()
+
 	for k, v := range m.DirectTransformSettings().Mapping() {
-		from := k
-		to := v
+		from := cols.MustFind(k.String())
+		to := cols.MustFind(v.String())
 
 		handleFn := func(e event.Event, h event.Handler) {
 			e = e.WithSource(to)

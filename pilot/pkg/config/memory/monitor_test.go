@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,11 +21,23 @@ import (
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/test/mock"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
+func TestMonitorLifecycle(t *testing.T) {
+	// Regression test to ensure no race conditions during monitor shutdown
+	store := memory.Make(collections.Mocks)
+	m := memory.NewMonitor(store)
+	stop := make(chan struct{})
+	go m.Run(stop)
+	m.ScheduleProcessEvent(memory.ConfigEvent{})
+	close(stop)
+	m.ScheduleProcessEvent(memory.ConfigEvent{})
+}
+
 func TestEventConsistency(t *testing.T) {
-	store := memory.Make(mock.Types)
+	store := memory.Make(collections.Mocks)
 	controller := memory.NewController(store)
 
 	testConfig := mock.Make(TestNamespace, 0)
@@ -35,8 +47,7 @@ func TestEventConsistency(t *testing.T) {
 
 	lock := sync.Mutex{}
 
-	controller.RegisterEventHandler(schemas.MockConfig.Type, func(config model.Config, event model.Event) {
-
+	controller.RegisterEventHandler(collections.Mock.Resource().GroupVersionKind(), func(_, config config.Config, event model.Event) {
 		lock.Lock()
 		tc := testConfig
 		lock.Unlock()
@@ -78,7 +89,7 @@ func TestEventConsistency(t *testing.T) {
 
 	// Test Delete Event
 	testEvent = model.EventDelete
-	if err := controller.Delete(schemas.MockConfig.Type, testConfig.Name, TestNamespace); err != nil {
+	if err := controller.Delete(collections.Mock.Resource().GroupVersionKind(), testConfig.Name, TestNamespace, nil); err != nil {
 		t.Error(err)
 		return
 	}

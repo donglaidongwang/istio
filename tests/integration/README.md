@@ -39,12 +39,13 @@ This folder contains Istio integration tests that use the test framework checked
 The goal of the framework is to make it as easy as possible to author and run tests. In its simplest
 case, just typing ```go test ./...``` should be sufficient to run tests.
 
+This guide walks through the basics of writing tests with the Istio test framework. For best
+practices, see [Writing Good Integration Tests](https://github.com/istio/istio/wiki/Writing-Good-Integration-Tests).
+
 ## Writing Tests
 
 The test framework is designed to work with standard go tooling and allows developers
-to write environment-agnostics tests in a high-level fashion. The quickest way to get started with authoring
-new tests is to checkout the code in the
-[framework](https://github.com/istio/istio/tree/master/tests/integration/framework) folder.
+to write environment-agnostics tests in a high-level fashion.
 
 ### Adding a Test Suite
 
@@ -77,11 +78,11 @@ func TestMyLogic(t *testing.T) {
         NewTest(t).
         Run(func(ctx framework.TestContext) {
             // Create a component
-            g := galley.NewOrFail(ctx, ctx, cfg)
+            p := pilot.NewOrFail(ctx, ctx, cfg)
 
             // Use the component.
-            g.ApplyConfigOrFail(ctx, nil, mycfg)
-            defer g.DeleteConfigOrFail(ctx, nil, mycfg)
+            // Apply Kubernetes Config
+            ctx.ApplyConfigOrFail(ctx, nil, mycfg)
 
             // Do more stuff here.
         }
@@ -98,10 +99,8 @@ In the `TestMain`, you can also restrict the test to particular environment, app
 func TestMain(m *testing.M) {
     framework.
         NewSuite("mysuite", m).
-        // Restrict the test to the K8s environment only, tests will be skipped in native environment.
-        RequireEnvironment(environment.Kube).
         // Deploy Istio on the cluster
-        Setup(istio.SetupOnKube(nil, nil)).
+        Setup(istio.Setup(nil, nil)).
         // Run your own custom setup
         Setup(mySetup).
         Run()
@@ -136,8 +135,7 @@ func TestMyLogic(t *testing.T) {
             for _, cfg := range configs {
                 ctx.NewSubTest(cfg.name).
                     Run(func(ctx framework.TestContext) {
-                        g.ApplyConfigOrFail(ctx, nil, mycfg)
-                        defer g.DeleteConfigOrFail(ctx, nil, mycfg)
+                        ctx.ApplyConfigOrFail(ctx, nil, mycfg)
                         // Do more stuff here.
                     })
             }
@@ -233,13 +231,10 @@ func TestMyLogic(t *testing.T) {
         Run(func(ctx framework.TestContext) {
             // Create the components.
             g := galley.NewOrFail(ctx, ctx, galley.Config{})
-            p := pilot.NewOrFail(ctx, ctx, pilot.Config {
-                Galley: g,
-            })
+            p := pilot.NewOrFail(ctx, ctx, pilot.Config {})
 
             // Apply configuration via Galley.
-            g.ApplyConfigOrFail(ctx, nil, mycfg)
-            defer g.DeleteConfigOrFail(ctx, nil, mycfg)
+            ctx.ApplyConfigOrFail(ctx, nil, mycfg)
 
             // Wait until Pilot has received the configuration update.
             p.StartDiscoveryOrFail(t, discoveryRequest)
@@ -261,7 +256,7 @@ To add a new component, you'll first need to create a top-level folder for your 
 [components folder](https://github.com/istio/istio/tree/master/pkg/test/framework/components).
 
 ```console
-$ cd ${ISTIO}/tests/integration
+$ cd ${ISTIO}/pkg/test/framework/components
 $ mkdir mycomponent
 ```
 
@@ -359,13 +354,12 @@ the standard `go test` command-line.  For example, to run the tests under the `/
 using the default (native) environment, you can simply type:
 
 ```console
-$ go test ./tests/integration/mycomponent/...
+$ go test -tags=integ ./tests/integration/mycomponent/...
 ```
 
 Note that samples below invoking variations of ```go test ./...``` are intended to be run from the ```tests/integration``` directory.
 
-| WARNING: Many tests, including integration tests, assume that a [Helm](https://helm.sh/docs/using_helm/#installing-helm) client is installed and on the path.|
-| --- |
+Tests are tagged with the `integ` build target to avoid accidental invocation. If this is not set, no tests will be run.
 
 ### Test Parellelism and Kubernetes
 
@@ -430,87 +424,29 @@ Tool | Description |
 [Prow](https://github.com/kubernetes/test-infra/tree/master/prow) | Kubernetes-based CI/CD system developed by the Kubernetes community and is deployed in Google Kubernetes Engine (GKE).
 [TestGrid](https://k8s-testgrid.appspot.com/istio-release) | A Kubernetes dashboard used for visualizing the status of the Prow jobs.
 
-This section describes the steps for adding new tests to Prow and TestGrid.
+Test suites are defined for each toplevel directory (such as `pilot` and `telemetry`), so any tests added to these directories will automatically be run in CI.
 
-#### Step 1: Add a Test Script
-
-To simplify the process of running tests from Prow, each suite is given its own test script under the
-[prow](https://github.com/istio/istio/tree/master/prow) folder.
-
-Embedded in the name of the script is the following:
-
-1. Type of test (unit, end-to-end, integration)
-1. Component/feature being tested
-1. The environment used (i.e. native/local or k8s)
-1. Job execution (i.e. presubmit, postsubmit)
-
-For example, the file `integ-security-k8s-presubmit-tests.sh` runs integration tests for various Istio security
-features on Kubernetes during PR pre-submit.
-
-In general, when creating a new script use similar scripts as a guide.
-
-#### Step 2: Add a Prow Job
-
-Istio's Prow jobs are configured in the [istio/test-infra](https://github.com/istio/test-infra) repository.
-
-The [prow/cluster/jobs/istio/istio](https://github.com/istio/test-infra/tree/master/prow/cluster/jobs/istio/istio) folder
-contains configuration files for running Prow jobs against various Istio branches.
-
-For example, [istio.istio.master.yaml](https://github.com/istio/test-infra/blob/master/prow/cluster/jobs/istio/istio/istio.istio.master.gen.yaml)
-configures Prow jobs that run against Istio's master branch.
-
-Each configuration file contains sections for both **presubmit** and **postsubmit**. To add a new job, add a new config
-stanza to one of these sections, using an existing config stanza as a template.
-
-In general, all tests *should* be required to succeed. However, as flaky tests appear we may need to temporarily disable
-certain jobs from gating PR submission. This can be done by adding the following to the configuration:
-
-```yaml
-optional: true
-```
-
-When this is done, however, a GitHub issue should be raised to address the flake and move the job back to required.
-
-#### Step 3: Update TestGrid
-
-TestGrid is owned by the Kubernetes team and its configuration is located in the
-[kubernetes/test-infra](https://github.com/kubernetes/test-infra) repository.
-Configuring testgrid is explained [here](https://github.com/kubernetes/test-infra/blob/master/testgrid/config.md)
+If you need to add a new test suite, it can be added to the [job configuration](https://github.com/istio/test-infra/blob/master/prow/config/jobs/istio.yaml).
 
 ## Environments
 
-When running tests, only one environment can be specified. Currently, the framework supports the following:
-
-### Native Environment (Default)
-
-The test binaries run on the native platform either in-memory, or as processes. This is the default, however you can
-also explicitly specify the native environment:
+The test binaries run in a Kubernetes cluster, but the test logic runs in the test binary.
 
 ```console
-$ go test ./... -istio.test.env native
+$ go test ./... -p 1
 ```
 
-### Kubernetes Environment
-
-The test binaries run in a Kubernetes cluster, but the test logic runs in the test binary. To specify the Kubernetes
-environment:
-
-```console
-$ go test ./... -p 1 --istio.test.env kube
-```
-
-| WARNING: ```-p 1``` is required when running directly in the ```tests/integration/``` folder, when using ```kube``` environment. |
+| WARNING: ```-p 1``` is required when running directly in the ```tests/integration/``` folder. |
 | --- |
 
-When running the tests against the Kubernetes environment, you will need to provide a K8s cluster to run the tests
-against.
+You will need to provide a K8s cluster to run the tests against.
 (See [here](https://github.com/istio/istio/blob/master/tests/integration/GKE.md)
 for info about how to set up a suitable GKE cluster.)
 You can specify the kube config file that should be used to use for connecting to the cluster, through
 command-line:
 
 ```console
-$ go test ./... -p 1 --istio.test.env kube --istio.test.kube.config ~/.kube/config
+$ go test ./... -p 1 --istio.test.kube.config ~/.kube/config
 ```
 
 If not specified, `~/.kube/config` will be used by default.
@@ -576,19 +512,11 @@ pass command-line flags to the test while running under the debugger, you can us
 
 ## Reference
 
-### Helm Values Overrides
-
-If your tests require special Helm values flags, you can specify your Helm values via additional
-for Kubernetes environments. See [mtls_healthcheck_test.go](security/healthcheck/mtls_healthcheck_test.go) for example.
-
 ### Command-Line Flags
 
 The test framework supports the following command-line flags:
 
 ```plain
-  -istio.test.env string
-        Specify the environment to run the tests against. Allowed values are: [native kube] (default "native")
-
   -istio.test.work_dir string
         Local working directory for creating logs/temp files. If left empty, os.TempDir() is used.
 
@@ -611,10 +539,13 @@ The test framework supports the following command-line flags:
         Common image pull policy to use when deploying container images
 
   -istio.test.kube.config string
-        The path to the kube config file for cluster environments
+        A comma-separated list of paths to kube config files for cluster environments. (default ~/.kube/config)
 
   -istio.test.kube.deploy
         Deploy Istio into the target Kubernetes environment. (default true)
+
+  -istio.test.kube.deployEastWestGW
+        Deploy Istio east west gateway into the target Kubernetes environment. (default true)
 
   -istio.test.kube.deployTimeout duration
         Timeout applied to deploying Istio into the target Kubernetes environment. Only applies if DeployIstio=true.
@@ -625,17 +556,20 @@ The test framework supports the following command-line flags:
   -istio.test.kube.systemNamespace string
         The namespace where the Istio components reside in a typical deployment. (default "istio-system")
 
-  -istio.test.kube.helm.chartDir string
-        Helm chart dir for Istio. Only valid when deploying Istio. (default "/Users/ozben/go/src/istio.io/istio/install/kubernetes/helm/istio")
-
   -istio.test.kube.helm.values string
         Manual overrides for Helm values file. Only valid when deploying Istio.
 
-  -istio.test.kube.helm.valuesFile string
-        Helm values file. This can be an absolute path or relative to chartDir. Only valid when deploying Istio. (default "test-values/values-e2e.yaml")
+  -istio.test.kube.helm.iopFile string
+        IstioOperator spec file. This can be an absolute path or relative to the repository root. Defaults to "tests/integration/iop-integration-test-defaults.yaml".
 
-  -istio.test.kube.minikube
-        Indicates that the target environment is Minikube. Used by Ingress component to obtain the right IP address. This also pertains to any environment that doesn't support a LoadBalancer type.
+  -istio.test.kube.loadbalancer bool
+        Used to obtain the right IP address for ingress gateway. This should be false for any environment that doesn't support a LoadBalancer type.
+
+  -istio.test.revision string
+        Overwrite the default namespace label (istio-enabled=true) with revision lable (istio.io/rev=XXX). (default is no overwrite)
+
+  -istio.test.skipVM bool
+        Skip all the VM related parts in all the tests. (default is "false")
 ```
 
 }
@@ -653,7 +587,7 @@ unable to locate an Envoy binary
 This is documented in this [PR](https://github.com/istio/istio/issues/13677). Once the Envoy binary is available for the Mac,
 these tests will hopefully succeed.
 
-* If one uses Docker for Mac for the kubernetes environment be sure to specify the `-istio.test.kube.minikube` parameter. The solves an error like:
+* If one uses Docker for Mac for the kubernetes environment be sure to specify the `-istio.test.kube.loadbalancer=false` parameter. The solves an error like:
 
 ```plain
 service ingress is not available yet

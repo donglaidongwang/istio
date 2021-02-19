@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,15 +17,13 @@ package memory
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
-	"istio.io/pkg/log"
-
-	"istio.io/pkg/ledger"
-
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
 )
 
 var (
@@ -33,50 +31,43 @@ var (
 	errAlreadyExists = errors.New("item already exists")
 )
 
-const ledgerLogf = "error tracking pilot config memory versions for distribution: %v"
-
-// Make creates an in-memory config store from a config descriptor
-func Make(descriptor schema.Set) model.ConfigStore {
-	return MakeWithLedger(descriptor, ledger.Make(time.Minute))
+// Make creates an in-memory config store from a config schemas
+func Make(schemas collection.Schemas) model.ConfigStore {
+	return MakeSkipValidation(schemas, false)
 }
 
-func MakeWithLedger(descriptor schema.Set, configLedger ledger.Ledger) model.ConfigStore {
+func MakeSkipValidation(schemas collection.Schemas, skipValidation bool) model.ConfigStore {
 	out := store{
-		descriptor: descriptor,
-		data:       make(map[string]map[string]*sync.Map),
-		ledger:     configLedger,
+		schemas:        schemas,
+		data:           make(map[config.GroupVersionKind]map[string]*sync.Map),
+		skipValidation: skipValidation,
 	}
-	for _, typ := range descriptor.Types() {
-		out.data[typ] = make(map[string]*sync.Map)
+	for _, s := range schemas.All() {
+		out.data[s.Resource().GroupVersionKind()] = make(map[string]*sync.Map)
 	}
 	return &out
 }
 
 type store struct {
-	descriptor schema.Set
-	data       map[string]map[string]*sync.Map
-	ledger     ledger.Ledger
+	schemas        collection.Schemas
+	data           map[config.GroupVersionKind]map[string]*sync.Map
+	skipValidation bool
+	mutex          sync.RWMutex
 }
 
-func (cr *store) GetResourceAtVersion(version string, key string) (resourceVersion string, err error) {
-	return cr.ledger.GetPreviousValue(version, key)
+func (cr *store) Schemas() collection.Schemas {
+	return cr.schemas
 }
 
-func (cr *store) ConfigDescriptor() schema.Set {
-	return cr.descriptor
-}
-
-func (cr *store) Version() string {
-	return cr.ledger.RootHash()
-}
-
-func (cr *store) Get(typ, name, namespace string) *model.Config {
-	_, ok := cr.data[typ]
+func (cr *store) Get(kind config.GroupVersionKind, name, namespace string) *config.Config {
+	cr.mutex.RLock()
+	defer cr.mutex.RUnlock()
+	_, ok := cr.data[kind]
 	if !ok {
 		return nil
 	}
 
-	ns, exists := cr.data[typ][namespace]
+	ns, exists := cr.data[kind][namespace]
 	if !exists {
 		return nil
 	}
@@ -85,21 +76,23 @@ func (cr *store) Get(typ, name, namespace string) *model.Config {
 	if !exists {
 		return nil
 	}
-	config := out.(model.Config)
+	config := out.(config.Config)
 
 	return &config
 }
 
-func (cr *store) List(typ, namespace string) ([]model.Config, error) {
-	data, exists := cr.data[typ]
+func (cr *store) List(kind config.GroupVersionKind, namespace string) ([]config.Config, error) {
+	cr.mutex.RLock()
+	defer cr.mutex.RUnlock()
+	data, exists := cr.data[kind]
 	if !exists {
 		return nil, nil
 	}
-	out := make([]model.Config, 0, len(cr.data[typ]))
+	out := make([]config.Config, 0, len(cr.data[kind]))
 	if namespace == "" {
 		for _, ns := range data {
 			ns.Range(func(key, value interface{}) bool {
-				out = append(out, value.(model.Config))
+				out = append(out, value.(config.Config))
 				return true
 			})
 		}
@@ -109,15 +102,17 @@ func (cr *store) List(typ, namespace string) ([]model.Config, error) {
 			return nil, nil
 		}
 		ns.Range(func(key, value interface{}) bool {
-			out = append(out, value.(model.Config))
+			out = append(out, value.(config.Config))
 			return true
 		})
 	}
 	return out, nil
 }
 
-func (cr *store) Delete(typ, name, namespace string) error {
-	data, ok := cr.data[typ]
+func (cr *store) Delete(kind config.GroupVersionKind, name, namespace string, resourceVersion *string) error {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+	data, ok := cr.data[kind]
 	if !ok {
 		return errors.New("unknown type")
 	}
@@ -131,80 +126,135 @@ func (cr *store) Delete(typ, name, namespace string) error {
 		return errNotFound
 	}
 
-	err := cr.ledger.Delete(model.Key(typ, name, namespace))
-	if err != nil {
-		log.Warnf(ledgerLogf, err)
-	}
 	ns.Delete(name)
 	return nil
 }
 
-func (cr *store) Create(config model.Config) (string, error) {
-	typ := config.Type
-	s, ok := cr.descriptor.GetByType(typ)
+func (cr *store) Create(cfg config.Config) (string, error) {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+	kind := cfg.GroupVersionKind
+	s, ok := cr.schemas.FindByGroupVersionKind(kind)
 	if !ok {
-		return "", errors.New("unknown type")
+		return "", fmt.Errorf("unknown type %v", kind)
 	}
-	if err := s.Validate(config.Name, config.Namespace, config.Spec); err != nil {
-		return "", err
+	if !cr.skipValidation {
+		if _, err := s.Resource().ValidateConfig(cfg); err != nil {
+			return "", err
+		}
 	}
-	ns, exists := cr.data[typ][config.Namespace]
+	ns, exists := cr.data[kind][cfg.Namespace]
 	if !exists {
 		ns = new(sync.Map)
-		cr.data[typ][config.Namespace] = ns
+		cr.data[kind][cfg.Namespace] = ns
 	}
 
-	_, exists = ns.Load(config.Name)
+	_, exists = ns.Load(cfg.Name)
 
 	if !exists {
 		tnow := time.Now()
-		config.ResourceVersion = tnow.String()
+		cfg.ResourceVersion = tnow.String()
 
 		// Set the creation timestamp, if not provided.
-		if config.CreationTimestamp.IsZero() {
-			config.CreationTimestamp = tnow
+		if cfg.CreationTimestamp.IsZero() {
+			cfg.CreationTimestamp = tnow
 		}
 
-		_, err := cr.ledger.Put(model.Key(typ, config.Namespace, config.Name), config.Version)
-		if err != nil {
-			log.Warnf(ledgerLogf, err)
-		}
-		ns.Store(config.Name, config)
-		return config.ResourceVersion, nil
+		ns.Store(cfg.Name, cfg)
+		return cfg.ResourceVersion, nil
 	}
 	return "", errAlreadyExists
 }
 
-func (cr *store) Update(config model.Config) (string, error) {
-	typ := config.Type
-	s, ok := cr.descriptor.GetByType(typ)
+func (cr *store) Update(cfg config.Config) (string, error) {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+	kind := cfg.GroupVersionKind
+	s, ok := cr.schemas.FindByGroupVersionKind(kind)
 	if !ok {
 		return "", errors.New("unknown type")
 	}
-	if err := s.Validate(config.Name, config.Namespace, config.Spec); err != nil {
-		return "", err
+	if !cr.skipValidation {
+		if _, err := s.Resource().ValidateConfig(cfg); err != nil {
+			return "", err
+		}
 	}
 
-	ns, exists := cr.data[typ][config.Namespace]
+	ns, exists := cr.data[kind][cfg.Namespace]
 	if !exists {
 		return "", errNotFound
 	}
 
-	oldConfig, exists := ns.Load(config.Name)
+	_, exists = ns.Load(cfg.Name)
 	if !exists {
 		return "", errNotFound
-	}
-
-	if config.ResourceVersion != oldConfig.(model.Config).ResourceVersion {
-		return "", errors.New("old revision")
 	}
 
 	rev := time.Now().String()
-	config.ResourceVersion = rev
-	_, err := cr.ledger.Put(model.Key(typ, config.Namespace, config.Name), config.Version)
-	if err != nil {
-		log.Warnf(ledgerLogf, err)
+	cfg.ResourceVersion = rev
+	ns.Store(cfg.Name, cfg)
+	return rev, nil
+}
+
+func (cr *store) UpdateStatus(cfg config.Config) (string, error) {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+	kind := cfg.GroupVersionKind
+	s, ok := cr.schemas.FindByGroupVersionKind(kind)
+	if !ok {
+		return "", errors.New("unknown type")
 	}
-	ns.Store(config.Name, config)
+	if !cr.skipValidation {
+		if _, err := s.Resource().ValidateConfig(cfg); err != nil {
+			return "", err
+		}
+	}
+
+	ns, exists := cr.data[kind][cfg.Namespace]
+	if !exists {
+		return "", errNotFound
+	}
+
+	_, exists = ns.Load(cfg.Name)
+	if !exists {
+		return "", errNotFound
+	}
+
+	rev := time.Now().String()
+	cfg.ResourceVersion = rev
+	ns.Store(cfg.Name, cfg)
+	return rev, nil
+}
+
+func (cr *store) Patch(orig config.Config, patchFn config.PatchFunc) (string, error) {
+	cr.mutex.Lock()
+	defer cr.mutex.Unlock()
+
+	gvk := orig.GroupVersionKind
+	s, ok := cr.schemas.FindByGroupVersionKind(gvk)
+	if !ok {
+		return "", errors.New("unknown type")
+	}
+
+	cfg, _ := patchFn(orig)
+	if !cr.skipValidation {
+		if _, err := s.Resource().ValidateConfig(cfg); err != nil {
+			return "", err
+		}
+	}
+
+	_, ok = cr.data[gvk]
+	if !ok {
+		return "", errNotFound
+	}
+	ns, exists := cr.data[gvk][orig.Namespace]
+	if !exists {
+		return "", errNotFound
+	}
+
+	rev := time.Now().String()
+	cfg.ResourceVersion = rev
+	ns.Store(cfg.Name, cfg)
+
 	return rev, nil
 }

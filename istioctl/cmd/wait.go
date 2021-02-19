@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,49 +19,49 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 
+	"istio.io/istio/istioctl/pkg/clioptions"
 	"istio.io/istio/istioctl/pkg/util/handlers"
-	"istio.io/istio/pkg/config/schemas"
-
-	"istio.io/istio/pilot/pkg/model"
-
-	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"istio.io/istio/istioctl/pkg/kubernetes"
-	v2 "istio.io/istio/pilot/pkg/proxy/envoy/v2"
-	configschema "istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pilot/pkg/xds"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/kube"
 )
 
 var (
-	forFlag              string
-	nameflag             string
-	threshold            float32
-	timeout              time.Duration
-	resourceVersion      string
-	verbose              bool
-	targetSchemaInstance configschema.Instance
-	clientGetter         func(string, string) (dynamic.Interface, error)
+	forFlag      string
+	nameflag     string
+	threshold    float32
+	timeout      time.Duration
+	generation   string
+	verbose      bool
+	targetSchema collection.Schema
+	clientGetter func(string, string) (dynamic.Interface, error)
 )
 
 const pollInterval = time.Second
 
 // waitCmd represents the wait command
 func waitCmd() *cobra.Command {
+	var opts clioptions.ControlPlaneOptions
 	cmd := &cobra.Command{
 		Use:   "wait [flags] <type> <name>[.<namespace>]",
 		Short: "Wait for an Istio resource",
-		Long: `Waits for the specified condition to be true of an Istio resource.  For example:
+		Long:  `Waits for the specified condition to be true of an Istio resource.`,
+		Example: `  # Wait until the bookinfo virtual service has been distributed to all proxies in the mesh
+  istioctl experimental wait --for=distribution virtualservice bookinfo.default
 
-istioctl experimental wait --for=distribution virtual-service bookinfo.default
-
-will block until the bookinfo virtual service has been distributed to all proxies in the mesh.
+  # Wait until 99% of the proxies receive the distribution, timing out after 5 minutes
+  istioctl experimental wait --for=distribution --threshold=.99 --timeout=300 virtualservice bookinfo.default
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			printVerbosef(cmd, "kubeconfig %s", kubeconfig)
@@ -74,45 +74,45 @@ will block until the bookinfo virtual service has been distributed to all proxie
 			var w *watcher
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
-			if resourceVersion == "" {
+			if generation == "" {
 				w = getAndWatchResource(ctx) // setup version getter from kubernetes
 			} else {
 				w = withContext(ctx)
 				w.Go(func(result chan string) error {
-					result <- resourceVersion
+					result <- generation
 					return nil
 				})
 			}
-			// wait for all deployed versions to be contained in resourceVersions
+			// wait for all deployed versions to be contained in generations
 			t := time.NewTicker(pollInterval)
 			printVerbosef(cmd, "getting first version from chan")
 			firstVersion, err := w.BlockingRead()
 			if err != nil {
-				return fmt.Errorf("unable to retrieve kubernetes resource %s: %v", "", err)
+				return fmt.Errorf("unable to retrieve Kubernetes resource %s: %v", "", err)
 			}
-			resourceVersions := []string{firstVersion}
-			targetResource := model.Key(targetSchemaInstance.Type, nameflag, namespace)
+			generations := []string{firstVersion}
+			targetResource := config.Key(targetSchema.Resource().Kind(), nameflag, namespace)
 			for {
-				//run the check here as soon as we start
-				// because tickers wont' run immediately
-				present, notpresent, err := poll(resourceVersions, targetResource)
+				// run the check here as soon as we start
+				// because tickers won't run immediately
+				present, notpresent, err := poll(cmd, generations, targetResource, opts)
 				printVerbosef(cmd, "Received poll result: %d/%d", present, present+notpresent)
 				if err != nil {
 					return err
 				} else if float32(present)/float32(present+notpresent) >= threshold {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Resource %s present on %d out of %d sidecars",
+					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Resource %s present on %d out of %d sidecars\n",
 						targetResource, present, present+notpresent)
 					return nil
 				}
 				select {
 				case newVersion := <-w.resultsChan:
 					printVerbosef(cmd, "received new target version: %s", newVersion)
-					resourceVersions = append(resourceVersions, newVersion)
+					generations = append(generations, newVersion)
 				case <-t.C:
 					printVerbosef(cmd, "tick")
 					continue
 				case err = <-w.errorChan:
-					return fmt.Errorf("unable to retrieve kubernetes resource %s: %v", "", err)
+					return fmt.Errorf("unable to retrieve Kubernetes resource2 %s: %v", "", err)
 				case <-ctx.Done():
 					printVerbosef(cmd, "timeout")
 					// I think this means the timeout has happened:
@@ -131,33 +131,39 @@ will block until the bookinfo virtual service has been distributed to all proxie
 		},
 	}
 	cmd.PersistentFlags().StringVar(&forFlag, "for", "distribution",
-		"wait condition, must be 'distribution' or 'delete'")
+		"Wait condition, must be 'distribution' or 'delete'")
 	cmd.PersistentFlags().DurationVar(&timeout, "timeout", time.Second*30,
-		"the duration to wait before failing")
+		"The duration to wait before failing")
 	cmd.PersistentFlags().Float32Var(&threshold, "threshold", 1,
-		"the ratio of distribution required for success")
-	cmd.PersistentFlags().StringVar(&resourceVersion, "resource-version", "",
-		"wait for a specific version of config to become current, rather than using whatever is latest in "+
-			"kubernetes")
+		"The ratio of distribution required for success")
+	cmd.PersistentFlags().StringVar(&generation, "generation", "",
+		"Wait for a specific generation of config to become current, rather than using whatever is latest in "+
+			"Kubernetes")
 	cmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enables verbose output")
 	_ = cmd.PersistentFlags().MarkHidden("verbose")
+	opts.AttachControlPlaneFlags(cmd)
 	return cmd
 }
 
 func printVerbosef(cmd *cobra.Command, template string, args ...interface{}) {
 	if verbose {
-		fmt.Fprintf(cmd.OutOrStdout(), template+"\n", args...)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), template+"\n", args...)
 	}
 }
 
-func validateType(typ string) error {
-	for _, instance := range schemas.Istio {
-		if typ == instance.VariableName || typ == instance.Type {
-			targetSchemaInstance = instance
+func validateType(kind string) error {
+	originalKind := kind
+
+	// Remove any dashes.
+	kind = strings.ReplaceAll(kind, "-", "")
+
+	for _, s := range collections.Pilot.All() {
+		if strings.EqualFold(kind, s.Resource().Kind()) {
+			targetSchema = s
 			return nil
 		}
 	}
-	return fmt.Errorf("type %s is not recognized", typ)
+	return fmt.Errorf("type %s is not recognized", originalKind)
 }
 
 func countVersions(versionCount map[string]int, configVersion string) {
@@ -168,24 +174,25 @@ func countVersions(versionCount map[string]int, configVersion string) {
 	}
 }
 
-func poll(acceptedVersions []string, targetResource string) (present, notpresent int, err error) {
-	kubeClient, err := clientExecFactory(kubeconfig, configContext)
+func poll(cmd *cobra.Command, acceptedVersions []string, targetResource string, opts clioptions.ControlPlaneOptions) (present, notpresent int, err error) {
+	kubeClient, err := kubeClientWithRevision(kubeconfig, configContext, opts.Revision)
 	if err != nil {
 		return 0, 0, err
 	}
 	path := fmt.Sprintf("/debug/config_distribution?resource=%s", targetResource)
-	pilotResponses, err := kubeClient.AllPilotsDiscoveryDo(istioNamespace, "GET", path, nil)
+	pilotResponses, err := kubeClient.AllDiscoveryDo(context.TODO(), istioNamespace, path)
 	if err != nil {
 		return 0, 0, fmt.Errorf("unable to query pilot for distribution "+
 			"(are you using pilot version >= 1.4 with config distribution tracking on): %s", err)
 	}
 	versionCount := make(map[string]int)
 	for _, response := range pilotResponses {
-		var configVersions []v2.SyncedVersions
+		var configVersions []xds.SyncedVersions
 		err = json.Unmarshal(response, &configVersions)
 		if err != nil {
 			return 0, 0, err
 		}
+		printVerbosef(cmd, "sync status: %v", configVersions)
 		for _, configVersion := range configVersions {
 			countVersions(versionCount, configVersion.ClusterVersion)
 			countVersions(versionCount, configVersion.RouteVersion)
@@ -205,58 +212,45 @@ func poll(acceptedVersions []string, targetResource string) (present, notpresent
 
 func init() {
 	clientGetter = func(kubeconfig, context string) (dynamic.Interface, error) {
-		baseClient, err := kubernetes.NewClient(kubeconfig, context)
+		config, err := kube.DefaultRestConfig(kubeconfig, context)
 		if err != nil {
 			return nil, err
 		}
-		cfg := dynamic.ConfigFor(baseClient.Config)
+		cfg := dynamic.ConfigFor(config)
 		dclient, err := dynamic.NewForConfig(cfg)
 		if err != nil {
 			return nil, err
 		}
 		return dclient, nil
 	}
-
 }
 
-// getAndWatchResource ensures that ResourceVersions always contains
-// the current resourceVersion of the targetResource, adding new versions
+// getAndWatchResource ensures that Generations always contains
+// the current generation of the targetResource, adding new versions
 // as they are created.
 func getAndWatchResource(ictx context.Context) *watcher {
 	g := withContext(ictx)
+	// copy nameflag to avoid race
+	nf := nameflag
 	g.Go(func(result chan string) error {
-		// retrieve resource version from Kubernetes
+		// retrieve latest generation from Kubernetes
 		dclient, err := clientGetter(kubeconfig, configContext)
 		if err != nil {
 			return err
 		}
-		collectionParts := strings.Split(targetSchemaInstance.Collection, "/")
-		group := targetSchemaInstance.Group + ".istio.io"
-		version := targetSchemaInstance.Version
+		collectionParts := strings.Split(targetSchema.Name().String(), "/")
+		group := targetSchema.Resource().Group()
+		version := targetSchema.Resource().Version()
 		resource := collectionParts[3]
 		r := dclient.Resource(schema.GroupVersionResource{Group: group, Version: version, Resource: resource}).Namespace(namespace)
-		obj, err := r.Get(nameflag, metav1.GetOptions{})
+		watch, err := r.Watch(context.TODO(), metav1.ListOptions{FieldSelector: "metadata.name=" + nf})
 		if err != nil {
 			return err
 		}
-		localResourceVersion := obj.GetResourceVersion()
-		result <- localResourceVersion
-		watch, err := r.Watch(metav1.ListOptions{ResourceVersion: localResourceVersion})
-		if err != nil {
-			return err
-		}
-		metaAccessor := meta.NewAccessor()
 		for w := range watch.ResultChan() {
-			watchname, err := metaAccessor.Name(w.Object)
-			if err != nil {
-				return err
-			}
-			if watchname == nameflag {
-				newVersion, err := metaAccessor.ResourceVersion(w.Object)
-				if err != nil {
-					return err
-				}
-				result <- newVersion
+			o := w.Object.(metav1.Object)
+			if o.GetName() == nf {
+				result <- strconv.FormatInt(o.GetGeneration(), 10)
 			}
 			select {
 			case <-ictx.Done():

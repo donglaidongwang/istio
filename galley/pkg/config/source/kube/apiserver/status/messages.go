@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ func NewMessageSet() Messages {
 
 // Add a new message for a given origin.
 func (m *Messages) Add(origin *rt.Origin, msg diag.Message) {
-	k := key{col: origin.Collection, res: origin.Name}
+	k := key{col: origin.Collection, res: origin.FullName}
 	e := m.entries[k]
 	e.origin = origin
 	e.messages = append(e.messages, msg)

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 package virtualservice
 
 import (
-	"istio.io/api/networking/v1alpha3"
+	"fmt"
 
+	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/galley/pkg/config/analysis"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/util"
 	"istio.io/istio/galley/pkg/config/analysis/msg"
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 // GatewayAnalyzer checks the gateways associated with each virtual service
@@ -33,34 +35,83 @@ var _ analysis.Analyzer = &GatewayAnalyzer{}
 // Metadata implements Analyzer
 func (s *GatewayAnalyzer) Metadata() analysis.Metadata {
 	return analysis.Metadata{
-		Name: "virtualservice.GatewayAnalyzer",
+		Name:        "virtualservice.GatewayAnalyzer",
+		Description: "Checks the gateways associated with each virtual service",
 		Inputs: collection.Names{
-			metadata.IstioNetworkingV1Alpha3Gateways,
-			metadata.IstioNetworkingV1Alpha3Virtualservices,
+			collections.IstioNetworkingV1Alpha3Gateways.Name(),
+			collections.IstioNetworkingV1Alpha3Virtualservices.Name(),
 		},
 	}
 }
 
 // Analyze implements Analyzer
 func (s *GatewayAnalyzer) Analyze(c analysis.Context) {
-	c.ForEach(metadata.IstioNetworkingV1Alpha3Virtualservices, func(r *resource.Entry) bool {
+	c.ForEach(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), func(r *resource.Instance) bool {
 		s.analyzeVirtualService(r, c)
 		return true
 	})
 }
 
-func (s *GatewayAnalyzer) analyzeVirtualService(r *resource.Entry, c analysis.Context) {
-	vs := r.Item.(*v1alpha3.VirtualService)
+func (s *GatewayAnalyzer) analyzeVirtualService(r *resource.Instance, c analysis.Context) {
+	vs := r.Message.(*v1alpha3.VirtualService)
+	vsNs := r.Metadata.FullName.Namespace
+	vsName := r.Metadata.FullName
 
-	ns, _ := r.Metadata.Name.InterpretAsNamespaceAndName()
-	for _, gwName := range vs.Gateways {
+	for i, gwName := range vs.Gateways {
 		// This is a special-case accepted value
 		if gwName == util.MeshGateway {
 			continue
 		}
 
-		if !c.Exists(metadata.IstioNetworkingV1Alpha3Gateways, resource.NewName(ns, gwName)) {
-			c.Report(metadata.IstioNetworkingV1Alpha3Virtualservices, msg.NewReferencedResourceNotFound(r, "gateway", gwName))
+		gwFullName := resource.NewShortOrFullName(vsNs, gwName)
+
+		if !c.Exists(collections.IstioNetworkingV1Alpha3Gateways.Name(), gwFullName) {
+			m := msg.NewReferencedResourceNotFound(r, "gateway", gwName)
+
+			if line, ok := util.ErrorLine(r, fmt.Sprintf(util.VSGateway, i)); ok {
+				m.Line = line
+			}
+
+			c.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
+		}
+
+		if !vsHostInGateway(c, gwFullName, vs.Hosts) {
+			m := msg.NewVirtualServiceHostNotFoundInGateway(r, vs.Hosts, vsName.String(), gwFullName.String())
+
+			if line, ok := util.ErrorLine(r, fmt.Sprintf(util.VSGateway, i)); ok {
+				m.Line = line
+			}
+
+			c.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
 		}
 	}
+}
+
+func vsHostInGateway(c analysis.Context, gateway resource.FullName, vsHosts []string) bool {
+	var gatewayHosts []string
+
+	c.ForEach(collections.IstioNetworkingV1Alpha3Gateways.Name(), func(r *resource.Instance) bool {
+		if r.Metadata.FullName == gateway {
+			s := r.Message.(*v1alpha3.Gateway)
+
+			for _, v := range s.Servers {
+				gatewayHosts = append(gatewayHosts, v.Hosts...)
+			}
+		}
+
+		return true
+	})
+
+	for _, gh := range gatewayHosts {
+		for _, vsh := range vsHosts {
+			gatewayHost := host.Name(gh)
+			vsHost := host.Name(vsh)
+
+			if gatewayHost.Matches(vsHost) {
+				return true
+			}
+		}
+	}
+
+	return false
 }

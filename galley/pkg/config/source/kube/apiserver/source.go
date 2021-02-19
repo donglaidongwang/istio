@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,28 +23,29 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 
 	"istio.io/istio/galley/pkg/config/analysis/diag"
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/meta/schema"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
 	"istio.io/istio/galley/pkg/config/processing/snapshotter"
 	"istio.io/istio/galley/pkg/config/scope"
 	"istio.io/istio/galley/pkg/config/source/kube/apiserver/status"
 	"istio.io/istio/galley/pkg/config/source/kube/rt"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/resource"
 )
 
-var (
-	// crdKubeResource is metadata for listening to CRD resource on the API Server.
-	crdKubeResource = schema.KubeResource{
+// crdKubeResource is metadata for listening to CRD resource on the API Server.
+var crdKubeResource = collection.Builder{
+	Name: "k8s/crd",
+	Resource: resource.Builder{
 		Group:   "apiextensions.k8s.io",
 		Version: "v1beta1",
 		Plural:  "customresourcedefinitions",
 		Kind:    "CustomResourceDefinition",
-	}
-)
+	}.BuildNoValidate(),
+}.MustBuild()
 
 // Source is an implementation of processing.KubeSource
 type Source struct { // nolint:maligned
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	options Options
 
 	// Keep the handlers that are registered by this Source. As we're recreating watchers, we need to seed them correctly
@@ -56,7 +57,7 @@ type Source struct { // nolint:maligned
 
 	// Set of resources that we're waiting CRD events for. As CRD events arrive, if they match to entries in
 	// expectedResources, the watchers for those resources will be created.
-	expectedResources map[string]schema.KubeResource
+	expectedResources map[string]collection.Schema
 
 	// Set of resources that have been found so far.
 	foundResources map[string]bool
@@ -77,8 +78,10 @@ type Source struct { // nolint:maligned
 	statusCtl status.Controller
 }
 
-var _ event.Source = &Source{}
-var _ snapshotter.StatusUpdater = &Source{}
+var (
+	_ event.Source              = &Source{}
+	_ snapshotter.StatusUpdater = &Source{}
+)
 
 // New returns a new kube.Source.
 func New(o Options) *Source {
@@ -107,29 +110,30 @@ func (s *Source) Start() {
 		return
 	}
 	s.started = true
-	s.mu.Unlock()
 
 	// Create a set of pending resources. These will be matched up with incoming CRD events for creating watchers for
 	// each resource that we expect.
 	// We also keep track of what resources have been found in the metadata.
-	s.expectedResources = make(map[string]schema.KubeResource)
+	s.expectedResources = make(map[string]collection.Schema)
 	s.foundResources = make(map[string]bool)
-	for _, r := range s.options.Resources {
-		key := asKey(r.Group, r.Kind)
+	for _, r := range s.options.Schemas.All() {
+		key := asKey(r.Resource().Group(), r.Resource().Kind())
 		s.expectedResources[key] = r
 	}
+	// Releasing the lock here to avoid deadlock on crdWatcher between the existing one and a newly started one.
+	s.mu.Unlock()
 
 	// Start the CRD listener. When the listener is fully-synced, the listening of actual resources will start.
 	scope.Source.Infof("Beginning CRD Discovery, to figure out resources that are available...")
-	s.provider = rt.NewProvider(s.options.Client, s.options.ResyncPeriod)
-	a := s.provider.GetAdapter(crdKubeResource)
+	s.provider = rt.NewProvider(s.options.Client, s.options.WatchedNamespaces, s.options.ResyncPeriod)
+	a := s.provider.GetAdapter(crdKubeResource.Resource())
 	s.crdWatcher = newWatcher(crdKubeResource, a, s.statusCtl)
 	s.crdWatcher.dispatch(event.HandlerFromFn(s.onCrdEvent))
 	s.crdWatcher.start()
 }
 
 func (s *Source) onCrdEvent(e event.Event) {
-	scope.Source.Debuga("onCrdEvent: ", e)
+	scope.Source.Debug("onCrdEvent: ", e)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -147,13 +151,13 @@ func (s *Source) onCrdEvent(e event.Event) {
 
 	switch e.Kind {
 	case event.Added:
-		crd := e.Entry.Item.(*v1beta1.CustomResourceDefinitionSpec)
+		crd := e.Resource.Message.(*v1beta1.CustomResourceDefinitionSpec)
 		g := crd.Group
 		k := crd.Names.Kind
 		key := asKey(g, k)
 		r, ok := s.expectedResources[key]
 		if ok {
-			scope.Source.Debugf("Marking resource as available: %v", r.CanonicalResourceName())
+			scope.Source.Debugf("Marking resource as available: %v", r.Resource().GroupVersionKind())
 			s.foundResources[key] = true
 			s.expectedResources[key] = r
 		}
@@ -177,39 +181,44 @@ func (s *Source) startWatchers() {
 	// must be called under lock
 
 	// sort resources by name for consistent logging
-	resources := make([]schema.KubeResource, 0, len(s.expectedResources))
+	resources := make([]collection.Schema, 0, len(s.expectedResources))
 	for _, r := range s.expectedResources {
 		resources = append(resources, r)
 	}
 
 	sort.Slice(resources, func(i, j int) bool {
-		return strings.Compare(resources[i].CanonicalResourceName(), resources[j].CanonicalResourceName()) < 0
+		return strings.Compare(resources[i].Resource().GroupVersionKind().String(), resources[j].Resource().GroupVersionKind().String()) < 0
 	})
 
 	scope.Source.Info("Creating watchers for Kubernetes CRDs")
 	s.watchers = make(map[collection.Name]*watcher)
 	for i, r := range resources {
-		a := s.provider.GetAdapter(r)
+		if s.provider == nil {
+			scope.Source.Warn("stopped before finished starting watchers")
+			return
+		}
+		a := s.provider.GetAdapter(r.Resource())
 
-		found := s.foundResources[asKey(r.Group, r.Kind)]
+		found := s.foundResources[asKey(r.Resource().Group(), r.Resource().Kind())]
 
 		scope.Source.Infof("[%d]", i)
-		scope.Source.Infof("  Source:       %s", r.CanonicalResourceName())
-		scope.Source.Infof("  Name:  		 %s", r.Collection)
+		scope.Source.Infof("  Source:       %s", r.Resource().GroupVersionKind())
+		scope.Source.Infof("  Name:  		 %s", r.Name())
 		scope.Source.Infof("  Built-in:     %v", a.IsBuiltIn())
+		scope.Source.Infof("  Disabled:     %v", r.IsDisabled())
 		if !a.IsBuiltIn() {
 			scope.Source.Infof("  Found:  %v", found)
 		}
 
 		// Send a Full Sync event immediately for custom resources that were never found, or that are disabled.
 		// For everything else, create a watcher.
-		if (!a.IsBuiltIn() && !found) || r.Disabled {
-			scope.Source.Debuga("Source.Start: sending immediate FullSync for: ", r.Collection.Name)
-			s.handlers.Handle(event.FullSyncFor(r.Collection.Name))
+		if (!a.IsBuiltIn() && !found) || r.IsDisabled() {
+			scope.Source.Debug("Source.Start: sending immediate FullSync for: ", r.Name())
+			s.handlers.Handle(event.FullSyncFor(r))
 		} else {
 			col := newWatcher(r, a, s.statusCtl)
 			col.dispatch(s.handlers)
-			s.watchers[r.Collection.Name] = col
+			s.watchers[r.Name()] = col
 		}
 	}
 
@@ -219,7 +228,7 @@ func (s *Source) startWatchers() {
 	}
 
 	for c, w := range s.watchers {
-		scope.Source.Debuga("Source.Start: starting watcher: ", c)
+		scope.Source.Debug("Source.Start: starting watcher: ", c)
 		w.start()
 	}
 }
@@ -239,6 +248,8 @@ func (s *Source) Stop() {
 
 // Update implements processing.StatusUpdater
 func (s *Source) Update(messages diag.Messages) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.statusCtl == nil {
 		panic("received diagnostic messages while the source is not configured with a status controller")
 	}
@@ -255,7 +266,7 @@ func (s *Source) stop() {
 
 	if s.watchers != nil {
 		for c, w := range s.watchers {
-			scope.Source.Debuga("Source.Stop: stopping watcher: ", c)
+			scope.Source.Debug("Source.Stop: stopping watcher: ", c)
 			w.stop()
 		}
 		s.watchers = nil

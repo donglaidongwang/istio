@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,23 +16,35 @@ package analyzers
 
 import (
 	"fmt"
+	"os"
 	"regexp"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 
 	"istio.io/istio/galley/pkg/config/analysis"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/annotations"
-	"istio.io/istio/galley/pkg/config/analysis/analyzers/auth"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/authz"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/deployment"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/deprecation"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/destinationrule"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/gateway"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/injection"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/multicluster"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/service"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/serviceentry"
+	"istio.io/istio/galley/pkg/config/analysis/analyzers/sidecar"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/virtualservice"
 	"istio.io/istio/galley/pkg/config/analysis/diag"
 	"istio.io/istio/galley/pkg/config/analysis/local"
 	"istio.io/istio/galley/pkg/config/analysis/msg"
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
+	"istio.io/istio/galley/pkg/config/processing/snapshotter"
+	"istio.io/istio/galley/pkg/config/scope"
+	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/pkg/log"
 )
 
 type message struct {
@@ -41,10 +53,12 @@ type message struct {
 }
 
 type testCase struct {
-	name       string
-	inputFiles []string
-	analyzer   analysis.Analyzer
-	expected   []message
+	name             string
+	inputFiles       []string
+	meshConfigFile   string // Optional
+	meshNetworksFile string // Optional
+	analyzer         analysis.Analyzer
+	expected         []message
 }
 
 // Some notes on setting up tests for Analyzers:
@@ -54,24 +68,18 @@ type testCase struct {
 //     * Note that if Namespace is omitted in the input YAML, it will be skipped here.
 var testGrid = []testCase{
 	{
-		name:       "serviceRoleBindings",
-		inputFiles: []string{"testdata/servicerolebindings.yaml"},
-		analyzer:   &auth.ServiceRoleBindingAnalyzer{},
-		expected: []message{
-			{msg.ReferencedResourceNotFound, "ServiceRoleBinding test-bogus-binding"},
+		name: "misannoted",
+		inputFiles: []string{
+			"testdata/misannotated.yaml",
 		},
-	},
-	{
-		name:       "serviceRoleServices",
-		inputFiles: []string{"testdata/serviceroleservices.yaml"},
-		analyzer:   &auth.ServiceRoleServicesAnalyzer{},
+		analyzer: &annotations.K8sAnalyzer{},
 		expected: []message{
-			{msg.ReferencedResourceNotFound, "ServiceRole bogus-short-name.default"},
-			{msg.ReferencedResourceNotFound, "ServiceRole bogus-fqdn.default"},
-			{msg.ReferencedResourceNotFound, "ServiceRole fqdn.anothernamespace"},
-			{msg.ReferencedResourceNotFound, "ServiceRole short-name.anothernamespace"},
-			{msg.ReferencedResourceNotFound, "ServiceRole fqdn-cross-ns.anothernamespace"},
-			{msg.ReferencedResourceNotFound, "ServiceRole namespace-wide.anothernamespace"},
+			{msg.UnknownAnnotation, "Service httpbin"},
+			{msg.InvalidAnnotation, "Pod invalid-annotations"},
+			{msg.MisplacedAnnotation, "Pod grafana-test"},
+			{msg.MisplacedAnnotation, "Deployment fortio-deploy"},
+			{msg.MisplacedAnnotation, "Namespace staging"},
+			{msg.DeprecatedAnnotation, "Deployment fortio-deploy"},
 		},
 	},
 	{
@@ -79,11 +87,8 @@ var testGrid = []testCase{
 		inputFiles: []string{"testdata/deprecation.yaml"},
 		analyzer:   &deprecation.FieldAnalyzer{},
 		expected: []message{
-			{msg.Deprecated, "VirtualService route-egressgateway"},
-			{msg.Deprecated, "VirtualService tornado"},
-			{msg.Deprecated, "EnvoyFilter istio-multicluster-egressgateway.istio-system"},
-			{msg.Deprecated, "EnvoyFilter istio-multicluster-egressgateway.istio-system"}, // Duplicate, because resource has two problems
-			{msg.Deprecated, "ServiceRoleBinding bind-mongodb-viewer.default"},
+			{msg.Deprecated, "VirtualService productpage.foo"},
+			{msg.Deprecated, "Sidecar no-selector.default"},
 		},
 	},
 	{
@@ -134,7 +139,16 @@ var testGrid = []testCase{
 			{msg.GatewayPortNotOnWorkload, "Gateway httpbin8002-gateway"},
 		},
 	},
-
+	{
+		name:       "gatewaySecret",
+		inputFiles: []string{"testdata/gateway-secrets.yaml"},
+		analyzer:   &gateway.SecretAnalyzer{},
+		expected: []message{
+			{msg.ReferencedResourceNotFound, "Gateway defaultgateway-bogusCredentialName"},
+			{msg.ReferencedResourceNotFound, "Gateway customgateway-wrongnamespace"},
+			{msg.ReferencedResourceNotFound, "Gateway bogusgateway"},
+		},
+	},
 	{
 		name:       "istioInjection",
 		inputFiles: []string{"testdata/injection.yaml"},
@@ -142,14 +156,73 @@ var testGrid = []testCase{
 		expected: []message{
 			{msg.NamespaceNotInjected, "Namespace bar"},
 			{msg.PodMissingProxy, "Pod noninjectedpod.default"},
+			{msg.NamespaceMultipleInjectionLabels, "Namespace busted"},
 		},
 	},
 	{
-		name:       "istioInjectionVersionMismatch",
-		inputFiles: []string{"testdata/injection-with-mismatched-sidecar.yaml"},
-		analyzer:   &injection.VersionAnalyzer{},
+		name: "istioInjectionProxyImageMismatch",
+		inputFiles: []string{
+			"testdata/injection-with-mismatched-sidecar.yaml",
+			"testdata/common/sidecar-injector-configmap.yaml",
+		},
+		analyzer: &injection.ImageAnalyzer{},
 		expected: []message{
-			{msg.IstioProxyVersionMismatch, "Pod details-v1-pod-old.enabled-namespace"},
+			{msg.IstioProxyImageMismatch, "Pod details-v1-pod-old.enabled-namespace"},
+		},
+	},
+	{
+		name: "istioInjectionProxyImageMismatchAbsolute",
+		inputFiles: []string{
+			"testdata/injection-with-mismatched-sidecar.yaml",
+			"testdata/sidecar-injector-configmap-absolute-override.yaml",
+		},
+		analyzer: &injection.ImageAnalyzer{},
+		expected: []message{
+			{msg.IstioProxyImageMismatch, "Pod details-v1-pod-old.enabled-namespace"},
+		},
+	},
+	{
+		name:       "portNameNotFollowConvention",
+		inputFiles: []string{"testdata/service-no-port-name.yaml"},
+		analyzer:   &service.PortNameAnalyzer{},
+		expected: []message{
+			{msg.PortNameIsNotUnderNamingConvention, "Service my-service1.my-namespace1"},
+			{msg.PortNameIsNotUnderNamingConvention, "Service my-service1.my-namespace1"},
+			{msg.PortNameIsNotUnderNamingConvention, "Service my-service2.my-namespace2"},
+		},
+	},
+	{
+		name:       "namedPort",
+		inputFiles: []string{"testdata/service-port-name.yaml"},
+		analyzer:   &service.PortNameAnalyzer{},
+		expected:   []message{},
+	},
+	{
+		name:       "unnamedPortInSystemNamespace",
+		inputFiles: []string{"testdata/service-no-port-name-system-namespace.yaml"},
+		analyzer:   &service.PortNameAnalyzer{},
+		expected:   []message{},
+	},
+	{
+		name:       "sidecarDefaultSelector",
+		inputFiles: []string{"testdata/sidecar-default-selector.yaml"},
+		analyzer:   &sidecar.DefaultSelectorAnalyzer{},
+		expected: []message{
+			{msg.MultipleSidecarsWithoutWorkloadSelectors, "Sidecar has-conflict-2.ns2"},
+			{msg.MultipleSidecarsWithoutWorkloadSelectors, "Sidecar has-conflict-1.ns2"},
+		},
+	},
+	{
+		name:       "sidecarSelector",
+		inputFiles: []string{"testdata/sidecar-selector.yaml"},
+		analyzer:   &sidecar.SelectorAnalyzer{},
+		expected: []message{
+			{msg.ReferencedResourceNotFound, "Sidecar maps-to-nonexistent.default"},
+			{msg.ReferencedResourceNotFound, "Sidecar maps-to-different-ns.other"},
+			{msg.ConflictingSidecarWorkloadSelectors, "Sidecar dupe-1.default"},
+			{msg.ConflictingSidecarWorkloadSelectors, "Sidecar dupe-2.default"},
+			{msg.ConflictingSidecarWorkloadSelectors, "Sidecar overlap-1.default"},
+			{msg.ConflictingSidecarWorkloadSelectors, "Sidecar overlap-2.default"},
 		},
 	},
 	{
@@ -171,6 +244,11 @@ var testGrid = []testCase{
 		analyzer:   &virtualservice.DestinationHostAnalyzer{},
 		expected: []message{
 			{msg.ReferencedResourceNotFound, "VirtualService reviews-bogushost.default"},
+			{msg.ReferencedResourceNotFound, "VirtualService reviews-bookinfo-other.default"},
+			{msg.ReferencedResourceNotFound, "VirtualService reviews-mirror-bogushost.default"},
+			{msg.ReferencedResourceNotFound, "VirtualService reviews-bogusport.default"},
+			{msg.VirtualServiceDestinationPortSelectorRequired, "VirtualService reviews-2port-missing.default"},
+			{msg.ReferencedResourceNotFound, "VirtualService cross-namespace-details.istio-system"},
 		},
 	},
 	{
@@ -179,6 +257,7 @@ var testGrid = []testCase{
 		analyzer:   &virtualservice.DestinationRuleAnalyzer{},
 		expected: []message{
 			{msg.ReferencedResourceNotFound, "VirtualService reviews-bogussubset.default"},
+			{msg.ReferencedResourceNotFound, "VirtualService reviews-mirror-bogussubset.default"},
 		},
 	},
 	{
@@ -187,19 +266,197 @@ var testGrid = []testCase{
 		analyzer:   &virtualservice.GatewayAnalyzer{},
 		expected: []message{
 			{msg.ReferencedResourceNotFound, "VirtualService httpbin-bogus"},
+
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService cross-test.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService httpbin-bogus"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService httpbin"},
 		},
 	},
 	{
-		name: "misannoted",
-		inputFiles: []string{
-			"testdata/misannotated.yaml",
-		},
-		analyzer: &annotations.K8sAnalyzer{},
+		name:       "serviceMultipleDeployments",
+		inputFiles: []string{"testdata/deployment-multi-service.yaml"},
+		analyzer:   &deployment.ServiceAssociationAnalyzer{},
 		expected: []message{
-			{msg.UnknownAnnotation, "Service httpbin"},
-			{msg.MisplacedAnnotation, "Service details"},
-			{msg.MisplacedAnnotation, "Pod grafana-test"},
-			{msg.MisplacedAnnotation, "Deployment fortio-deploy"},
+			{msg.DeploymentAssociatedToMultipleServices, "Deployment multiple-svc-multiple-prot.bookinfo"},
+			{msg.DeploymentAssociatedToMultipleServices, "Deployment multiple-without-port.bookinfo"},
+			{msg.DeploymentRequiresServiceAssociated, "Deployment no-services.bookinfo"},
+			{msg.DeploymentRequiresServiceAssociated, "Deployment ann-enabled-ns-disabled.injection-disabled-ns"},
+			{msg.DeploymentConflictingPorts, "Deployment conflicting-ports.bookinfo"},
+		},
+	},
+	{
+		name: "regexes",
+		inputFiles: []string{
+			"testdata/virtualservice_regexes.yaml",
+		},
+		analyzer: &virtualservice.RegexAnalyzer{},
+		expected: []message{
+			{msg.InvalidRegexp, "VirtualService bad-match"},
+			{msg.InvalidRegexp, "VirtualService ecma-not-v2"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+			{msg.InvalidRegexp, "VirtualService lots-of-regexes"},
+		},
+	},
+	{
+		name: "unknown service registry in mesh networks",
+		inputFiles: []string{
+			"testdata/multicluster-unknown-serviceregistry.yaml",
+		},
+		meshNetworksFile: "testdata/common/meshnetworks.yaml",
+		analyzer:         &multicluster.MeshNetworksAnalyzer{},
+		expected: []message{
+			{msg.UnknownMeshNetworksServiceRegistry, "MeshNetworks meshnetworks.istio-system"},
+			{msg.UnknownMeshNetworksServiceRegistry, "MeshNetworks meshnetworks.istio-system"},
+		},
+	},
+	{
+		name: "authorizationpolicies",
+		inputFiles: []string{
+			"testdata/authorizationpolicies.yaml",
+		},
+		analyzer: &authz.AuthorizationPoliciesAnalyzer{},
+		expected: []message{
+			{msg.NoMatchingWorkloadsFound, "AuthorizationPolicy meshwide-httpbin-v1.istio-system"},
+			{msg.NoMatchingWorkloadsFound, "AuthorizationPolicy httpbin-empty-namespace-wide.httpbin-empty"},
+			{msg.NoMatchingWorkloadsFound, "AuthorizationPolicy httpbin-nopods.httpbin"},
+			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin-bogus-ns.httpbin"},
+			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin-bogus-ns.httpbin"},
+			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin-bogus-not-ns.httpbin"},
+			{msg.ReferencedResourceNotFound, "AuthorizationPolicy httpbin-bogus-not-ns.httpbin"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, simple at destinationlevel",
+		inputFiles: []string{
+			"testdata/destinationrule-simple-destination.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationDestinationLevel, "DestinationRule db-tls"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, mutual at destinationlevel",
+		inputFiles: []string{
+			"testdata/destinationrule-mutual-destination.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationDestinationLevel, "DestinationRule db-mtls"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, simple at portlevel",
+		inputFiles: []string{
+			"testdata/destinationrule-simple-port.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationPortLevel, "DestinationRule db-tls"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, mutual at portlevel",
+		inputFiles: []string{
+			"testdata/destinationrule-mutual-port.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationPortLevel, "DestinationRule db-mtls"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, mutual at destinationlevel and simple at port level",
+		inputFiles: []string{
+			"testdata/destinationrule-compound-simple-mutual.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationDestinationLevel, "DestinationRule db-mtls"},
+			{msg.NoServerCertificateVerificationPortLevel, "DestinationRule db-mtls"},
+		},
+	},
+	{
+		name: "destinationrule with no cacert, simple at destinationlevel and mutual at port level",
+		inputFiles: []string{
+			"testdata/destinationrule-compound-mutual-simple.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{
+			{msg.NoServerCertificateVerificationPortLevel, "DestinationRule db-mtls"},
+			{msg.NoServerCertificateVerificationDestinationLevel, "DestinationRule db-mtls"},
+		},
+	},
+	{
+		name: "destinationrule with both cacerts",
+		inputFiles: []string{
+			"testdata/destinationrule-with-ca.yaml",
+		},
+		analyzer: &destinationrule.CaCertificateAnalyzer{},
+		expected: []message{},
+	},
+	{
+		name: "dupmatches",
+		inputFiles: []string{
+			"testdata/virtualservice_dupmatches.yaml",
+		},
+		analyzer: &virtualservice.MatchesAnalyzer{},
+		expected: []message{
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-match"},
+			{msg.VirtualServiceUnreachableRule, "VirtualService sample-foo-cluster01.foo"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService almost-duplicate-match"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService duplicate-match"},
+
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-tcp-match"},
+			{msg.VirtualServiceUnreachableRule, "VirtualService duplicate-empty-tcp"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService almost-duplicate-tcp-match"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService duplicate-tcp-match"},
+
+			{msg.VirtualServiceUnreachableRule, "VirtualService tls-routing.none"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService tls-routing-almostmatch.none"},
+			{msg.VirtualServiceIneffectiveMatch, "VirtualService tls-routing.none"},
+		},
+	},
+	{
+		name: "host defined in virtualservice not found in the gateway",
+		inputFiles: []string{
+			"testdata/virtualservice_host_not_found_gateway.yaml",
+		},
+		analyzer: &virtualservice.GatewayAnalyzer{},
+		expected: []message{
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-01.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-02.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-02-test-03.default"},
+			{msg.VirtualServiceHostNotFoundInGateway, "VirtualService testing-service-03-test-04.default"},
+		},
+	},
+	{
+		name: "missing Addresses and Protocol in Service Entry",
+		inputFiles: []string{
+			"testdata/serviceentry-missing-addresses-protocol.yaml",
+		},
+		analyzer: &serviceentry.ProtocolAdressesAnalyzer{},
+		expected: []message{
+			{msg.ServiceEntryAddressesRequired, "ServiceEntry service-entry-test-03.default"},
+			{msg.ServiceEntryAddressesRequired, "ServiceEntry service-entry-test-04.default"},
+			{msg.ServiceEntryAddressesRequired, "ServiceEntry service-entry-test-07.default"},
+		},
+	},
+	{
+		name: "certificate duplication in Gateway",
+		inputFiles: []string{
+			"testdata/gateway-duplicate-certificate.yaml",
+		},
+		analyzer: &gateway.CertificateAnalyzer{},
+		expected: []message{
+			{msg.GatewayDuplicateCertificate, "Gateway gateway-01-test-01.istio-system"},
+			{msg.GatewayDuplicateCertificate, "Gateway gateway-02-test-01.istio-system"},
+			{msg.GatewayDuplicateCertificate, "Gateway gateway-01-test-02.istio-system"},
+			{msg.GatewayDuplicateCertificate, "Gateway gateway-01-test-03.default"},
 		},
 	},
 }
@@ -217,13 +474,13 @@ func TestAnalyzers(t *testing.T) {
 	requestedInputsByAnalyzer := make(map[string]map[collection.Name]struct{})
 
 	// For each test case, verify we get the expected messages as output
-	for _, testCase := range testGrid {
-		testCase := testCase // Capture range variable so subtests work correctly
-		t.Run(testCase.name, func(t *testing.T) {
-			g := NewGomegaWithT(t)
+	for _, tc := range testGrid {
+		tc := tc // Capture range variable so subtests work correctly
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
 
 			// Set up a hook to record which collections are accessed by each analyzer
-			analyzerName := testCase.analyzer.Metadata().Name
+			analyzerName := tc.analyzer.Metadata().Name
 			cr := func(col collection.Name) {
 				if _, ok := requestedInputsByAnalyzer[analyzerName]; !ok {
 					requestedInputsByAnalyzer[analyzerName] = make(map[collection.Name]struct{})
@@ -231,28 +488,26 @@ func TestAnalyzers(t *testing.T) {
 				requestedInputsByAnalyzer[analyzerName][col] = struct{}{}
 			}
 
-			sa := local.NewSourceAnalyzer(metadata.MustGet(), analysis.Combine("testCombined", testCase.analyzer), "", cr, true)
-
-			err := sa.AddFileKubeSource(testCase.inputFiles)
+			// Set up Analyzer for this test case
+			sa, err := setupAnalyzerForCase(tc, cr)
 			if err != nil {
-				t.Fatalf("Error setting up file kube source on testcase %s: %v", testCase.name, err)
-			}
-			cancel := make(chan struct{})
-
-			result, err := sa.Analyze(cancel)
-			if err != nil {
-				t.Fatalf("Error running analysis on testcase %s: %v", testCase.name, err)
+				t.Fatalf("Error setting up analysis for testcase %s: %v", tc.name, err)
 			}
 
-			actualMsgs := extractFields(result.Messages)
-			g.Expect(actualMsgs).To(ConsistOf(testCase.expected))
+			// Run the analysis
+			result, err := runAnalyzer(sa)
+			if err != nil {
+				t.Fatalf("Error running analysis on testcase %s: %v", tc.name, err)
+			}
+
+			g.Expect(extractFields(result.Messages)).To(ConsistOf(tc.expected), "%v", prettyPrintMessages(result.Messages))
 		})
 	}
 
 	// Verify that the collections actually accessed during testing actually match
 	// the collections declared as inputs for each of the analyzers
 	t.Run("CheckMetadataInputs", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 	outer:
 		for _, a := range All() {
 			analyzerName := a.Metadata().Name
@@ -280,13 +535,31 @@ func TestAnalyzers(t *testing.T) {
 	})
 }
 
+// Verify that all of the analyzers tested here are also registered in All()
+func TestAnalyzersInAll(t *testing.T) {
+	g := NewWithT(t)
+
+	var allNames []string
+	for _, a := range All() {
+		allNames = append(allNames, a.Metadata().Name)
+	}
+
+	for _, tc := range testGrid {
+		g.Expect(allNames).To(ContainElement(tc.analyzer.Metadata().Name))
+	}
+}
+
 func TestAnalyzersHaveUniqueNames(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	existingNames := make(map[string]struct{})
 	for _, a := range All() {
 		n := a.Metadata().Name
 		_, ok := existingNames[n]
+		// TODO (Nino-K): remove this condition once metadata is clean up
+		if ok == true && n == "schema.ValidationAnalyzer.ServiceEntry" {
+			continue
+		}
 		g.Expect(ok).To(BeFalse(), fmt.Sprintf("Analyzer name %q is used more than once. "+
 			"Analyzers should be registered in All() exactly once and have a unique name.", n))
 
@@ -294,17 +567,92 @@ func TestAnalyzersHaveUniqueNames(t *testing.T) {
 	}
 }
 
+func TestAnalyzersHaveDescription(t *testing.T) {
+	g := NewWithT(t)
+
+	for _, a := range All() {
+		g.Expect(a.Metadata().Description).ToNot(Equal(""))
+	}
+}
+
+func setupAnalyzerForCase(tc testCase, cr snapshotter.CollectionReporterFn) (*local.SourceAnalyzer, error) {
+	sa := local.NewSourceAnalyzer(schema.MustGet(), analysis.Combine("testCase", tc.analyzer), "", "istio-system", cr, true, 10*time.Second)
+
+	// If a mesh config file is specified, use it instead of the defaults
+	if tc.meshConfigFile != "" {
+		err := sa.AddFileKubeMeshConfig(tc.meshConfigFile)
+		if err != nil {
+			return nil, fmt.Errorf("error applying mesh config file %s: %v", tc.meshConfigFile, err)
+		}
+	}
+
+	if tc.meshNetworksFile != "" {
+		err := sa.AddFileKubeMeshNetworks(tc.meshNetworksFile)
+		if err != nil {
+			return nil, fmt.Errorf("error apply mesh networks file %s: %v", tc.meshNetworksFile, err)
+		}
+	}
+
+	// Include default resources
+	err := sa.AddDefaultResources()
+	if err != nil {
+		return nil, fmt.Errorf("error adding default resources: %v", err)
+	}
+
+	// Gather test files
+	var files []local.ReaderSource
+	for _, f := range tc.inputFiles {
+		of, err := os.Open(f)
+		if err != nil {
+			return nil, fmt.Errorf("error opening test file: %q", f)
+		}
+		files = append(files, local.ReaderSource{Name: f, Reader: of})
+	}
+
+	// Include resources from test files
+	err = sa.AddReaderKubeSource(files)
+	if err != nil {
+		return nil, fmt.Errorf("error setting up file kube source on testcase %s: %v", tc.name, err)
+	}
+
+	return sa, nil
+}
+
+func runAnalyzer(sa *local.SourceAnalyzer) (local.AnalysisResult, error) {
+	// Default processing log level is too chatty for these tests
+	prevLogLevel := scope.Processing.GetOutputLevel()
+	scope.Processing.SetOutputLevel(log.ErrorLevel)
+	defer scope.Processing.SetOutputLevel(prevLogLevel)
+
+	cancel := make(chan struct{})
+	result, err := sa.Analyze(cancel)
+	if err != nil {
+		return local.AnalysisResult{}, err
+	}
+	return result, err
+}
+
 // Pull just the fields we want to check out of diag.Message
-func extractFields(msgs []diag.Message) []message {
+func extractFields(msgs diag.Messages) []message {
 	result := make([]message, 0)
 	for _, m := range msgs {
 		expMsg := message{
 			messageType: m.Type,
 		}
-		if m.Origin != nil {
-			expMsg.origin = m.Origin.FriendlyName()
+		if m.Resource != nil {
+			expMsg.origin = m.Resource.Origin.FriendlyName()
 		}
+
 		result = append(result, expMsg)
 	}
 	return result
+}
+
+func prettyPrintMessages(msgs diag.Messages) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Analyzer messages: %d\n", len(msgs))
+	for _, m := range msgs {
+		fmt.Fprintf(&sb, "\t%s\n", m.String())
+	}
+	return sb.String()
 }

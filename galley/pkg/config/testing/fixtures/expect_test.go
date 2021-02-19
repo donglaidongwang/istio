@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@ package fixtures_test
 import (
 	"testing"
 
+	"istio.io/istio/galley/pkg/config/testing/basicmeta"
 	"istio.io/istio/galley/pkg/config/testing/data"
 	"istio.io/istio/galley/pkg/config/testing/fixtures"
 )
@@ -33,7 +34,7 @@ func TestExpect_FullSync(t *testing.T) {
 	acc := &fixtures.Accumulator{}
 	acc.Handle(data.Event1Col1Synced)
 
-	fixtures.ExpectFullSync(t, acc, data.Collection1)
+	fixtures.ExpectFullSync(t, acc, basicmeta.K8SCollection1)
 }
 
 func TestExpect_None(t *testing.T) {

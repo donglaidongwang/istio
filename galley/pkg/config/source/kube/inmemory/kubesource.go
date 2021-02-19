@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,23 +15,28 @@
 package inmemory
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 
-	"github.com/ghodss/yaml"
 	"github.com/hashicorp/go-multierror"
+	yamlv3 "gopkg.in/yaml.v3"
 	kubeJson "k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/util/yaml"
 
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/meta/schema"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
 	"istio.io/istio/galley/pkg/config/scope"
 	"istio.io/istio/galley/pkg/config/source/inmemory"
 	"istio.io/istio/galley/pkg/config/source/kube/rt"
 	"istio.io/istio/galley/pkg/config/util/kubeyaml"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	schemaresource "istio.io/istio/pkg/config/schema/resource"
 )
 
 var inMemoryKubeNameDiscriminator int64
@@ -41,9 +46,9 @@ type KubeSource struct {
 	mu sync.Mutex
 
 	name      string
-	resources schema.KubeResources
+	schemas   *collection.Schemas
 	source    *inmemory.Source
-	defaultNs string
+	defaultNs resource.Namespace
 
 	versionCtr int64
 	shas       map[kubeResourceKey]resourceSha
@@ -53,43 +58,43 @@ type KubeSource struct {
 type resourceSha [sha1.Size]byte
 
 type kubeResource struct {
-	entry *resource.Entry
-	spec  schema.KubeResource
-	sha   resourceSha
+	resource *resource.Instance
+	schema   collection.Schema
+	sha      resourceSha
 }
 
 func (r *kubeResource) newKey() kubeResourceKey {
 	return kubeResourceKey{
-		kind:     r.spec.Kind,
-		fullName: r.entry.Metadata.Name,
+		kind:     r.schema.Resource().Kind(),
+		fullName: r.resource.Metadata.FullName,
 	}
 }
 
 type kubeResourceKey struct {
-	fullName resource.Name
+	fullName resource.FullName
 	kind     string
 }
 
 var _ event.Source = &KubeSource{}
 
 // NewKubeSource returns a new in-memory Source that works with Kubernetes resources.
-func NewKubeSource(resources schema.KubeResources) *KubeSource {
+func NewKubeSource(schemas collection.Schemas) *KubeSource {
 	name := fmt.Sprintf("kube-inmemory-%d", inMemoryKubeNameDiscriminator)
 	inMemoryKubeNameDiscriminator++
 
-	s := inmemory.New(resources.Collections())
+	s := inmemory.New(schemas)
 
 	return &KubeSource{
-		name:      name,
-		resources: resources,
-		source:    s,
-		shas:      make(map[kubeResourceKey]resourceSha),
-		byFile:    make(map[string]map[kubeResourceKey]collection.Name),
+		name:    name,
+		schemas: &schemas,
+		source:  s,
+		shas:    make(map[kubeResourceKey]resourceSha),
+		byFile:  make(map[string]map[kubeResourceKey]collection.Name),
 	}
 }
 
 // SetDefaultNamespace enables injecting a default namespace for resources where none is already specified
-func (s *KubeSource) SetDefaultNamespace(defaultNs string) {
+func (s *KubeSource) SetDefaultNamespace(defaultNs resource.Namespace) {
 	s.defaultNs = defaultNs
 }
 
@@ -143,7 +148,7 @@ func (s *KubeSource) ApplyContent(name, yamlText string) error {
 	defer s.mu.Unlock()
 
 	// We hold off on dealing with parseErr until the end, since partial success is possible
-	resources, parseErrs := s.parseContent(s.resources, name, yamlText)
+	resources, parseErrs := s.parseContent(s.schemas, name, yamlText)
 
 	oldKeys := s.byFile[name]
 	newKeys := make(map[kubeResourceKey]collection.Name)
@@ -154,14 +159,14 @@ func (s *KubeSource) ApplyContent(name, yamlText string) error {
 		oldSha, found := s.shas[key]
 		if !found || oldSha != r.sha {
 			s.versionCtr++
-			r.entry.Metadata.Version = resource.Version(fmt.Sprintf("v%d", s.versionCtr))
-			scope.Source.Debuga("KubeSource.ApplyContent: Set: ", r.spec.Collection.Name, r.entry.Metadata.Name)
-			s.source.Get(r.spec.Collection.Name).Set(r.entry)
+			r.resource.Metadata.Version = resource.Version(fmt.Sprintf("v%d", s.versionCtr))
+			scope.Source.Debug("KubeSource.ApplyContent: Set: ", r.schema.Name(), r.resource.Metadata.FullName)
+			s.source.Get(r.schema.Name()).Set(r.resource)
 			s.shas[key] = r.sha
 		}
-		newKeys[key] = r.spec.Collection.Name
+		newKeys[key] = r.schema.Name()
 		if oldKeys != nil {
-			scope.Source.Debuga("KubeSource.ApplyContent: Delete: ", r.spec.Collection.Name, key)
+			scope.Source.Debug("KubeSource.ApplyContent: Delete: ", r.schema.Name(), key)
 			delete(oldKeys, key)
 		}
 	}
@@ -193,27 +198,63 @@ func (s *KubeSource) RemoveContent(name string) {
 	}
 }
 
-func (s *KubeSource) parseContent(r schema.KubeResources, name, yamlText string) ([]kubeResource, error) {
+func (s *KubeSource) parseContent(r *collection.Schemas, name, yamlText string) ([]kubeResource, error) {
 	var resources []kubeResource
 	var errs error
-	for i, chunk := range kubeyaml.Split([]byte(yamlText)) {
-		chunk = bytes.TrimSpace(chunk)
-		r, err := s.parseChunk(r, chunk)
+
+	reader := bufio.NewReader(strings.NewReader(yamlText))
+	decoder := kubeyaml.NewYAMLReader(reader)
+	chunkCount := -1
+
+	for {
+		chunkCount++
+		doc, lineNum, err := decoder.Read()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
-			e := fmt.Errorf("error processing %s[%d]: %v", name, i, err)
+			e := fmt.Errorf("error reading documents in %s[%d]: %v", name, chunkCount, err)
 			scope.Source.Warnf("%v - skipping", e)
-			scope.Source.Debugf("Failed to parse yaml chunk: %v", string(chunk))
+			scope.Source.Debugf("Failed to parse yamlText chunk: %v", yamlText)
 			errs = multierror.Append(errs, e)
+			break
+		}
+
+		chunk := bytes.TrimSpace(doc)
+		r, err := s.parseChunk(r, name, lineNum, chunk)
+		if err != nil {
+			var uerr *unknownSchemaError
+			if errors.As(err, &uerr) {
+				// Note the error to the debug log but continue
+				scope.Source.Debugf("skipping unknown yaml chunk %s: %s", name, uerr.Error())
+			} else {
+				e := fmt.Errorf("error processing %s[%d]: %v", name, chunkCount, err)
+				scope.Source.Warnf("%v - skipping", e)
+				scope.Source.Debugf("Failed to parse yaml chunk: %v", string(chunk))
+				errs = multierror.Append(errs, e)
+			}
 			continue
 		}
 		resources = append(resources, r)
 	}
+
 	return resources, errs
 }
 
-func (s *KubeSource) parseChunk(r schema.KubeResources, yamlChunk []byte) (kubeResource, error) {
+// unknownSchemaError represents a schema was not found for a group+version+kind.
+type unknownSchemaError struct {
+	group   string
+	version string
+	kind    string
+}
+
+func (e unknownSchemaError) Error() string {
+	return fmt.Sprintf("failed finding schema for group/version/kind: %s/%s/%s", e.group, e.version, e.kind)
+}
+
+func (s *KubeSource) parseChunk(r *collection.Schemas, name string, lineNum int, yamlChunk []byte) (kubeResource, error) {
 	// Convert to JSON
-	jsonChunk, err := yaml.YAMLToJSON(yamlChunk)
+	jsonChunk, err := yaml.ToJSON(yamlChunk)
 	if err != nil {
 		return kubeResource{}, fmt.Errorf("failed converting YAML to JSON: %v", err)
 	}
@@ -224,12 +265,20 @@ func (s *KubeSource) parseChunk(r schema.KubeResources, yamlChunk []byte) (kubeR
 		return kubeResource{}, fmt.Errorf("failed interpreting jsonChunk: %v", err)
 	}
 
-	resourceSpec, found := r.Find(groupVersionKind.Group, groupVersionKind.Kind)
-	if !found {
-		return kubeResource{}, fmt.Errorf("failed finding spec for group/kind: %s/%s", groupVersionKind.Group, groupVersionKind.Kind)
+	if groupVersionKind.Empty() {
+		return kubeResource{}, fmt.Errorf("unable to parse resource with no group, version and kind")
 	}
 
-	t := rt.DefaultProvider().GetAdapter(resourceSpec)
+	schema, found := r.FindByGroupVersionKind(schemaresource.FromKubernetesGVK(groupVersionKind))
+	if !found {
+		return kubeResource{}, &unknownSchemaError{
+			group:   groupVersionKind.Group,
+			version: groupVersionKind.Version,
+			kind:    groupVersionKind.Kind,
+		}
+	}
+
+	t := rt.DefaultProvider().GetAdapter(schema.Resource())
 	obj, err := t.ParseJSON(jsonChunk)
 	if err != nil {
 		return kubeResource{}, fmt.Errorf("failed parsing JSON for built-in type: %v", err)
@@ -239,10 +288,10 @@ func (s *KubeSource) parseChunk(r schema.KubeResources, yamlChunk []byte) (kubeR
 	// If namespace is blank and we have a default set, fill in the default
 	// (This mirrors the behavior if you kubectl apply a resource without a namespace defined)
 	// Don't do this for cluster scoped resources
-	if !resourceSpec.ClusterScoped {
+	if !schema.Resource().IsClusterScoped() {
 		if objMeta.GetNamespace() == "" && s.defaultNs != "" {
 			scope.Source.Debugf("KubeSource.parseChunk: namespace not specified for %q, using %q", objMeta.GetName(), s.defaultNs)
-			objMeta.SetNamespace(s.defaultNs)
+			objMeta.SetNamespace(string(s.defaultNs))
 		}
 	} else {
 		// Clear the namespace if there is any specified.
@@ -254,9 +303,64 @@ func (s *KubeSource) parseChunk(r schema.KubeResources, yamlChunk []byte) (kubeR
 		return kubeResource{}, err
 	}
 
+	// Build flat map for analyzers if the line JSON object exists, if the YAML text is ill-formed, this will be nil
+	fieldMap := make(map[string]int)
+
+	// yamlv3.Node contains information like line number of the node, which will be used with its name to construct the field map
+	yamlChunkNode := yamlv3.Node{}
+	err = yamlv3.Unmarshal(yamlChunk, &yamlChunkNode)
+	if err == nil && len(yamlChunkNode.Content) == 1 {
+
+		// Get the Node that contains all the YAML chunk information
+		yamlNode := yamlChunkNode.Content[0]
+
+		BuildFieldPathMap(yamlNode, lineNum, "", fieldMap)
+	}
+
+	pos := rt.Position{Filename: name, Line: lineNum}
 	return kubeResource{
-		spec:  resourceSpec,
-		sha:   sha1.Sum(yamlChunk),
-		entry: rt.ToResourceEntry(objMeta, &resourceSpec, item),
+		schema:   schema,
+		sha:      sha1.Sum(yamlChunk),
+		resource: rt.ToResource(objMeta, schema, item, &pos, fieldMap),
 	}, nil
+}
+
+// BuildFieldPathMap builds the flat map for each field of the YAML resource
+func BuildFieldPathMap(yamlNode *yamlv3.Node, startLineNum int, curPath string, fieldPathMap map[string]int) {
+	// If no content in the node, terminate the DFS search
+	if len(yamlNode.Content) == 0 {
+		return
+	}
+
+	nodeContent := yamlNode.Content
+	// Iterate content by a step of 2, because in the content array the value is in the key's next index position
+	for i := 0; i < len(nodeContent)-1; i += 2 {
+		// Two condition, i + 1 positions have no content, which means they have the format like "key: value", then build the map
+		// Or i + 1 has contents, which means "key:\n  value...", then perform one more DFS search
+		keyNode := nodeContent[i]
+		valueNode := nodeContent[i+1]
+		pathKeyForMap := fmt.Sprintf("%s.%s", curPath, keyNode.Value)
+
+		switch {
+		case valueNode.Kind == yamlv3.ScalarNode:
+			// Can build map because the value node has no content anymore
+			// minus one because startLineNum starts at line 1, and yamlv3.Node.line also starts at line 1
+			fieldPathMap[fmt.Sprintf("{%s}", pathKeyForMap)] = valueNode.Line + startLineNum - 1
+
+		case valueNode.Kind == yamlv3.MappingNode:
+			BuildFieldPathMap(valueNode, startLineNum, pathKeyForMap, fieldPathMap)
+
+		case valueNode.Kind == yamlv3.SequenceNode:
+			for j, node := range valueNode.Content {
+				pathWithIndex := fmt.Sprintf("%s[%d]", pathKeyForMap, j)
+
+				// Array with values or array with maps
+				if node.Kind == yamlv3.ScalarNode {
+					fieldPathMap[fmt.Sprintf("{%s}", pathWithIndex)] = node.Line + startLineNum - 1
+				} else {
+					BuildFieldPathMap(node, startLineNum, pathWithIndex, fieldPathMap)
+				}
+			}
+		}
+	}
 }

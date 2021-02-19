@@ -17,7 +17,10 @@
 
 # Separate downloader for istioctl
 #
-# This file will be fetched as: curl -sL https://git.io/getLatestIstioCtl | sh -
+# You can fetch the the istioctl file using:
+# curl -sL https://raw.githubusercontent.com/istio/istio/${BRANCH}/release/downloadIstioCtl.sh | sh -
+#
+# where ${BRANCH} is either your branch name (e.g. release-1.4) or master.
 #
 
 # Determines the operating system.
@@ -28,11 +31,12 @@ else
   OSEXT="linux"
 fi
 
-# Determines the istioctl version.
+# Determine the latest Istio version by version number ignoring alpha, beta, and rc versions.
 if [ "x${ISTIO_VERSION}" = "x" ] ; then
-  ISTIO_VERSION=$(curl -L -s https://api.github.com/repos/istio/istio/releases | \
-                  grep tag_name | sed "s/ *\"tag_name\": *\"\\(.*\\)\",*/\\1/" | \
-                  sort -t"." -k 1,1 -k 2,2 -k 3,3 -k 4,4 | tail -n 1)
+  ISTIO_VERSION="$(curl -sL https://github.com/istio/istio/releases | \
+                  grep -o 'releases/[0-9]*.[0-9]*.[0-9]*/' | sort --version-sort | \
+                  tail -1 | awk -F'/' '{ print $2}')"
+  ISTIO_VERSION="${ISTIO_VERSION##*/}"
 fi
 
 if [ "x${ISTIO_VERSION}" = "x" ] ; then
@@ -40,17 +44,81 @@ if [ "x${ISTIO_VERSION}" = "x" ] ; then
   exit;
 fi
 
+LOCAL_ARCH=$(uname -m)
+if [ "${TARGET_ARCH}" ]; then
+    LOCAL_ARCH=${TARGET_ARCH}
+fi
+
+case "${LOCAL_ARCH}" in 
+  x86_64)
+    ISTIO_ARCH=amd64
+    ;;
+  armv8*)
+    ISTIO_ARCH=arm64
+    ;;
+  aarch64*)
+    ISTIO_ARCH=arm64
+    ;;
+  armv*)
+    ISTIO_ARCH=armv7
+    ;;
+  amd64|arm64)
+    ISTIO_ARCH=${LOCAL_ARCH}
+    ;;
+  *)
+    echo "This system's architecture, ${LOCAL_ARCH}, isn't supported"
+    exit 1
+    ;;
+esac
+
+download_failed () {
+  printf "Download failed, please make sure your ISTIO_VERSION is correct and verify the download URL exists!"
+  exit 1
+}
+
 # Downloads the istioctl binary archive.
 tmp=$(mktemp -d /tmp/istioctl.XXXXXX)
-filename="istioctl-${ISTIO_VERSION}-${OSEXT}.tar.gz"
+NAME="istioctl-${ISTIO_VERSION}"
+
 cd "$tmp" || exit
 URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istioctl-${ISTIO_VERSION}-${OSEXT}.tar.gz"
-printf "Downloading %s from %s ... \n" "${filename}" "${URL}"
-curl -sLO "${URL}"
+ARCH_URL="https://github.com/istio/istio/releases/download/${ISTIO_VERSION}/istioctl-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
+
+with_arch() {
+  printf "\nDownloading %s from %s ...\n" "${NAME}" "$ARCH_URL"
+  curl -fsLO "$ARCH_URL"
+  filename="istioctl-${ISTIO_VERSION}-${OSEXT}-${ISTIO_ARCH}.tar.gz"
+  tar -xzf "${filename}"
+}
+
+without_arch() {
+  printf "\n Downloading %s from %s ... \n" "${NAME}" "${URL}"
+  curl -fsLO "$URL"
+  filename="istioctl-${ISTIO_VERSION}-${OSEXT}.tar.gz"
+  tar -xzf "${filename}"
+}
+
+# Istio 1.6 and above support arch
+ARCH_SUPPORTED=$(echo "$ISTIO_VERSION" | awk  '{ ARCH_SUPPORTED=substr($0, 1, 3); print ARCH_SUPPORTED; }' )
+# Istio 1.5 and below do not have arch support
+ARCH_UNSUPPORTED="1.5"
+
+if [ "${OS}" = "Linux" ] ; then
+  # This checks if 1.6 <= 1.5 or 1.4 <= 1.5
+  if [ "$(expr "${ARCH_SUPPORTED}" \<= "${ARCH_UNSUPPORTED}")" -eq 1 ]; then
+    without_arch
+  else
+    with_arch
+  fi
+elif [ "x${OS}" = "xDarwin" ] ; then
+  without_arch
+else
+  download_failed
+fi
+
 printf "%s download complete!\n" "${filename}"
 
 # setup istioctl
-tar -xzf "${filename}"
 cd "$HOME" || exit
 mkdir -p ".istioctl/bin"
 mv "${tmp}/istioctl" ".istioctl/bin/istioctl"
@@ -63,7 +131,7 @@ printf "Add the istioctl to your path with:"
 printf "\n"
 printf "  export PATH=\$PATH:\$HOME/.istioctl/bin \n"
 printf "\n"
-printf "Begin the Istio pre-installation verification check by running:\n"
-printf "\t istioctl verify-install \n"
+printf "Begin the Istio pre-installation check by running:\n"
+printf "\t istioctl x precheck \n"
 printf "\n"
 printf "Need more information? Visit https://istio.io/docs/reference/commands/istioctl/ \n"

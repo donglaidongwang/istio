@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,18 @@
 package option
 
 import (
-	"net"
-
 	"github.com/gogo/protobuf/types"
 
 	meshAPI "istio.io/api/mesh/v1alpha1"
 	networkingAPI "istio.io/api/networking/v1alpha3"
-
 	"istio.io/istio/pilot/pkg/model"
 )
 
-type LocalhostValue string
-type WildcardValue string
-type DNSLookupFamilyValue string
+type (
+	LocalhostValue       string
+	WildcardValue        string
+	DNSLookupFamilyValue string
+)
 
 const (
 	LocalhostIPv4       LocalhostValue       = "127.0.0.1"
@@ -43,15 +42,7 @@ func ProxyConfig(value *meshAPI.ProxyConfig) Instance {
 }
 
 func PilotSubjectAltName(value []string) Instance {
-	return newOption("pilot_SAN", value)
-}
-
-func MixerSubjectAltName(value []string) Instance {
-	san := ""
-	if len(value) > 0 {
-		san = value[0]
-	}
-	return newOptionOrSkipIfZero("MixerSubjectAltName", san)
+	return newOption("pilot_SAN", value).withConvert(sanConverter(value))
 }
 
 func ConnectTimeout(value *types.Duration) Instance {
@@ -78,16 +69,12 @@ func SubZone(value string) Instance {
 	return newOptionOrSkipIfZero("sub_zone", value)
 }
 
-func NodeMetadata(meta *model.NodeMetadata, rawMeta map[string]interface{}) Instance {
+func NodeMetadata(meta *model.BootstrapNodeMetadata, rawMeta map[string]interface{}) Instance {
 	return newOptionOrSkipIfZero("meta_json_str", meta).withConvert(nodeMetadataConverter(meta, rawMeta))
 }
 
 func DiscoveryAddress(value string) Instance {
 	return newOption("discovery_address", value)
-}
-
-func DNSRefreshRate(value string) Instance {
-	return newOption("dns_refresh_rate", value)
 }
 
 func Localhost(value LocalhostValue) Instance {
@@ -102,32 +89,12 @@ func DNSLookupFamily(value DNSLookupFamilyValue) Instance {
 	return newOption("dns_lookup_family", value)
 }
 
-func PodName(value string) Instance {
-	return newOptionOrSkipIfZero("PodName", value)
+func ProxyViaAgent(value bool) Instance {
+	return newOption("proxy_via_agent", value)
 }
 
-func PodNamespace(value string) Instance {
-	return newOptionOrSkipIfZero("PodNamespace", value)
-}
-
-func PodIP(value net.IP) Instance {
-	return newOption("PodIP", value).withConvert(podIPConverter(value))
-}
-
-func ControlPlaneAuth(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "enable"
-	}
-	return newOptionOrSkipIfZero("ControlPlaneAuth", strVal)
-}
-
-func DisableReportCalls(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "true"
-	}
-	return newOptionOrSkipIfZero("DisableReportCalls", strVal)
+func OutlierLogPath(value string) Instance {
+	return newOptionOrSkipIfZero("outlier_log_path", value)
 }
 
 func LightstepAddress(value string) Instance {
@@ -138,12 +105,13 @@ func LightstepToken(value string) Instance {
 	return newOption("lightstepToken", value)
 }
 
-func LightstepSecure(value bool) Instance {
-	return newOption("lightstepSecure", value)
+func OpenCensusAgentAddress(value string) Instance {
+	return newOptionOrSkipIfZero("openCensusAgent", value)
 }
 
-func LightstepCACertPath(value string) Instance {
-	return newOption("lightstepCacertPath", value)
+func OpenCensusAgentContexts(value []meshAPI.Tracing_OpenCensusAgent_TraceContext) Instance {
+	return newOption("openCensusAgentContexts", value).
+		withConvert(openCensusAgentContextConverter(value))
 }
 
 func StackDriverEnabled(value bool) Instance {
@@ -186,13 +154,18 @@ func StatsdAddress(value string) Instance {
 	return newOptionOrSkipIfZero("statsd", value).withConvert(addressConverter(value))
 }
 
+func TracingTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata, isH2 bool) Instance {
+	return newOptionOrSkipIfZero("tracing_tls", value).
+		withConvert(transportSocketConverter(value, "tracer", metadata, isH2))
+}
+
 func EnvoyMetricsServiceAddress(value string) Instance {
 	return newOptionOrSkipIfZero("envoy_metrics_service_address", value).withConvert(addressConverter(value))
 }
 
-func EnvoyMetricsServiceTLS(value *networkingAPI.TLSSettings, metadata *model.NodeMetadata) Instance {
+func EnvoyMetricsServiceTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata) Instance {
 	return newOptionOrSkipIfZero("envoy_metrics_service_tls", value).
-		withConvert(tlsConverter(value, "envoy_metrics_service", metadata))
+		withConvert(transportSocketConverter(value, "envoy_metrics_service", metadata, true))
 }
 
 func EnvoyMetricsServiceTCPKeepalive(value *networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive) Instance {
@@ -203,13 +176,17 @@ func EnvoyAccessLogServiceAddress(value string) Instance {
 	return newOptionOrSkipIfZero("envoy_accesslog_service_address", value).withConvert(addressConverter(value))
 }
 
-func EnvoyAccessLogServiceTLS(value *networkingAPI.TLSSettings, metadata *model.NodeMetadata) Instance {
+func EnvoyAccessLogServiceTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata) Instance {
 	return newOptionOrSkipIfZero("envoy_accesslog_service_tls", value).
-		withConvert(tlsConverter(value, "envoy_accesslog_service", metadata))
+		withConvert(transportSocketConverter(value, "envoy_accesslog_service", metadata, true))
 }
 
 func EnvoyAccessLogServiceTCPKeepalive(value *networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive) Instance {
 	return newTCPKeepaliveOption("envoy_accesslog_service_tcp_keepalive", value)
+}
+
+func EnvoyExtraStatTags(value []string) Instance {
+	return newStringArrayOptionOrSkipIfEmpty("extraStatTags", value)
 }
 
 func EnvoyStatsMatcherInclusionPrefix(value []string) Instance {
@@ -224,10 +201,26 @@ func EnvoyStatsMatcherInclusionRegexp(value []string) Instance {
 	return newStringArrayOptionOrSkipIfEmpty("inclusionRegexps", value)
 }
 
-func SDSUDSPath(value string) Instance {
-	return newOption("sds_uds_path", value)
+func PilotCertProvider(value string) Instance {
+	return newOption("pilot_cert_provider", value)
 }
 
-func SDSTokenPath(value string) Instance {
-	return newOption("sds_token_path", value)
+func STSPort(value int) Instance {
+	return newOption("sts_port", value)
+}
+
+func GCPProjectID(value string) Instance {
+	return newOption("gcp_project_id", value)
+}
+
+func STSEnabled(value bool) Instance {
+	return newOption("sts", value)
+}
+
+func ProvCert(value string) Instance {
+	return newOption("provisioned_cert", value)
+}
+
+func DiscoveryHost(value string) Instance {
+	return newOption("discovery_host", value)
 }

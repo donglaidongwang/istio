@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,41 +16,83 @@ package rt
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 // Origin is a K8s specific implementation of resource.Origin
 type Origin struct {
 	Collection collection.Name
 	Kind       string
-	Name       resource.Name
+	FullName   resource.FullName
 	Version    resource.Version
+	Ref        resource.Reference
+	FieldsMap  map[string]int
 }
 
-var _ resource.Origin = &Origin{}
+var (
+	_ resource.Origin    = &Origin{}
+	_ resource.Reference = &Position{}
+)
 
 // FriendlyName implements resource.Origin
 func (o *Origin) FriendlyName() string {
-	parts := strings.Split(o.Name.String(), "/")
+	parts := strings.Split(o.FullName.String(), "/")
 	if len(parts) == 2 {
 		// The istioctl convention is <type> <name>[.<namespace>].
 		// This code has no notion of a default and always shows the namespace.
 		return fmt.Sprintf("%s %s.%s", o.Kind, parts[1], parts[0])
 	}
-	return fmt.Sprintf("%s %s", o.Kind, o.Name.String())
+	return fmt.Sprintf("%s %s", o.Kind, o.FullName.String())
+}
+
+func (o *Origin) Comparator() string {
+	return o.Kind + "/" + o.FullName.Name.String() + "/" + o.FullName.Namespace.String()
 }
 
 // Namespace implements resource.Origin
-func (o *Origin) Namespace() string {
+func (o *Origin) Namespace() resource.Namespace {
 	// Special case: the namespace of a namespace resource is its own name
-	if o.Collection == metadata.K8SCoreV1Namespaces {
-		return o.Name.String()
+	if o.Collection == collections.K8SCoreV1Namespaces.Name() {
+		return resource.Namespace(o.FullName.Name)
 	}
 
-	ns, _ := o.Name.InterpretAsNamespaceAndName()
-	return ns
+	return o.FullName.Namespace
+}
+
+// Reference implements resource.Origin
+func (o *Origin) Reference() resource.Reference {
+	return o.Ref
+}
+
+// GetFieldMap implements resource.Origin
+func (o *Origin) FieldMap() map[string]int {
+	return o.FieldsMap
+}
+
+// Position is a representation of the location of a source.
+type Position struct {
+	Filename string // filename, if any
+	Line     int    // line number, starting at 1
+}
+
+// String outputs the string representation of the position.
+func (p *Position) String() string {
+	s := p.Filename
+	// TODO: support json file position.
+	if p.isValid() && filepath.Ext(p.Filename) != ".json" {
+		if s != "" {
+			s += ":"
+		}
+		s += fmt.Sprintf("%d", p.Line)
+	}
+	return s
+}
+
+func (p *Position) isValid() bool {
+	return p.Line > 0 && p.Filename != ""
 }

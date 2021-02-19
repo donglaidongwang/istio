@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,10 +27,16 @@ const (
 	// HTTP declares that the port carries HTTP/1.1 traffic.
 	// Note that HTTP/1.0 or earlier may not be supported by the proxy.
 	HTTP Instance = "HTTP"
+	// HTTP_PROXY declares that the port is a generic outbound proxy port.
+	// Note that this is currently applicable only for defining sidecar egress listeners.
+	// nolint
+	HTTP_PROXY Instance = "HTTP_PROXY"
 	// HTTP2 declares that the port carries HTTP/2 traffic.
 	HTTP2 Instance = "HTTP2"
 	// HTTPS declares that the port carries HTTPS traffic.
 	HTTPS Instance = "HTTPS"
+	// Thrift declares that the port carries Thrift traffic.
+	Thrift Instance = "Thrift"
 	// TCP declares the the port uses TCP.
 	// This is the default protocol for a service port.
 	TCP Instance = "TCP"
@@ -63,10 +69,14 @@ func Parse(s string) Instance {
 		return GRPCWeb
 	case "http":
 		return HTTP
+	case "http_proxy":
+		return HTTP_PROXY
 	case "http2":
 		return HTTP2
 	case "https":
 		return HTTPS
+	case "thrift":
+		return Thrift
 	case "tls":
 		return TLS
 	case "mongo":
@@ -93,7 +103,17 @@ func (i Instance) IsHTTP2() bool {
 // IsHTTP is true for protocols that use HTTP as transport protocol
 func (i Instance) IsHTTP() bool {
 	switch i {
-	case HTTP, HTTP2, GRPC, GRPCWeb:
+	case HTTP, HTTP2, HTTP_PROXY, GRPC, GRPCWeb:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsThrift is true for protocols that use Thrift as transport protocol
+func (i Instance) IsThrift() bool {
+	switch i {
+	case Thrift:
 		return true
 	default:
 		return false
@@ -103,7 +123,7 @@ func (i Instance) IsHTTP() bool {
 // IsTCP is true for protocols that use TCP as transport protocol
 func (i Instance) IsTCP() bool {
 	switch i {
-	case TCP, HTTPS, TLS, Mongo, Redis, MySQL:
+	case TCP, HTTPS, TLS, Mongo, Redis, MySQL, Thrift:
 		return true
 	default:
 		return false
@@ -120,7 +140,7 @@ func (i Instance) IsTLS() bool {
 	}
 }
 
-// IsGRPC is true for GRCP protocols.
+// IsGRPC is true for GRPC protocols.
 func (i Instance) IsGRPC() bool {
 	switch i {
 	case GRPC, GRPCWeb:

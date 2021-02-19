@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,10 +20,11 @@ import (
 	"fmt"
 	"time"
 
-	envoy_admin_v2alpha "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoy_admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	"github.com/golang/protobuf/ptypes"
 
 	"istio.io/istio/istioctl/pkg/util/configdump"
-	"istio.io/istio/security/pkg/nodeagent/sds"
 	"istio.io/pkg/log"
 )
 
@@ -139,39 +140,6 @@ func (s *secretItemBuilder) Build() (SecretItem, error) {
 	return result, nil
 }
 
-// connNameFilter used to provide a filter function through which node agent secrets can be filtered out
-type connNameFilter func(string) bool
-
-// GetNodeAgentSecrets takes the sds.Debug results provided to the comparator and parses them into []SecretItem
-func GetNodeAgentSecrets(
-	agentResponses map[string]sds.Debug, connFilter connNameFilter) ([]SecretItem, error) {
-	secrets := make([]SecretItem, 0)
-	for nodeAgentPod, debug := range agentResponses {
-		for _, client := range debug.Clients {
-			// note that the node agent contains secrets for all pods being served on that node
-			// we don't want to include the secret unless the pod name is included in the ProxyID
-			if connFilter(client.ProxyID) {
-				builder := NewSecretItemBuilder()
-				builder.Name(client.ResourceName).Source(nodeAgentPod).Destination(client.ProxyID)
-				if client.CertificateChain != "" {
-					builder.Data(client.CertificateChain)
-				} else if client.RootCert != "" {
-					builder.Data(client.RootCert)
-				}
-
-				secret, err := builder.Build()
-				if err != nil {
-					return nil, fmt.Errorf("error building node agent secret")
-				}
-				secrets = append(secrets, secret)
-			}
-
-		}
-	}
-
-	return secrets, nil
-}
-
 // GetEnvoySecrets parses the secrets section of the config dump into []SecretItem
 func GetEnvoySecrets(
 	wrapper *configdump.Wrapper) ([]SecretItem, error) {
@@ -200,15 +168,21 @@ func GetEnvoySecrets(
 	return proxySecretItems, nil
 }
 
-func parseDynamicSecret(s *envoy_admin_v2alpha.SecretsConfigDump_DynamicSecret, state string) (SecretItem, error) {
+func parseDynamicSecret(s *envoy_admin.SecretsConfigDump_DynamicSecret, state string) (SecretItem, error) {
 	builder := NewSecretItemBuilder()
 	builder.Name(s.Name).State(state)
 
-	certChainSecret := s.GetSecret().
+	secretTyped := &auth.Secret{}
+	err := ptypes.UnmarshalAny(s.GetSecret(), secretTyped)
+	if err != nil {
+		return SecretItem{}, err
+	}
+
+	certChainSecret := secretTyped.
 		GetTlsCertificate().
 		GetCertificateChain().
 		GetInlineBytes()
-	caDataSecret := s.GetSecret().
+	caDataSecret := secretTyped.
 		GetValidationContext().
 		GetTrustedCa().
 		GetInlineBytes()

@@ -19,7 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FINDFILES=find . \( -path ./common-protos -o -path ./.git -o -path ./.github -o -path ./licenses \) -prune -o -type f
+FINDFILES=find . \( -path ./common-protos -o -path ./.git -o -path ./out -o -path ./.github -o -path ./licenses -o -path ./vendor \) -prune -o -type f
 XARGS = xargs -0 -r
 
 lint-dockerfiles:
@@ -29,7 +29,7 @@ lint-scripts:
 	@${FINDFILES} -name '*.sh' -print0 | ${XARGS} shellcheck
 
 lint-yaml:
-	@${FINDFILES} \( -name '*.yml' -o -name '*.yaml' \) -print0 | ${XARGS} grep -L -e "{{" | xargs -r yamllint -c ./common/config/.yamllint.yml
+	@${FINDFILES} \( -name '*.yml' -o -name '*.yaml' \) -not -exec grep -q -e "{{" {} \; -print0 | ${XARGS} yamllint -c ./common/config/.yamllint.yml
 
 lint-helm:
 	@${FINDFILES} -name 'Chart.yaml' -print0 | ${XARGS} -L 1 dirname | xargs -r helm lint --strict
@@ -37,6 +37,10 @@ lint-helm:
 lint-copyright-banner:
 	@${FINDFILES} \( -name '*.go' -o -name '*.cc' -o -name '*.h' -o -name '*.proto' -o -name '*.py' -o -name '*.sh' \) \( ! \( -name '*.gen.go' -o -name '*.pb.go' -o -name '*_pb2.py' \) \) -print0 |\
 		${XARGS} common/scripts/lint_copyright_banner.sh
+
+fix-copyright-banner:
+	@${FINDFILES} \( -name '*.go' -o -name '*.cc' -o -name '*.h' -o -name '*.proto' -o -name '*.py' -o -name '*.sh' \) \( ! \( -name '*.gen.go' -o -name '*.pb.go' -o -name '*_pb2.py' \) \) -print0 |\
+		${XARGS} common/scripts/fix_copyright_banner.sh
 
 lint-go:
 	@${FINDFILES} -name '*.go' \( ! \( -name '*.gen.go' -o -name '*.pb.go' \) \) -print0 | ${XARGS} common/scripts/lint_go.sh
@@ -46,7 +50,9 @@ lint-python:
 
 lint-markdown:
 	@${FINDFILES} -name '*.md' -print0 | ${XARGS} mdl --ignore-front-matter --style common/config/mdl.rb
-	@${FINDFILES} -name '*.md' -print0 | ${XARGS} awesome_bot --skip-save-results --allow_ssl --allow-timeout --allow-dupe --allow-redirect --white-list ${MARKDOWN_LINT_WHITELIST}
+
+lint-links:
+	@${FINDFILES} -name '*.md' -print0 | ${XARGS} awesome_bot --skip-save-results --allow_ssl --allow-timeout --allow-dupe --allow-redirect --white-list ${MARKDOWN_LINT_ALLOWLIST}
 
 lint-sass:
 	@${FINDFILES} -name '*.scss' -print0 | ${XARGS} sass-lint -c common/config/sass-lint.yml --verbose
@@ -58,16 +64,21 @@ lint-protos:
 	@if test -d common-protos; then $(FINDFILES) -name '*.proto' -print0 | $(XARGS) -L 1 prototool lint --protoc-bin-path=/usr/bin/protoc --protoc-wkt-path=common-protos; fi
 
 lint-licenses:
-	@-go mod download
-	@license-lint --config common/config/license-lint.yml
+	@if test -d licenses; then license-lint --config common/config/license-lint.yml; fi
 
 lint-all: lint-dockerfiles lint-scripts lint-yaml lint-helm lint-copyright-banner lint-go lint-python lint-markdown lint-sass lint-typescript lint-protos lint-licenses
 
 tidy-go:
 	@go mod tidy
 
+mod-download-go:
+	@-GOFLAGS="-mod=readonly" go mod download
+# go mod tidy is needed with Golang 1.16+ as go mod download affects go.sum
+# https://github.com/golang/go/issues/43994
+	@go mod tidy
+
 format-go: tidy-go
-	@${FINDFILES} -name '*.go' \( ! \( -name '*.gen.go' -o -name '*.pb.go' \) \) -print0 | ${XARGS} goimports -w -local "istio.io"
+	@${FINDFILES} -name '*.go' \( ! \( -name '*.gen.go' -o -name '*.pb.go' \) \) -print0 | ${XARGS} common/scripts/format_go.sh
 
 format-python:
 	@${FINDFILES} -name '*.py' -print0 | ${XARGS} autopep8 --max-line-length 160 --aggressive --aggressive -i
@@ -75,16 +86,13 @@ format-python:
 format-protos:
 	@$(FINDFILES) -name '*.proto' -print0 | $(XARGS) -L 1 prototool format -w
 
-dump-licenses:
-	@go mod download
+dump-licenses: mod-download-go
 	@license-lint --config common/config/license-lint.yml --report
 
-dump-licenses-csv:
-	@go mod download
+dump-licenses-csv: mod-download-go
 	@license-lint --config common/config/license-lint.yml --csv
 
-mirror-licenses:
-	@go mod download
+mirror-licenses: mod-download-go
 	@rm -fr licenses
 	@license-lint --mirror
 
@@ -96,7 +104,7 @@ update-common:
 	@git clone -q --depth 1 --single-branch --branch $(UPDATE_BRANCH) https://github.com/istio/common-files $(TMP)/common-files
 	@cd $(TMP)/common-files ; git rev-parse HEAD >files/common/.commonfiles.sha
 	@rm -fr common
-	@cp -ar $(TMP)/common-files/files/* $(shell pwd)
+	@cp -a $(TMP)/common-files/files/* $(shell pwd)
 	@rm -fr $(TMP)/common-files
 
 update-common-protos:
@@ -104,10 +112,17 @@ update-common-protos:
 	@git clone -q --depth 1 --single-branch --branch $(UPDATE_BRANCH) https://github.com/istio/common-files $(TMP)/common-files
 	@cd $(TMP)/common-files ; git rev-parse HEAD > common-protos/.commonfiles.sha
 	@rm -fr common-protos
-	@cp -ar $(TMP)/common-files/common-protos/* $(shell pwd)/common-protos
+	@cp -a $(TMP)/common-files/common-protos $(shell pwd)
 	@rm -fr $(TMP)/common-files
 
 check-clean-repo:
 	@common/scripts/check_clean_repo.sh
 
-.PHONY: lint-dockerfiles lint-scripts lint-yaml lint-copyright-banner lint-go lint-python lint-helm lint-markdown lint-sass lint-typescript lint-protos lint-all format-go format-python format-protos update-common update-common-protos lint-licenses dump-licenses dump-licenses-csv check-clean-repo
+tidy-docker:
+	@docker image prune --all --force --filter="label=io.istio.repo=https://github.com/istio/tools" --filter="label!=io.istio.version=$(IMAGE_VERSION)"
+
+# help works by looking over all Makefile includes matching `target: ## comment` regex and outputting them
+help: ## Show this help
+	@egrep -h '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort  | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: lint-dockerfiles lint-scripts lint-yaml lint-copyright-banner lint-go lint-python lint-helm lint-markdown lint-sass lint-typescript lint-protos lint-all format-go format-python format-protos update-common update-common-protos lint-licenses dump-licenses dump-licenses-csv check-clean-repo tidy-docker help tidy-go mod-download-go

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,8 +52,10 @@ type Instance interface {
 
 var _ Instance = &instance{}
 
-type convertFunc func(*instance) (interface{}, error)
-type applyFunc func(map[string]interface{}, *instance) error
+type (
+	convertFunc func(*instance) (interface{}, error)
+	applyFunc   func(map[string]interface{}, *instance) error
+)
 
 type instance struct {
 	name      Name

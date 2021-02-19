@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,10 +20,39 @@ import (
 	"testing"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
-
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/validation"
+	"istio.io/istio/pkg/util/gogoprotomarshal"
 )
+
+func TestApplyProxyConfig(t *testing.T) {
+	config := mesh.DefaultMeshConfig()
+	defaultDiscovery := config.DefaultConfig.DiscoveryAddress
+
+	t.Run("apply single", func(t *testing.T) {
+		mc, err := mesh.ApplyProxyConfig("discoveryAddress: foo", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mc.DefaultConfig.DiscoveryAddress != "foo" {
+			t.Fatalf("expected discoveryAddress: foo, got %q", mc.DefaultConfig.DiscoveryAddress)
+		}
+	})
+
+	t.Run("apply again", func(t *testing.T) {
+		mc, err := mesh.ApplyProxyConfig("drainDuration: 5s", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Ensure we didn't modify the passed in mesh config
+		if mc.DefaultConfig.DiscoveryAddress != defaultDiscovery {
+			t.Fatalf("expected discoveryAddress: %q, got %q", defaultDiscovery, mc.DefaultConfig.DiscoveryAddress)
+		}
+		if mc.DefaultConfig.DrainDuration.Seconds != 5 {
+			t.Fatalf("expected drainDuration: 5s, got %q", mc.DefaultConfig.DrainDuration.Seconds)
+		}
+	})
+}
 
 func TestDefaultProxyConfig(t *testing.T) {
 	proxyConfig := mesh.DefaultProxyConfig()
@@ -56,10 +85,37 @@ defaultConfig:
 	if !reflect.DeepEqual(got, &want) {
 		t.Fatalf("Wrong default values:\n got %#v \nwant %#v", got, &want)
 	}
+	// Verify overrides
+	got, err = mesh.ApplyMeshConfigDefaults(`
+serviceSettings: 
+  - settings:
+      clusterLocal: true
+    host:
+      - "*.myns.svc.cluster.local"
+ingressClass: foo
+enableTracing: false
+defaultServiceExportTo: 
+- "foo"
+outboundTrafficPolicy:
+  mode: REGISTRY_ONLY
+clusterLocalNamespaces: 
+- "foons"
+defaultConfig:
+  tracing: {}
+  concurrency: 4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DefaultConfig.Tracing.GetZipkin() != nil {
+		t.Error("Failed to override tracing")
+	}
+
+	gotY, err := gogoprotomarshal.ToYAML(got)
+	t.Log("Result: \n", gotY, err)
 }
 
 func TestApplyMeshNetworksDefaults(t *testing.T) {
-	yml := fmt.Sprintf(`
+	yml := `
 networks:
   network1:
     endpoints:
@@ -73,7 +129,7 @@ networks:
     gateways:
     - registryServiceName: reg1
       port: 443
-`)
+`
 
 	want := mesh.EmptyMeshNetworks()
 	want.Networks = map[string]*meshconfig.Network{
@@ -113,11 +169,60 @@ networks:
 		},
 	}
 
-	got, err := mesh.LoadMeshNetworksConfig(yml)
+	got, err := mesh.ParseMeshNetworks(yml)
 	if err != nil {
 		t.Fatalf("ApplyMeshNetworksDefaults() failed: %v", err)
 	}
 	if !reflect.DeepEqual(got, &want) {
 		t.Fatalf("Wrong values:\n got %#v \nwant %#v", got, &want)
+	}
+}
+
+func TestResolveHostsInNetworksConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		address  string
+		modified bool
+	}{
+		{
+			"Gateway with IP address",
+			"9.142.3.1",
+			false,
+		},
+		{
+			"Gateway with localhost address",
+			"localhost",
+			true,
+		},
+		{
+			"Gateway with empty address",
+			"",
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &meshconfig.MeshNetworks{
+				Networks: map[string]*meshconfig.Network{
+					"network": {
+						Gateways: []*meshconfig.Network_IstioNetworkGateway{
+							{
+								Gw: &meshconfig.Network_IstioNetworkGateway_Address{
+									Address: tt.address,
+								},
+							},
+						},
+					},
+				},
+			}
+			mesh.ResolveHostsInNetworksConfig(config)
+			addrAfter := config.Networks["network"].Gateways[0].GetAddress()
+			if addrAfter == tt.address && tt.modified {
+				t.Fatalf("Expected network address to be modified but it's the same as before calling the function")
+			}
+			if addrAfter != tt.address && !tt.modified {
+				t.Fatalf("Expected network address not to be modified after calling the function")
+			}
+		})
 	}
 }

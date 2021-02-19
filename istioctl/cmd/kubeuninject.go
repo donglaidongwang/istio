@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,11 +16,13 @@ package cmd
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/ghodss/yaml"
@@ -32,18 +34,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	yamlDecoder "k8s.io/apimachinery/pkg/util/yaml"
 
+	istioStatus "istio.io/istio/pilot/cmd/pilot-agent/status"
 	"istio.io/istio/pkg/kube/inject"
-
 	"istio.io/pkg/log"
 )
 
 const (
-	proxyContainerName          = "istio-proxy"
-	initContainerName           = "istio-init"
+	annotationPolicy            = "sidecar.istio.io/inject"
+	certVolumeName              = "istio-certs"
+	dataVolumeName              = "istio-data"
 	enableCoreDumpContainerName = "enable-core-dump"
 	envoyVolumeName             = "istio-envoy"
-	certVolumeName              = "istio-certs"
-	annotationPolicy            = "sidecar.istio.io/inject"
+	initContainerName           = "istio-init"
+	initValidationContainerName = "istio-validation"
+	jwtTokenVolumeName          = "istio-token"
+	pilotCertVolumeName         = "istiod-ca-cert"
+	podInfoVolumeName           = "istio-podinfo"
+	proxyContainerName          = "istio-proxy"
 	sidecarAnnotationPrefix     = "sidecar.istio.io"
 )
 
@@ -112,9 +119,67 @@ func removeInjectedContainers(containers []corev1.Container, injectedContainerNa
 	return containers
 }
 
-// removeInjectedVolumes removes the injected volumes - istio-envoy and istio-certs
-func removeInjectedVolumes(volumes []corev1.Volume, injectedVolume string) []corev1.Volume {
+func restoreAppProbes(containers []corev1.Container, probers map[string]*inject.Prober) []corev1.Container {
+	re := regexp.MustCompile("/app-health/([a-z]+)/(readyz|livez|startupz)")
+	for name, prober := range probers {
+		matches := re.FindStringSubmatch(name)
+		if len(matches) == 0 {
+			continue
+		}
+		containerName := matches[1]
+		probeType := matches[2]
+		for i, c := range containers {
+			if c.Name == containerName {
+				container := c.DeepCopy()
+				switch probeType {
+				case "readyz":
+					container.ReadinessProbe = &corev1.Probe{
+						Handler: corev1.Handler{
+							HTTPGet: prober.HTTPGet,
+						},
+						TimeoutSeconds: prober.TimeoutSeconds,
+					}
+				case "livez":
+					container.LivenessProbe = &corev1.Probe{
+						Handler: corev1.Handler{
+							HTTPGet: prober.HTTPGet,
+						},
+						TimeoutSeconds: prober.TimeoutSeconds,
+					}
+				case "startupz":
+					container.StartupProbe = &corev1.Probe{
+						Handler: corev1.Handler{
+							HTTPGet: prober.HTTPGet,
+						},
+						TimeoutSeconds: prober.TimeoutSeconds,
+					}
+				}
+				containers[i] = *container
+			}
+		}
+	}
+	return containers
+}
 
+func retrieveAppProbe(containers []corev1.Container) string {
+	for _, c := range containers {
+		if c.Name != proxyContainerName {
+			continue
+		}
+
+		for _, env := range c.Env {
+			if env.Name == istioStatus.KubeAppProberEnvName {
+				return env.Value
+			}
+		}
+	}
+
+	return ""
+}
+
+// removeInjectedVolumes removes the injected volumes if exists.
+// for example, istio-envoy, istio-certs, and istio-token
+func removeInjectedVolumes(volumes []corev1.Volume, injectedVolume string) []corev1.Volume {
 	for index, v := range volumes {
 		if v.Name == injectedVolume {
 			if index < len(volumes)-1 {
@@ -151,7 +216,6 @@ func removeDNSConfig(podDNSConfig *corev1.PodDNSConfig) {
 			index++
 		}
 	}
-
 }
 
 // handleAnnotations removes the injected annotations which contains sidecar.istio.io
@@ -244,11 +308,27 @@ func extractObject(in runtime.Object) (interface{}, error) {
 		return out, nil
 	}
 
+	var appProbe inject.KubeAppProbers
+	appProbeStr := retrieveAppProbe(podSpec.Containers)
+	if appProbeStr != "" {
+		if err := json.Unmarshal([]byte(appProbeStr), &appProbe); err != nil {
+			return nil, err
+		}
+	}
+	if appProbe != nil {
+		podSpec.Containers = restoreAppProbes(podSpec.Containers, appProbe)
+	}
+
 	podSpec.InitContainers = removeInjectedContainers(podSpec.InitContainers, initContainerName)
+	podSpec.InitContainers = removeInjectedContainers(podSpec.InitContainers, initValidationContainerName)
 	podSpec.InitContainers = removeInjectedContainers(podSpec.InitContainers, enableCoreDumpContainerName)
 	podSpec.Containers = removeInjectedContainers(podSpec.Containers, proxyContainerName)
-	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, envoyVolumeName)
 	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, certVolumeName)
+	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, dataVolumeName)
+	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, envoyVolumeName)
+	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, jwtTokenVolumeName)
+	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, pilotCertVolumeName)
+	podSpec.Volumes = removeInjectedVolumes(podSpec.Volumes, podInfoVolumeName)
 	removeDNSConfig(podSpec.DNSConfig)
 
 	return out, nil
@@ -264,23 +344,18 @@ func uninjectCommand() *cobra.Command {
 		Use:   "kube-uninject",
 		Short: "Uninject Envoy sidecar from Kubernetes pod resources",
 		Long: `
-
 kube-uninject is used to prevent Istio from adding a sidecar and
 also provides the inverse of "istioctl kube-inject -f".
-
 `,
-		Example: `
-# Update resources before applying.
-kubectl apply -f <(istioctl experimental kube-uninject -f <resource.yaml>)
+		Example: `  # Update resources before applying.
+  kubectl apply -f <(istioctl experimental kube-uninject -f <resource.yaml>)
 
-# Create a persistent version of the deployment by removing Envoy sidecar.
-istioctl experimental kube-uninject -f deployment.yaml -o deployment-uninjected.yaml
+  # Create a persistent version of the deployment by removing Envoy sidecar.
+  istioctl experimental kube-uninject -f deployment.yaml -o deployment-uninjected.yaml
 
-# Update an existing deployment.
-kubectl get deployment -o yaml | istioctl experimental kube-uninject -f - | kubectl apply -f -
-`,
+  # Update an existing deployment.
+  kubectl get deployment -o yaml | istioctl experimental kube-uninject -f - | kubectl apply -f -`,
 		RunE: func(c *cobra.Command, _ []string) (err error) {
-
 			if err = validateUninjectFlags(); err != nil {
 				return err
 			}

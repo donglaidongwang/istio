@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,31 +19,31 @@ import (
 
 	. "github.com/onsi/gomega"
 
-	"istio.io/pkg/log"
-
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/resource"
 	"istio.io/istio/galley/pkg/config/scope"
+	"istio.io/istio/galley/pkg/config/testing/basicmeta"
 	"istio.io/istio/galley/pkg/config/testing/data"
 	"istio.io/istio/galley/pkg/config/testing/fixtures"
+	"istio.io/istio/pkg/config/event"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/pkg/log"
 )
 
 func TestCollection_Start_Empty(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
 	col.Start()
 
-	expected := []event.Event{event.FullSyncFor(data.Collection1)}
+	expected := []event.Event{event.FullSyncFor(basicmeta.K8SCollection1)}
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Start_Element(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	old := scope.Source.GetOutputLevel()
 	defer func() {
@@ -51,84 +51,87 @@ func TestCollection_Start_Element(t *testing.T) {
 	}()
 	scope.Source.SetOutputLevel(log.DebugLevel)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
-	col.Set(data.Event1Col1AddItem1.Entry)
+	col.Set(data.Event1Col1AddItem1.Resource)
 	col.Start()
 
-	expected := []event.Event{data.Event1Col1AddItem1, event.FullSyncFor(data.Collection1)}
+	expected := []event.Event{data.Event1Col1AddItem1, event.FullSyncFor(basicmeta.K8SCollection1)}
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Update(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
-	col.Set(data.Event1Col1AddItem1.Entry)
+	col.Set(data.Event1Col1AddItem1.Resource)
 	col.Start()
 
-	col.Set(data.Event1Col1UpdateItem1.Entry)
+	col.Set(data.Event1Col1UpdateItem1.Resource)
 
 	expected := []event.Event{
 		data.Event1Col1AddItem1,
-		event.FullSyncFor(data.Collection1),
-		data.Event1Col1UpdateItem1}
+		event.FullSyncFor(basicmeta.K8SCollection1),
+		data.Event1Col1UpdateItem1,
+	}
 
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Delete(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
-	col.Set(data.Event1Col1AddItem1.Entry)
+	col.Set(data.Event1Col1AddItem1.Resource)
 	col.Start()
 
-	col.Remove(data.Event1Col1AddItem1.Entry.Metadata.Name)
+	col.Remove(data.Event1Col1AddItem1.Resource.Metadata.FullName)
 
 	expected := []event.Event{
 		data.Event1Col1AddItem1,
-		event.FullSyncFor(data.Collection1),
-		data.Event1Col1DeleteItem1}
+		event.FullSyncFor(basicmeta.K8SCollection1),
+		data.Event1Col1DeleteItem1,
+	}
 
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Delete_NoItem(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
 	col.Set(data.EntryN1I1V1)
 	col.Start()
 
-	col.Remove(data.EntryN2I2V2.Metadata.Name)
+	col.Remove(data.EntryN2I2V2.Metadata.FullName)
 
 	expected := []event.Event{
 		data.Event1Col1AddItem1,
-		event.FullSyncFor(data.Collection1)}
+		event.FullSyncFor(basicmeta.K8SCollection1),
+	}
 
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Clear_BeforeStart(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
@@ -138,15 +141,15 @@ func TestCollection_Clear_BeforeStart(t *testing.T) {
 
 	col.Start()
 
-	expected := []event.Event{event.FullSyncFor(data.Collection1)}
+	expected := []event.Event{event.FullSyncFor(basicmeta.K8SCollection1)}
 	actual := acc.Events()
 	g.Expect(actual).To(Equal(expected))
 }
 
 func TestCollection_Clear_AfterStart(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
@@ -158,7 +161,7 @@ func TestCollection_Clear_AfterStart(t *testing.T) {
 	expected := []interface{}{
 		data.Event1Col1AddItem1,
 		data.Event2Col1AddItem2,
-		event.FullSyncFor(data.Collection1),
+		event.FullSyncFor(basicmeta.K8SCollection1),
 		data.Event1Col1DeleteItem1,
 		data.Event1Col1DeleteItem2,
 	}
@@ -168,18 +171,19 @@ func TestCollection_Clear_AfterStart(t *testing.T) {
 }
 
 func TestCollection_StopStart(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 	acc := &fixtures.Accumulator{}
 	col.Dispatch(acc)
 
-	col.Set(data.Event1Col1AddItem1.Entry)
+	col.Set(data.Event1Col1AddItem1.Resource)
 	col.Start()
 
 	expected := []event.Event{
 		data.Event1Col1AddItem1,
-		event.FullSyncFor(data.Collection1)}
+		event.FullSyncFor(basicmeta.K8SCollection1),
+	}
 
 	g.Eventually(acc.Events).Should(Equal(expected))
 
@@ -191,14 +195,14 @@ func TestCollection_StopStart(t *testing.T) {
 }
 
 func TestCollection_AllSorted(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	col := NewCollection(data.Collection1)
+	col := NewCollection(basicmeta.K8SCollection1)
 
 	col.Set(data.EntryN1I1V1)
 	col.Set(data.EntryN2I2V2)
 
-	expected := []*resource.Entry{
+	expected := []*resource.Instance{
 		data.EntryN1I1V1,
 		data.EntryN2I2V2,
 	}

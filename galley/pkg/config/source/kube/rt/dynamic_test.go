@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,10 +27,11 @@ import (
 	"istio.io/istio/galley/pkg/config/source/kube/rt"
 	"istio.io/istio/galley/pkg/config/testing/basicmeta"
 	"istio.io/istio/galley/pkg/config/testing/data"
+	"istio.io/istio/pkg/config"
 )
 
 func TestParseDynamic(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 	input, err := yaml.ToJSON([]byte(data.YamlN1I1V1))
 	g.Expect(err).To(BeNil())
 	objMeta, objResource := parseDynamic(t, input, "Kind1")
@@ -45,19 +46,19 @@ func TestParseDynamic(t *testing.T) {
 }
 
 func TestExtractObjectDynamic(t *testing.T) {
-	for _, r := range basicmeta.MustGet().KubeSource().Resources() {
-		a := rt.DefaultProvider().GetAdapter(r)
+	for _, r := range basicmeta.MustGet().KubeCollections().All() {
+		a := rt.DefaultProvider().GetAdapter(r.Resource())
 
-		t.Run(r.Kind, func(t *testing.T) {
+		t.Run(r.Resource().Kind(), func(t *testing.T) {
 			t.Run("WrongTypeShouldReturnNil", func(t *testing.T) {
 				out := a.ExtractObject(struct{}{})
-				g := NewGomegaWithT(t)
+				g := NewWithT(t)
 				g.Expect(out).To(BeNil())
 			})
 
 			t.Run("Success", func(t *testing.T) {
 				out := a.ExtractObject(&unstructured.Unstructured{})
-				g := NewGomegaWithT(t)
+				g := NewWithT(t)
 				g.Expect(out).ToNot(BeNil())
 			})
 		})
@@ -65,19 +66,19 @@ func TestExtractObjectDynamic(t *testing.T) {
 }
 
 func TestExtractResourceDynamic(t *testing.T) {
-	for _, r := range basicmeta.MustGet().KubeSource().Resources() {
-		a := rt.DefaultProvider().GetAdapter(r)
+	for _, r := range basicmeta.MustGet().KubeCollections().All() {
+		a := rt.DefaultProvider().GetAdapter(r.Resource())
 
-		t.Run(r.Kind, func(t *testing.T) {
+		t.Run(r.Resource().Kind(), func(t *testing.T) {
 			t.Run("WrongTypeShouldReturnNil", func(t *testing.T) {
 				_, err := a.ExtractResource(struct{}{})
-				g := NewGomegaWithT(t)
+				g := NewWithT(t)
 				g.Expect(err).NotTo(BeNil())
 			})
 
 			t.Run("Success", func(t *testing.T) {
 				out, err := a.ExtractResource(&unstructured.Unstructured{})
-				g := NewGomegaWithT(t)
+				g := NewWithT(t)
 				g.Expect(err).To(BeNil())
 				g.Expect(out).ToNot(BeNil())
 			})
@@ -87,10 +88,14 @@ func TestExtractResourceDynamic(t *testing.T) {
 
 func parseDynamic(t *testing.T, input []byte, kind string) (metaV1.Object, proto.Message) {
 	t.Helper()
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	pr := rt.DefaultProvider()
-	a := pr.GetAdapter(basicmeta.MustGet().KubeSource().Resources().MustFind("testdata.istio.io", kind))
+	a := pr.GetAdapter(basicmeta.MustGet().KubeCollections().MustFindByGroupVersionKind(config.GroupVersionKind{
+		Group:   "testdata.istio.io",
+		Version: "v1alpha1",
+		Kind:    kind,
+	}).Resource())
 
 	obj, err := a.ParseJSON(input)
 	g.Expect(err).To(BeNil())

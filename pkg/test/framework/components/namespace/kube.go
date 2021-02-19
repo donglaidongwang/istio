@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -15,16 +15,22 @@
 package namespace
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
-	"istio.io/istio/pkg/test/framework/components/environment/kube"
-	"istio.io/istio/pkg/test/framework/components/istio"
+	kubeApiCore "k8s.io/api/core/v1"
+	kubeApiMeta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	"istio.io/api/label"
+	"istio.io/istio/pkg/test/framework/image"
 	"istio.io/istio/pkg/test/framework/resource"
-	k "istio.io/istio/pkg/test/kube"
+	kube2 "istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/scopes"
 )
 
@@ -38,15 +44,38 @@ var (
 type kubeNamespace struct {
 	id   resource.ID
 	name string
-	a    *k.Accessor
+	ctx  resource.Context
 }
 
-var _ Instance = &kubeNamespace{}
-var _ io.Closer = &kubeNamespace{}
-var _ resource.Resource = &kubeNamespace{}
+func (n *kubeNamespace) Dump(ctx resource.Context) {
+	scopes.Framework.Errorf("=== Dumping Namespace %s State...", n.name)
+
+	d, err := ctx.CreateTmpDirectory(n.name + "-state")
+	if err != nil {
+		scopes.Framework.Errorf("Unable to create directory for dumping %s contents: %v", n.name, err)
+		return
+	}
+
+	kube2.DumpPods(n.ctx, d, n.name)
+}
+
+var (
+	_ Instance          = &kubeNamespace{}
+	_ io.Closer         = &kubeNamespace{}
+	_ resource.Resource = &kubeNamespace{}
+	_ resource.Dumper   = &kubeNamespace{}
+)
 
 func (n *kubeNamespace) Name() string {
 	return n.name
+}
+
+func (n *kubeNamespace) SetLabel(key, value string) error {
+	return n.setNamespaceLabel(key, value)
+}
+
+func (n *kubeNamespace) RemoveLabel(key string) error {
+	return n.removeNamespaceLabel(key)
 }
 
 func (n *kubeNamespace) ID() resource.ID {
@@ -59,32 +88,58 @@ func (n *kubeNamespace) Close() (err error) {
 		scopes.Framework.Debugf("%s deleting namespace", n.id)
 		ns := n.name
 		n.name = ""
-		err = n.a.DeleteNamespace(ns)
+
+		for _, c := range n.ctx.Clusters().Kube() {
+			err = c.CoreV1().Namespaces().Delete(context.TODO(), ns, kube2.DeleteOptionsForeground())
+		}
 	}
 
 	scopes.Framework.Debugf("%s close complete (err:%v)", n.id, err)
 	return
 }
 
-func claimKube(ctx resource.Context, name string) (Instance, error) {
-	env := ctx.Environment().(*kube.Environment)
-	cfg, err := istio.DefaultConfig(ctx)
-	if err != nil {
-		return nil, err
+func claimKube(ctx resource.Context, nsConfig *Config) (Instance, error) {
+	for _, cluster := range ctx.Clusters().Kube() {
+		if !kube2.NamespaceExists(cluster, nsConfig.Prefix) {
+			if _, err := cluster.CoreV1().Namespaces().Create(context.TODO(), &kubeApiCore.Namespace{
+				ObjectMeta: kubeApiMeta.ObjectMeta{
+					Name:   nsConfig.Prefix,
+					Labels: createNamespaceLabels(nsConfig),
+				},
+			}, kubeApiMeta.CreateOptions{}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &kubeNamespace{name: nsConfig.Prefix}, nil
+}
+
+// setNamespaceLabel labels a namespace with the given key, value pair
+func (n *kubeNamespace) setNamespaceLabel(key, value string) error {
+	// need to convert '/' to '~1' as per the JSON patch spec http://jsonpatch.com/#operations
+	jsonPatchEscapedKey := strings.ReplaceAll(key, "/", "~1")
+	for _, cluster := range n.ctx.Clusters().Kube() {
+		nsLabelPatch := fmt.Sprintf(`[{"op":"replace","path":"/metadata/labels/%s","value":"%s"}]`, jsonPatchEscapedKey, value)
+		if _, err := cluster.CoreV1().Namespaces().Patch(context.TODO(), n.name, types.JSONPatchType, []byte(nsLabelPatch), kubeApiMeta.PatchOptions{}); err != nil {
+			return err
+		}
 	}
 
-	if !env.Accessor.NamespaceExists(name) {
-		nsConfig := Config{
-			Inject:                  true,
-			CustomInjectorNamespace: cfg.CustomSidecarInjectorNamespace,
-		}
-		nsLabels := createNamespaceLabels(&nsConfig)
-		if err := env.CreateNamespaceWithLabels(name, "istio-test", nsLabels); err != nil {
-			return nil, err
-		}
+	return nil
+}
 
+// removeNamespaceLabel removes namespace label with the given key
+func (n *kubeNamespace) removeNamespaceLabel(key string) error {
+	// need to convert '/' to '~1' as per the JSON patch spec http://jsonpatch.com/#operations
+	jsonPatchEscapedKey := strings.ReplaceAll(key, "/", "~1")
+	for _, cluster := range n.ctx.Clusters().Kube() {
+		nsLabelPatch := fmt.Sprintf(`[{"op":"remove","path":"/metadata/labels/%s"}]`, jsonPatchEscapedKey)
+		if _, err := cluster.CoreV1().Namespaces().Patch(context.TODO(), n.name, types.JSONPatchType, []byte(nsLabelPatch), kubeApiMeta.PatchOptions{}); err != nil {
+			return err
+		}
 	}
-	return &kubeNamespace{name: name}, nil
+
+	return nil
 }
 
 // NewNamespace allocates a new testing namespace.
@@ -95,17 +150,33 @@ func newKube(ctx resource.Context, nsConfig *Config) (Instance, error) {
 	r := rnd.Intn(99999)
 	mu.Unlock()
 
-	env := ctx.Environment().(*kube.Environment)
 	ns := fmt.Sprintf("%s-%d-%d", nsConfig.Prefix, nsid, r)
-
-	nsLabels := createNamespaceLabels(nsConfig)
-	if err := env.CreateNamespaceWithLabels(ns, "istio-test", nsLabels); err != nil {
-		return nil, err
+	n := &kubeNamespace{
+		name: ns,
+		ctx:  ctx,
 	}
-
-	n := &kubeNamespace{name: ns, a: env.Accessor}
 	id := ctx.TrackResource(n)
 	n.id = id
+
+	for _, cluster := range n.ctx.Clusters().Kube() {
+		if _, err := cluster.CoreV1().Namespaces().Create(context.TODO(), &kubeApiCore.Namespace{
+			ObjectMeta: kubeApiMeta.ObjectMeta{
+				Name:   ns,
+				Labels: createNamespaceLabels(nsConfig),
+			},
+		}, kubeApiMeta.CreateOptions{}); err != nil {
+			return nil, err
+		}
+		settings, err := image.SettingsFromCommandLine()
+		if err != nil {
+			return nil, err
+		}
+		if settings.ImagePullSecret != "" {
+			if err := cluster.ApplyYAMLFiles(n.name, settings.ImagePullSecret); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	return n, nil
 }
@@ -113,10 +184,12 @@ func newKube(ctx resource.Context, nsConfig *Config) (Instance, error) {
 // createNamespaceLabels will take a namespace config and generate the proper k8s labels
 func createNamespaceLabels(cfg *Config) map[string]string {
 	l := make(map[string]string)
+	l["istio-testing"] = "istio-test"
 	if cfg.Inject {
-		l["istio-injection"] = "enabled"
-		if cfg.CustomInjectorNamespace != "" {
-			l["istio-env"] = cfg.CustomInjectorNamespace
+		if cfg.Revision != "" {
+			l[label.IoIstioRev.Name] = cfg.Revision
+		} else {
+			l["istio-injection"] = "enabled"
 		}
 	}
 

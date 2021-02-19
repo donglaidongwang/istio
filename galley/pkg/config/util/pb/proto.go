@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,7 +34,6 @@ func UnmarshalData(pb proto.Message, data interface{}) error {
 }
 
 func toJSON(data interface{}) (string, error) {
-
 	var result string
 	b, err := yaml2.Marshal(data)
 	if err == nil {

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,9 +22,8 @@ import (
 	"github.com/gogo/protobuf/types"
 	"google.golang.org/grpc/codes"
 
-	"istio.io/istio/pkg/mcp/status"
-
 	mcp "istio.io/api/mcp/v1alpha1"
+	"istio.io/istio/pkg/mcp/status"
 )
 
 type FakeTypeBase struct{ Info string }
@@ -38,9 +37,11 @@ func (f *FakeTypeBase) Unmarshal(in []byte) error {
 	return nil
 }
 
-type FakeType0 struct{ FakeTypeBase }
-type FakeType1 struct{ FakeTypeBase }
-type FakeType2 struct{ FakeTypeBase }
+type (
+	FakeType0 struct{ FakeTypeBase }
+	FakeType1 struct{ FakeTypeBase }
+	FakeType2 struct{ FakeTypeBase }
+)
 
 type UnmarshalErrorType struct{ FakeTypeBase }
 

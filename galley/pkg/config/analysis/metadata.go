@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,11 +15,14 @@
 package analysis
 
 import (
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
+	"istio.io/istio/pkg/config/schema/collection"
 )
 
 // Metadata represents metadata for an analyzer
 type Metadata struct {
-	Name   string
-	Inputs collection.Names
+	Name string
+	// Description is a short explanation of what the analyzer checks. This
+	// field is displayed to users when --list-analyzers is called.
+	Description string
+	Inputs      collection.Names
 }

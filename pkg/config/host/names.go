@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -120,7 +120,7 @@ func NamesForNamespace(hosts []string, namespace string) Names {
 			if parts[0] != namespace && parts[0] != "*" {
 				continue
 			}
-			//strip the namespace
+			// strip the namespace
 			host = parts[1]
 		}
 		result = append(result, Name(host))

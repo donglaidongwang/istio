@@ -1,4 +1,5 @@
-//  Copyright 2019 Istio Authors
+// +build integ
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -16,8 +17,11 @@ package connection
 
 import (
 	"fmt"
+	"time"
 
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/echo/common/scheme"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/util/retry"
 )
@@ -25,6 +29,7 @@ import (
 // Checker is a test utility for testing the network connectivity between two endpoints.
 type Checker struct {
 	From          echo.Instance
+	DestClusters  cluster.Clusters
 	Options       echo.CallOptions
 	ExpectSuccess bool
 }
@@ -40,6 +45,13 @@ func (c *Checker) Check() error {
 			return fmt.Errorf("%s to %s:%s using %s: expected success but failed: %v",
 				c.From.Config().Service, c.Options.Target.Config().Service, c.Options.PortName, c.Options.Scheme, err)
 		}
+		// TODO: check why grpc can not reach all clusters
+		if c.DestClusters.IsMulticluster() && c.Options.Scheme != scheme.GRPC && c.Options.Count > 1 {
+			err = results.CheckReachedClusters(c.DestClusters)
+			if err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 
@@ -52,7 +64,7 @@ func (c *Checker) Check() error {
 }
 
 func (c *Checker) CheckOrFail(t test.Failer) {
-	if err := retry.UntilSuccess(c.Check); err != nil {
+	if err := retry.UntilSuccess(c.Check, retry.Delay(time.Millisecond*100)); err != nil {
 		t.Fatal(err)
 	}
 }

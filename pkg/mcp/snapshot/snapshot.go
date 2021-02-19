@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,10 +22,9 @@ import (
 	"github.com/gogo/protobuf/types"
 
 	mcp "istio.io/api/mcp/v1alpha1"
-	"istio.io/pkg/log"
-
 	"istio.io/istio/pkg/mcp/sink"
 	"istio.io/istio/pkg/mcp/source"
+	"istio.io/pkg/log"
 )
 
 var scope = log.RegisterScope("mcp", "mcp debugging", 0)
@@ -76,8 +75,6 @@ func New(groupIndex GroupIndexFn) *Cache {
 	}
 }
 
-var _ source.Watcher = &Cache{}
-
 type responseWatch struct {
 	request      *source.Request
 	pushResponse source.PushResponseFunc
@@ -90,21 +87,6 @@ type StatusInfo struct {
 	watches              map[int64]*responseWatch
 	// the synced structure is {Collection: {peerAddress: synced|nosynced}}.
 	synced map[string]map[string]bool
-}
-
-// Watches returns the number of open watches.
-func (si *StatusInfo) Watches() int {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return len(si.watches)
-}
-
-// LastWatchRequestTime returns the time the most recent watch request
-// was received.
-func (si *StatusInfo) LastWatchRequestTime() time.Time {
-	si.mu.RLock()
-	defer si.mu.RUnlock()
-	return si.lastWatchRequestTime
 }
 
 // Watch returns a watch for an MCP request.
@@ -167,7 +149,6 @@ func (c *Cache) Watch(
 }
 
 func (c *Cache) fillStatus(group string, request *source.Request, peerAddr string) *StatusInfo {
-
 	info, ok := c.status[group]
 	if !ok {
 		info = &StatusInfo{
@@ -190,6 +171,9 @@ func (c *Cache) fillStatus(group string, request *source.Request, peerAddr strin
 						break
 					}
 				}
+			}
+			if collectionExists && peerExists {
+				break
 			}
 		}
 		if !collectionExists {
@@ -299,51 +283,8 @@ func (c *Cache) GetGroups() []string {
 	return groups
 }
 
-// GetSnapshotInfo return the snapshots information
-func (c *Cache) GetSnapshotInfo(group string) []Info {
-
-	// if the group is empty, then use the default one
-	if group == "" {
-		group = c.GetGroups()[0]
-	}
-
-	if snapshot, ok := c.snapshots[group]; ok {
-
-		var snapshots []Info
-		collections := snapshot.Collections()
-
-		// sort the collections
-		sort.Strings(collections)
-
-		for _, collection := range collections {
-			entrieNames := make([]string, 0, len(snapshot.Resources(collection)))
-			for _, entry := range snapshot.Resources(collection) {
-				entrieNames = append(entrieNames, entry.Metadata.Name)
-			}
-			// sort the mcp resource names
-			sort.Strings(entrieNames)
-
-			synced := make(map[string]bool)
-			if statusInfo, found := c.status[group]; found {
-				synced = statusInfo.synced[collection]
-			}
-
-			info := Info{
-				Collection: collection,
-				Version:    snapshot.Version(collection),
-				Names:      entrieNames,
-				Synced:     synced,
-			}
-			snapshots = append(snapshots, info)
-		}
-		return snapshots
-	}
-	return nil
-}
-
 // GetResource returns the mcp resource detailed information for the specified group
 func (c *Cache) GetResource(group string, collection string, resourceName string) *sink.Object {
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

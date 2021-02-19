@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +15,14 @@
 package diag
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/api/analysis/v1alpha1"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/url"
 )
 
 // MessageType is a type of diagnostic message
@@ -42,14 +47,22 @@ func (m *MessageType) Code() string { return m.code }
 func (m *MessageType) Template() string { return m.template }
 
 // Message is a specific diagnostic message
+// TODO: Implement using Analysis message API
 type Message struct {
 	Type *MessageType
 
 	// The Parameters to the message
 	Parameters []interface{}
 
-	// Origin of the message
-	Origin resource.Origin
+	// Resource is the underlying resource instance associated with the
+	// message, or nil if no resource is associated with it.
+	Resource *resource.Instance
+
+	// DocRef is an optional reference tracker for the documentation URL
+	DocRef string
+
+	// Line is the line number of the error place in the message
+	Line int
 }
 
 // Unstructured returns this message as a JSON-style unstructured map
@@ -58,22 +71,81 @@ func (m *Message) Unstructured(includeOrigin bool) map[string]interface{} {
 
 	result["code"] = m.Type.Code()
 	result["level"] = m.Type.Level().String()
-	if includeOrigin && m.Origin != nil {
-		result["origin"] = m.Origin.FriendlyName()
+	if includeOrigin && m.Resource != nil {
+		result["origin"] = m.Resource.Origin.FriendlyName()
+		if m.Resource.Origin.Reference() != nil {
+			loc := m.Resource.Origin.Reference().String()
+			if m.Line != 0 {
+				loc = m.ReplaceLine(loc)
+			}
+			result["reference"] = loc
+		}
 	}
 	result["message"] = fmt.Sprintf(m.Type.Template(), m.Parameters...)
+
+	docQueryString := ""
+	if m.DocRef != "" {
+		docQueryString = fmt.Sprintf("?ref=%s", m.DocRef)
+	}
+	result["documentationUrl"] = fmt.Sprintf("%s/%s/%s", url.ConfigAnalysis, strings.ToLower(m.Type.Code()), docQueryString)
 
 	return result
 }
 
+// UnstructuredAnalysisMessageBase returns this message as a JSON-style unstructured map in AnalaysisMessageBase
+// TODO(jasonwzm): Remove once message implements AnalysisMessageBase
+func (m *Message) UnstructuredAnalysisMessageBase() map[string]interface{} {
+	docQueryString := ""
+	if m.DocRef != "" {
+		docQueryString = fmt.Sprintf("?ref=%s", m.DocRef)
+	}
+	docURL := fmt.Sprintf("%s/%s/%s", url.ConfigAnalysis, strings.ToLower(m.Type.Code()), docQueryString)
+
+	mb := v1alpha1.AnalysisMessageBase{
+		DocumentationUrl: docURL,
+		Level:            v1alpha1.AnalysisMessageBase_Level(v1alpha1.AnalysisMessageBase_Level_value[strings.ToUpper(m.Type.Level().String())]),
+		Type: &v1alpha1.AnalysisMessageBase_Type{
+			Code: m.Type.Code(),
+		},
+	}
+
+	var r map[string]interface{}
+
+	j, err := json.Marshal(mb)
+	if err != nil {
+		return r
+	}
+	json.Unmarshal(j, &r) // nolint: errcheck
+
+	return r
+}
+
+// Origin returns the origin of the message
+func (m *Message) Origin() string {
+	origin := ""
+	if m.Resource != nil {
+		loc := ""
+		if m.Resource.Origin.Reference() != nil {
+			loc = " " + m.Resource.Origin.Reference().String()
+			if m.Line != 0 {
+				loc = m.ReplaceLine(loc)
+			}
+		}
+		origin = " (" + m.Resource.Origin.FriendlyName() + loc + ")"
+	}
+	return origin
+}
+
 // String implements io.Stringer
 func (m *Message) String() string {
-	origin := ""
-	if m.Origin != nil {
-		origin = "(" + m.Origin.FriendlyName() + ")"
-	}
-	return fmt.Sprintf(
-		"%v [%v]%s %s", m.Type.Level(), m.Type.Code(), origin, fmt.Sprintf(m.Type.Template(), m.Parameters...))
+	return fmt.Sprintf("%v [%v]%s %s",
+		m.Type.Level(), m.Type.Code(), m.Origin(),
+		fmt.Sprintf(m.Type.Template(), m.Parameters...))
+}
+
+// MarshalJSON satisfies the Marshaler interface
+func (m *Message) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.Unstructured(true))
 }
 
 // NewMessageType returns a new MessageType instance.
@@ -86,10 +158,23 @@ func NewMessageType(level Level, code, template string) *MessageType {
 }
 
 // NewMessage returns a new Message instance from an existing type.
-func NewMessage(mt *MessageType, o resource.Origin, p ...interface{}) Message {
+func NewMessage(mt *MessageType, r *resource.Instance, p ...interface{}) Message {
 	return Message{
 		Type:       mt,
-		Origin:     o,
+		Resource:   r,
 		Parameters: p,
 	}
+}
+
+// ReplaceLine replaces the line number from the input String method of Reference to the line number from Message
+func (m Message) ReplaceLine(l string) string {
+	colonSep := strings.Split(l, ":")
+	if len(colonSep) < 2 {
+		return l
+	}
+	_, err := strconv.Atoi(strings.TrimSpace(colonSep[len(colonSep)-1]))
+	if err == nil {
+		colonSep[len(colonSep)-1] = fmt.Sprintf("%d", m.Line)
+	}
+	return strings.Join(colonSep, ":")
 }

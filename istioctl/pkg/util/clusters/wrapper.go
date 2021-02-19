@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package clusters
 import (
 	"bytes"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/golang/protobuf/jsonpb"
 )
 
@@ -41,10 +41,9 @@ func (w *Wrapper) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON is a custom unmarshaller to handle protobuf pain
 func (w *Wrapper) UnmarshalJSON(b []byte) error {
 	buf := bytes.NewBuffer(b)
-	jsonum := &jsonpb.Unmarshaler{}
+	jsonum := &jsonpb.Unmarshaler{AllowUnknownFields: true}
 	cd := &adminapi.Clusters{}
 	err := jsonum.Unmarshal(buf, cd)
 	*w = Wrapper{cd}
 	return err
-
 }

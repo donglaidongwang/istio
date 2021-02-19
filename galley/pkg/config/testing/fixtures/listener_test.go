@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ import (
 
 	"github.com/onsi/gomega"
 
-	"istio.io/istio/galley/pkg/config/event"
 	"istio.io/istio/galley/pkg/config/testing/data"
+	"istio.io/istio/pkg/config/event"
 )
 
 func TestDispatcher(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := gomega.NewWithT(t)
 
 	d := &Listener{}
 
@@ -35,5 +35,4 @@ func TestDispatcher(t *testing.T) {
 
 	expected := []event.Event{data.Event1Col1AddItem1}
 	g.Expect(h1.Events()).To(gomega.Equal(expected))
-
 }

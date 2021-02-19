@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,9 @@ package kube
 import (
 	"strings"
 
-	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/protocol"
-
 	coreV1 "k8s.io/api/core/v1"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"istio.io/istio/pkg/config/protocol"
 )
 
 const (
@@ -31,32 +29,31 @@ const (
 	MongoDB = 27017
 )
 
-var (
-	// Ports be skipped for protocol sniffing. Applications bound to these ports will be broken if
-	// protocol sniffing is enabled.
-	wellKnownPorts = map[int32]struct{}{
-		SMTP:    {},
-		DNS:     {},
-		MySQL:   {},
-		MongoDB: {},
-	}
-)
-
-func ConvertLabels(obj metaV1.ObjectMeta) labels.Instance {
-	out := make(labels.Instance, len(obj.Labels))
-	for k, v := range obj.Labels {
-		out[k] = v
-	}
-	return out
+// Ports be skipped for protocol sniffing. Applications bound to these ports will be broken if
+// protocol sniffing is enabled.
+var wellKnownPorts = map[int32]struct{}{
+	SMTP:    {},
+	DNS:     {},
+	MySQL:   {},
+	MongoDB: {},
 }
 
-var grpcWeb = string(protocol.GRPCWeb)
-var grpcWebLen = len(grpcWeb)
+var (
+	grpcWeb    = string(protocol.GRPCWeb)
+	grpcWebLen = len(grpcWeb)
+)
 
 // ConvertProtocol from k8s protocol and port name
-func ConvertProtocol(port int32, name string, proto coreV1.Protocol) protocol.Instance {
+func ConvertProtocol(port int32, portName string, proto coreV1.Protocol, appProto *string) protocol.Instance {
 	if proto == coreV1.ProtocolUDP {
 		return protocol.UDP
+	}
+
+	// If application protocol is set, we will use that
+	// If not, use the port name
+	name := portName
+	if appProto != nil {
+		name = *appProto
 	}
 
 	// Check if the port name prefix is "grpc-web". Need to do this before the general

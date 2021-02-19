@@ -32,11 +32,11 @@ DOCKER_HUB=${DOCKER_HUB:-gcr.io/istio-testing}
 GCS_BUCKET=${GCS_BUCKET:-istio-build/dev}
 
 # Use a pinned version in case breaking changes are needed
-BUILDER_SHA=b6ce79ae8b17bd46287401166aa0add43b3b2c53
+BUILDER_SHA=f1a02f97019440e09bf70133255bc1fa2fb2a82f
 
 # Reference to the next minor version of Istio
 # This will create a version like 1.4-alpha.sha
-NEXT_VERSION=1.5
+NEXT_VERSION=1.10
 TAG=$(git rev-parse HEAD)
 VERSION="${NEXT_VERSION}-alpha.${TAG}"
 
@@ -49,16 +49,11 @@ MANIFEST=$(cat <<EOF
 version: ${VERSION}
 docker: ${DOCKER_HUB}
 directory: ${WORK_DIR}
+ignoreVulnerability: true
 dependencies:
+${DEPENDENCIES:-$(cat <<EOD
   istio:
     localpath: ${ROOT}
-  cni:
-    git: https://github.com/istio/cni
-    auto: deps
-  operator:
-    git: https://github.com/istio/operator
-    auto: modules
-
   api:
     git: https://github.com/istio/api
     auto: modules
@@ -80,6 +75,16 @@ dependencies:
   tools:
     git: https://github.com/istio/tools
     branch: master
+EOD
+)}
+dashboards:
+  istio-mesh-dashboard: 7639
+  istio-performance-dashboard: 11829
+  istio-service-dashboard: 7636
+  istio-workload-dashboard: 7630
+  pilot-dashboard: 7645
+  istio-extension-dashboard: 13277
+${PROXY_OVERRIDE:-}
 EOF
 )
 

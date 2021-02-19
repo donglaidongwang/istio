@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,21 +17,26 @@ package envoyfilter
 import (
 	"testing"
 
-	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/testing/protocmp"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/fakes"
+	"istio.io/istio/pilot/pkg/networking/util"
+	"istio.io/istio/pilot/pkg/serviceregistry/memory"
+	"istio.io/istio/pkg/config/host"
 )
 
 func Test_clusterMatch(t *testing.T) {
 	type args struct {
 		proxy          *model.Proxy
-		cluster        *xdsapi.Cluster
+		cluster        *cluster.Cluster
 		matchCondition *networking.EnvoyFilter_EnvoyConfigObjectMatch
 		operation      networking.EnvoyFilter_Patch_Operation
+		host           host.Name
 	}
 	tests := []struct {
 		name string
@@ -48,7 +53,7 @@ func Test_clusterMatch(t *testing.T) {
 						Cluster: &networking.EnvoyFilter_ClusterMatch{Name: "scooby"},
 					},
 				},
-				cluster: &xdsapi.Cluster{Name: "scrappy"},
+				cluster: &cluster.Cluster{Name: "scrappy"},
 			},
 			want: false,
 		},
@@ -66,7 +71,7 @@ func Test_clusterMatch(t *testing.T) {
 						},
 					},
 				},
-				cluster: &xdsapi.Cluster{Name: "outbound|80|v2|foo.bar"},
+				cluster: &cluster.Cluster{Name: "outbound|80|v2|foo.bar"},
 			},
 			want: false,
 		},
@@ -84,9 +89,26 @@ func Test_clusterMatch(t *testing.T) {
 						},
 					},
 				},
-				cluster: &xdsapi.Cluster{Name: "outbound|80|v1|google.com"},
+				cluster: &cluster.Cluster{Name: "outbound|80|v1|google.com"},
 			},
 			want: false,
+		},
+		{
+			name: "service name match for inbound cluster",
+			args: args{
+				proxy:     &model.Proxy{Type: model.SidecarProxy},
+				operation: networking.EnvoyFilter_Patch_MERGE,
+				matchCondition: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+					ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Cluster{
+						Cluster: &networking.EnvoyFilter_ClusterMatch{
+							Service: "foo.bar",
+						},
+					},
+				},
+				cluster: &cluster.Cluster{Name: "inbound|80||"},
+				host:    "foo.bar",
+			},
+			want: true,
 		},
 		{
 			name: "port mismatch",
@@ -102,7 +124,7 @@ func Test_clusterMatch(t *testing.T) {
 						},
 					},
 				},
-				cluster: &xdsapi.Cluster{Name: "outbound|90|v1|foo.bar"},
+				cluster: &cluster.Cluster{Name: "outbound|90|v1|foo.bar"},
 			},
 			want: false,
 		},
@@ -120,21 +142,21 @@ func Test_clusterMatch(t *testing.T) {
 						},
 					},
 				},
-				cluster: &xdsapi.Cluster{Name: "outbound|80|v1|foo.bar"},
+				cluster: &cluster.Cluster{Name: "outbound|80|v1|foo.bar"},
 			},
 			want: true,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := clusterMatch(tt.args.cluster, &model.EnvoyFilterConfigPatchWrapper{Match: tt.args.matchCondition}); got != tt.want {
+			if got := clusterMatch(tt.args.cluster, &model.EnvoyFilterConfigPatchWrapper{Match: tt.args.matchCondition}, []host.Name{tt.args.host}); got != tt.want {
 				t.Errorf("clusterMatch() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestApplyClusterPatches(t *testing.T) {
+func TestClusterPatching(t *testing.T) {
 	configPatches := []*networking.EnvoyFilter_EnvoyConfigObjectPatch{
 		{
 			ApplyTo: networking.EnvoyFilter_CLUSTER,
@@ -183,6 +205,21 @@ func TestApplyClusterPatches(t *testing.T) {
 		{
 			ApplyTo: networking.EnvoyFilter_CLUSTER,
 			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				Context: networking.EnvoyFilter_SIDECAR_INBOUND,
+				ObjectTypes: &networking.EnvoyFilter_EnvoyConfigObjectMatch_Cluster{
+					Cluster: &networking.EnvoyFilter_ClusterMatch{
+						Service: "service.servicens",
+					},
+				},
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_MERGE,
+				Value:     buildPatchStruct(`{"protocol_selection":"USE_DOWNSTREAM_PROTOCOL"}`),
+			},
+		},
+		{
+			ApplyTo: networking.EnvoyFilter_CLUSTER,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
 				Context: networking.EnvoyFilter_ANY,
 			},
 			Patch: &networking.EnvoyFilter_Patch{
@@ -200,64 +237,207 @@ func TestApplyClusterPatches(t *testing.T) {
 				Value:     buildPatchStruct(`{"lb_policy":"RING_HASH"}`),
 			},
 		},
-	}
-
-	sidecarOutboundIn := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V4_ONLY, LbPolicy: xdsapi.Cluster_ROUND_ROBIN},
-		{Name: "cluster2",
-			Http2ProtocolOptions: &core.Http2ProtocolOptions{
-				AllowConnect:  true,
-				AllowMetadata: true,
-			}, LbPolicy: xdsapi.Cluster_MAGLEV,
+		{
+			ApplyTo: networking.EnvoyFilter_CLUSTER,
+			Match: &networking.EnvoyFilter_EnvoyConfigObjectMatch{
+				Context: networking.EnvoyFilter_SIDECAR_OUTBOUND,
+			},
+			Patch: &networking.EnvoyFilter_Patch{
+				Operation: networking.EnvoyFilter_Patch_MERGE,
+				Value: buildPatchStruct(`
+				{"transport_socket":{
+					"name":"envoy.transport_sockets.tls",
+					"typed_config":{
+						"@type":"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+						"common_tls_context":{
+							"tls_params":{
+								"tls_minimum_protocol_version":"TLSv1_3"}}}}}`),
+			},
 		},
 	}
 
-	sidecarOutboundOut := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V6_ONLY, LbPolicy: xdsapi.Cluster_RING_HASH},
-		{Name: "cluster2",
+	sidecarOutboundIn := []*cluster.Cluster{
+		{
+			Name:            "cluster1",
+			DnsLookupFamily: cluster.Cluster_V4_ONLY,
+			LbPolicy:        cluster.Cluster_ROUND_ROBIN,
+			TransportSocketMatches: []*cluster.Cluster_TransportSocketMatch{
+				{
+					Name: "tlsMode-istio",
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.UpstreamTlsContext{
+								CommonTlsContext: &tls.CommonTlsContext{
+									TlsParams: &tls.TlsParameters{
+										EcdhCurves:                []string{"X25519"},
+										TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_1,
+									},
+									TlsCertificateCertificateProviderInstance: &tls.CommonTlsContext_CertificateProviderInstance{
+										InstanceName:    "instance",
+										CertificateName: "certificate",
+									},
+								},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "cluster2",
 			Http2ProtocolOptions: &core.Http2ProtocolOptions{
 				AllowConnect:  true,
 				AllowMetadata: true,
-			}, LbPolicy: xdsapi.Cluster_RING_HASH, DnsLookupFamily: xdsapi.Cluster_V6_ONLY,
+			}, LbPolicy: cluster.Cluster_MAGLEV,
 		},
-		{Name: "new-cluster1", DnsLookupFamily: xdsapi.Cluster_V6_ONLY, LbPolicy: xdsapi.Cluster_RING_HASH},
-		{Name: "new-cluster2", DnsLookupFamily: xdsapi.Cluster_V6_ONLY, LbPolicy: xdsapi.Cluster_RING_HASH},
+		{
+			Name:            "cluster3",
+			DnsLookupFamily: cluster.Cluster_V4_ONLY,
+			LbPolicy:        cluster.Cluster_ROUND_ROBIN,
+			TransportSocket: &core.TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				ConfigType: &core.TransportSocket_TypedConfig{
+					TypedConfig: util.MessageToAny(&tls.UpstreamTlsContext{
+						CommonTlsContext: &tls.CommonTlsContext{
+							TlsParams: &tls.TlsParameters{
+								EcdhCurves:                []string{"X25519"},
+								TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
+							},
+							TlsCertificateCertificateProviderInstance: &tls.CommonTlsContext_CertificateProviderInstance{
+								InstanceName:    "instance",
+								CertificateName: "certificate",
+							},
+						},
+					}),
+				},
+			},
+		},
 	}
 
-	sidecarInboundIn := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V4_ONLY, LbPolicy: xdsapi.Cluster_ROUND_ROBIN},
+	sidecarOutboundOut := []*cluster.Cluster{
+		{
+			Name:            "cluster1",
+			DnsLookupFamily: cluster.Cluster_V6_ONLY,
+			LbPolicy:        cluster.Cluster_RING_HASH,
+			TransportSocketMatches: []*cluster.Cluster_TransportSocketMatch{
+				{
+					Name: "tlsMode-istio",
+					TransportSocket: &core.TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						ConfigType: &core.TransportSocket_TypedConfig{
+							TypedConfig: util.MessageToAny(&tls.UpstreamTlsContext{
+								CommonTlsContext: &tls.CommonTlsContext{
+									TlsParams: &tls.TlsParameters{
+										EcdhCurves:                []string{"X25519"},
+										TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_3,
+									},
+									TlsCertificateCertificateProviderInstance: &tls.CommonTlsContext_CertificateProviderInstance{
+										InstanceName:    "instance",
+										CertificateName: "certificate",
+									},
+								},
+							}),
+						},
+					},
+				},
+			},
+		},
+		{
+			Name: "cluster2",
+			Http2ProtocolOptions: &core.Http2ProtocolOptions{
+				AllowConnect:  true,
+				AllowMetadata: true,
+			},
+			LbPolicy:        cluster.Cluster_RING_HASH,
+			DnsLookupFamily: cluster.Cluster_V6_ONLY,
+			TransportSocket: &core.TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				ConfigType: &core.TransportSocket_TypedConfig{
+					TypedConfig: util.MessageToAny(&tls.UpstreamTlsContext{
+						CommonTlsContext: &tls.CommonTlsContext{
+							TlsParams: &tls.TlsParameters{
+								TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_3,
+							},
+						},
+					}),
+				},
+			},
+		},
+		{
+			Name:            "cluster3",
+			DnsLookupFamily: cluster.Cluster_V6_ONLY,
+			LbPolicy:        cluster.Cluster_RING_HASH,
+			TransportSocket: &core.TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				ConfigType: &core.TransportSocket_TypedConfig{
+					TypedConfig: util.MessageToAny(&tls.UpstreamTlsContext{
+						CommonTlsContext: &tls.CommonTlsContext{
+							TlsParams: &tls.TlsParameters{
+								EcdhCurves:                []string{"X25519"},
+								TlsMinimumProtocolVersion: tls.TlsParameters_TLSv1_3,
+								TlsMaximumProtocolVersion: tls.TlsParameters_TLSv1_3,
+							},
+							TlsCertificateCertificateProviderInstance: &tls.CommonTlsContext_CertificateProviderInstance{
+								InstanceName:    "instance",
+								CertificateName: "certificate",
+							},
+						},
+					}),
+				},
+			},
+		},
+		{Name: "new-cluster1"},
+		{Name: "new-cluster2"},
+	}
+
+	sidecarInboundIn := []*cluster.Cluster{
+		{Name: "cluster1", DnsLookupFamily: cluster.Cluster_V4_ONLY, LbPolicy: cluster.Cluster_ROUND_ROBIN},
 		{Name: "inbound|9999||mgmtCluster"},
 	}
-	sidecarInboundOut := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V6_ONLY, LbPolicy: xdsapi.Cluster_RING_HASH},
+	sidecarInboundOut := []*cluster.Cluster{
+		{Name: "cluster1", DnsLookupFamily: cluster.Cluster_V6_ONLY, LbPolicy: cluster.Cluster_RING_HASH},
 	}
 
-	gatewayInput := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V4_ONLY, LbPolicy: xdsapi.Cluster_ROUND_ROBIN},
-		{Name: "cluster2",
+	sidecarInboundServiceIn := []*cluster.Cluster{
+		{Name: "inbound|7443||", DnsLookupFamily: cluster.Cluster_V4_ONLY, LbPolicy: cluster.Cluster_ROUND_ROBIN},
+	}
+	sidecarInboundServiceOut := []*cluster.Cluster{
+		{
+			Name: "inbound|7443||", ProtocolSelection: cluster.Cluster_USE_DOWNSTREAM_PROTOCOL,
+			DnsLookupFamily: cluster.Cluster_V6_ONLY, LbPolicy: cluster.Cluster_RING_HASH,
+		},
+	}
+
+	gatewayInput := []*cluster.Cluster{
+		{Name: "cluster1", DnsLookupFamily: cluster.Cluster_V4_ONLY, LbPolicy: cluster.Cluster_ROUND_ROBIN},
+		{
+			Name: "cluster2",
 			Http2ProtocolOptions: &core.Http2ProtocolOptions{
 				AllowConnect:  true,
 				AllowMetadata: true,
-			}, LbPolicy: xdsapi.Cluster_MAGLEV,
+			}, LbPolicy: cluster.Cluster_MAGLEV,
 		},
 		{Name: "outbound|443||gateway.com"},
 	}
-	gatewayOutput := []*xdsapi.Cluster{
-		{Name: "cluster1", DnsLookupFamily: xdsapi.Cluster_V6_ONLY, LbPolicy: xdsapi.Cluster_RING_HASH},
-		{Name: "cluster2",
+	gatewayOutput := []*cluster.Cluster{
+		{Name: "cluster1", DnsLookupFamily: cluster.Cluster_V6_ONLY, LbPolicy: cluster.Cluster_RING_HASH},
+		{
+			Name: "cluster2",
 			Http2ProtocolOptions: &core.Http2ProtocolOptions{
 				AllowConnect:  true,
 				AllowMetadata: true,
-			}, LbPolicy: xdsapi.Cluster_RING_HASH, DnsLookupFamily: xdsapi.Cluster_V6_ONLY,
+			}, LbPolicy: cluster.Cluster_RING_HASH, DnsLookupFamily: cluster.Cluster_V6_ONLY,
 		},
 	}
 
 	testCases := []struct {
 		name         string
-		input        []*xdsapi.Cluster
+		input        []*cluster.Cluster
 		proxy        *model.Proxy
+		host         string
 		patchContext networking.EnvoyFilter_PatchContext
-		output       []*xdsapi.Cluster
+		output       []*cluster.Cluster
 	}{
 		{
 			name:         "sidecar outbound cluster patch",
@@ -274,6 +454,14 @@ func TestApplyClusterPatches(t *testing.T) {
 			output:       sidecarInboundOut,
 		},
 		{
+			name:         "sidecar inbound cluster patch with service name",
+			input:        sidecarInboundServiceIn,
+			patchContext: networking.EnvoyFilter_SIDECAR_INBOUND,
+			proxy:        &model.Proxy{Type: model.SidecarProxy, ConfigNamespace: "not-default"},
+			host:         "service.servicens",
+			output:       sidecarInboundServiceOut,
+		},
+		{
 			name:         "gateway cds patch",
 			input:        gatewayInput,
 			patchContext: networking.EnvoyFilter_GATEWAY,
@@ -282,15 +470,22 @@ func TestApplyClusterPatches(t *testing.T) {
 		},
 	}
 
-	serviceDiscovery := &fakes.ServiceDiscovery{}
+	serviceDiscovery := memory.NewServiceDiscovery(nil)
 	env := newTestEnvironment(serviceDiscovery, testMesh, buildEnvoyFilterConfigStore(configPatches))
 	push := model.NewPushContext()
 	push.InitContext(env, nil, nil)
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ApplyClusterPatches(tc.patchContext, tc.proxy, push, tc.input)
-			if diff := cmp.Diff(tc.output, got); diff != "" {
-				t.Errorf("ApplyClusterPatches(): %s mismatch (-want +got):\n%s", tc.name, diff)
+			efw := push.EnvoyFilters(tc.proxy)
+			output := []*cluster.Cluster{}
+			for _, c := range tc.input {
+				if ShouldKeepCluster(tc.patchContext, efw, c, []host.Name{host.Name(tc.host)}) {
+					output = append(output, ApplyClusterMerge(tc.patchContext, efw, c, []host.Name{host.Name(tc.host)}))
+				}
+			}
+			output = append(output, InsertedClusters(tc.patchContext, efw)...)
+			if diff := cmp.Diff(tc.output, output, protocmp.Transform()); diff != "" {
+				t.Errorf("%s mismatch (-want +got):\n%s", tc.name, diff)
 			}
 		})
 	}

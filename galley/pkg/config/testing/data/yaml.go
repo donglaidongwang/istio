@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -122,6 +122,19 @@ spec:
 apiVersion: testdata.istio.io/v1alpha1
 kind: Kind2
 metadata:
+  name: i1
+spec:
+  n1_i1: v1
+`
+
+	// YamlI1V1WithCommentContainingDocumentSeparator is a testing resource in
+	// yaml form with a comment containing a document separator.
+	YamlI1V1WithCommentContainingDocumentSeparator = `
+# ---
+apiVersion: testdata.istio.io/v1alpha1
+kind: Kind1
+metadata:
+  namespace: n1
   name: i1
 spec:
   n1_i1: v1

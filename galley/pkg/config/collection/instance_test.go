@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,20 +20,21 @@ import (
 	. "github.com/onsi/gomega"
 
 	"istio.io/istio/galley/pkg/config/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/galley/pkg/config/testing/basicmeta"
 	"istio.io/istio/galley/pkg/config/testing/data"
+	"istio.io/istio/pkg/config/resource"
 )
 
 func TestInstance_Basics(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	inst := collection.New(data.Collection1)
+	inst := collection.New(basicmeta.K8SCollection1)
 
 	g.Expect(inst.Size()).To(Equal(0))
 
-	var fe []*resource.Entry
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	var fe []*resource.Instance
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 	g.Expect(fe).To(HaveLen(0))
@@ -46,21 +47,21 @@ func TestInstance_Basics(t *testing.T) {
 	g.Expect(inst.Size()).To(Equal(2))
 
 	fe = nil
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 	g.Expect(fe).To(HaveLen(2))
 
 	g.Expect(inst.Generation()).To(Equal(int64(2)))
 
-	inst.Remove(data.EntryN1I1V1.Metadata.Name)
+	inst.Remove(data.EntryN1I1V1.Metadata.FullName)
 
 	g.Expect(inst.Size()).To(Equal(1))
 
 	fe = nil
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 	g.Expect(fe).To(HaveLen(1))
@@ -70,21 +71,20 @@ func TestInstance_Basics(t *testing.T) {
 	inst.Clear()
 
 	fe = nil
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 	g.Expect(fe).To(HaveLen(0))
 
 	g.Expect(inst.Generation()).To(Equal(int64(4)))
 	g.Expect(inst.Size()).To(Equal(0))
-
 }
 
 func TestInstance_Clone(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	inst := collection.New(data.Collection1)
+	inst := collection.New(basicmeta.K8SCollection1)
 	inst.Set(data.EntryN1I1V1)
 	inst.Set(data.EntryN2I2V2)
 
@@ -93,21 +93,21 @@ func TestInstance_Clone(t *testing.T) {
 	g.Expect(inst2.Size()).To(Equal(2))
 	g.Expect(inst2.Generation()).To(Equal(int64(2)))
 
-	var fe []*resource.Entry
-	inst2.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	var fe []*resource.Instance
+	inst2.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 	g.Expect(fe).To(HaveLen(2))
 
-	inst.Remove(data.EntryN1I1V1.Metadata.Name)
+	inst.Remove(data.EntryN1I1V1.Metadata.FullName)
 
 	g.Expect(inst2.Size()).To(Equal(2))
 	g.Expect(inst2.Generation()).To(Equal(int64(2)))
 
 	fe = nil
-	inst2.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	inst2.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return true
 	})
 
@@ -115,41 +115,41 @@ func TestInstance_Clone(t *testing.T) {
 }
 
 func TestInstance_ForEach_False(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	inst := collection.New(data.Collection1)
+	inst := collection.New(basicmeta.K8SCollection1)
 	inst.Set(data.EntryN1I1V2)
 	inst.Set(data.EntryN2I2V2)
 	inst.Set(data.EntryN3I3V1)
 
-	var fe []*resource.Entry
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	var fe []*resource.Instance
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return false
 	})
 	g.Expect(fe).To(HaveLen(1))
 
 	fe = nil
-	inst.ForEach(func(e *resource.Entry) bool {
-		fe = append(fe, e)
+	inst.ForEach(func(r *resource.Instance) bool {
+		fe = append(fe, r)
 		return len(fe) < 2
 	})
 	g.Expect(fe).To(HaveLen(2))
 }
 
 func TestInstance_Get(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	inst := collection.New(data.Collection1)
+	inst := collection.New(basicmeta.K8SCollection1)
 	inst.Set(data.EntryN1I1V1)
 	inst.Set(data.EntryN3I3V1)
 
-	e := inst.Get(data.EntryN1I1V1.Metadata.Name)
+	e := inst.Get(data.EntryN1I1V1.Metadata.FullName)
 	g.Expect(e).To(Equal(data.EntryN1I1V1))
 
-	e = inst.Get(data.EntryN3I3V1.Metadata.Name)
+	e = inst.Get(data.EntryN3I3V1.Metadata.FullName)
 	g.Expect(e).To(Equal(data.EntryN3I3V1))
 
-	e = inst.Get(data.EntryN2I2V2.Metadata.Name)
+	e = inst.Get(data.EntryN2I2V2.Metadata.FullName)
 	g.Expect(e).To(BeNil())
 }

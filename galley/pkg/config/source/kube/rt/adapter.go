@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,20 +22,22 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/cache"
 
-	"istio.io/istio/galley/pkg/config/resource"
 	"istio.io/istio/galley/pkg/config/scope"
 	"istio.io/istio/galley/pkg/config/source/kube/apiserver/stats"
+	"istio.io/istio/pkg/config/resource"
 )
 
 // Adapter provides core functions that are necessary to interact with a Kubernetes resource.
 type Adapter struct {
-	extractObject   extractObjectFn
-	extractResource extractResourceFn
-	newInformer     newInformerFn
-	parseJSON       parseJSONFn
-	getStatus       getStatusFn
-	isEqual         isEqualFn
-	isBuiltIn       bool
+	extractObject                 extractObjectFn
+	extractResource               extractResourceFn
+	newInformer                   newInformerFn
+	parseJSON                     parseJSONFn
+	getStatus                     getStatusFn
+	isEqual                       isEqualFn
+	isBuiltIn                     bool
+	isDefaultExcluded             bool
+	isRequiredForServiceDiscovery bool
 }
 
 // ExtractObject extracts the k8s object metadata from the given object of this type.
@@ -73,8 +75,18 @@ func (p *Adapter) IsBuiltIn() bool {
 	return p.isBuiltIn
 }
 
+// IsDefaultExcluded returns true if the adapter is excluded from the default set of resources to watch.
+func (p *Adapter) IsDefaultExcluded() bool {
+	return p.isDefaultExcluded
+}
+
+// IsRequiredForServiceDiscovery returns true if the adapter is required for service discovery.
+func (p *Adapter) IsRequiredForServiceDiscovery() bool {
+	return p.isRequiredForServiceDiscovery
+}
+
 // JSONToEntry parses the K8s Resource in JSON form and converts it to resource entry.
-func (p *Adapter) JSONToEntry(s string) (*resource.Entry, error) {
+func (p *Adapter) JSONToEntry(s string) (*resource.Instance, error) {
 	i, err := p.ParseJSON([]byte(s))
 	if err != nil {
 		return nil, err
@@ -86,16 +98,17 @@ func (p *Adapter) JSONToEntry(s string) (*resource.Entry, error) {
 		return nil, err
 	}
 
-	return ToResourceEntry(obj, nil, item), nil
-
+	return ToResource(obj, nil, item, nil, nil), nil
 }
 
-type extractObjectFn func(o interface{}) metav1.Object
-type extractResourceFn func(o interface{}) (proto.Message, error)
-type newInformerFn func() (cache.SharedIndexInformer, error)
-type parseJSONFn func(input []byte) (interface{}, error)
-type getStatusFn func(o interface{}) interface{}
-type isEqualFn func(o1 interface{}, o2 interface{}) bool
+type (
+	extractObjectFn   func(o interface{}) metav1.Object
+	extractResourceFn func(o interface{}) (proto.Message, error)
+	newInformerFn     func() (cache.SharedIndexInformer, error)
+	parseJSONFn       func(input []byte) (interface{}, error)
+	getStatusFn       func(o interface{}) interface{}
+	isEqualFn         func(o1 interface{}, o2 interface{}) bool
+)
 
 // resourceVersionsMatch is a resourceEqualFn that determines equality by the resource version.
 func resourceVersionsMatch(o1 interface{}, o2 interface{}) bool {

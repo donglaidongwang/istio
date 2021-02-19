@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,10 +37,31 @@ var (
 
 const (
 	// JwtPubKey1 is the response to 1st call for JWT public key returned by mock server.
-	JwtPubKey1 = "fakeKey1"
+	JwtPubKey1 = `{ "keys": [ { "kid": "fakeKey1_1", "alg": "RS256", "kty": "RSA", "n": "abc", "e": "def" },
+			{ "kid": "fakeKey1_2", "alg": "RS256", "kty": "RSA", "n": "123", "e": "456" } ] }`
+
+	// JwtPubKey1Reordered is the response to 1st call for JWT public key returned by mock server, but in a modified order of json elements.
+	JwtPubKey1Reordered = `{ "keys": [ { "alg": "RS256", "kid": "fakeKey1_2", "n": "123", "kty": "RSA", "e": "456" },
+			{ "n": "abc", "alg": "RS256", "kty": "RSA", "kid": "fakeKey1_1", "e": "def" } ] }`
 
 	// JwtPubKey2 is the response to later calls for JWT public key returned by mock server.
-	JwtPubKey2 = "fakeKey2"
+	JwtPubKey2 = `{ "keys": [ { "kid": "fakeKey2_1", "alg": "RS256", "kty": "RSA", "n": "ghi", "e": "lmn" },
+			{ "kid": "fakeKey2_2", "alg": "RS256", "kty": "RSA", "n": "789", "e": "1234" } ] }`
+
+	JwtPubKeyNoKid = `{ "keys": [ { "alg": "RS256", "kty": "RSA", "n": "abc", "e": "def" },
+			{ "alg": "RS256", "kty": "RSA", "n": "123", "e": "456" } ] }`
+
+	JwtPubKeyNoKid2 = `{ "keys": [ { "alg": "RS256", "kty": "RSA", "n": "ghi", "e": "lmn" },
+			{ "alg": "RS256", "kty": "RSA", "n": "789", "e": "123" } ] }`
+
+	JwtPubKeyNoKeys = `{ "pub": [ { "kid": "fakeKey1_1", "alg": "RS256", "kty": "RSA", "n": "abc", "e": "def" },
+			{ "kid": "fakeKey1_2", "alg": "RS256", "kty": "RSA", "n": "123", "e": "456" } ] }`
+
+	JwtPubKeyNoKeys2 = `{ "pub": [ { "kid": "fakeKey1_3", "alg": "RS256", "kty": "RSA", "n": "abc", "e": "def" },
+			{ "kid": "fakeKey1_4", "alg": "RS256", "kty": "RSA", "n": "123", "e": "456" } ] }`
+
+	JwtPubKeyExtraElements = `{ "keys": [ { "kid": "fakeKey1_1", "alg": "RS256", "kty": "RSA", "n": "abc", "e": "def", "bla": "blah" },
+			{ "kid": "fakeKey1_2", "alg": "RS256", "kty": "RSA", "n": "123", "e": "456", "bla": "blah" } ] }`
 )
 
 // MockOpenIDDiscoveryServer is the in-memory openID discovery server.
@@ -62,6 +83,10 @@ type MockOpenIDDiscoveryServer struct {
 	// The mock server will start to return an error after the first number of hits for public key,
 	// this is used to simulate network errors and test the refresh logic in jwks resolver.
 	ReturnErrorAfterFirstNumHits uint64
+
+	// The mock server will start to return an error after the first number of hits for public key,
+	// this is used to simulate network errors and test the refresh logic in jwks resolver.
+	ReturnReorderedKeyAfterFirstNumHits uint64
 
 	// If both TLSKeyFile and TLSCertFile are set, Start() will attempt to start a HTTPS server.
 	TLSKeyFile  string
@@ -143,17 +168,18 @@ func (ms *MockOpenIDDiscoveryServer) Start() error {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	wait := 300 * time.Millisecond
-	for try := 0; try < 5; try++ {
-		time.Sleep(wait)
+	wait := 10 * time.Millisecond
+	for try := 0; try < 10; try++ {
 		// Try to call the server
-		if _, err := httpClient.Get(fmt.Sprintf("%s/.well-known/openid-configuration", ms.URL)); err != nil {
+		res, err := httpClient.Get(fmt.Sprintf("%s/.well-known/openid-configuration", ms.URL))
+		if err != nil {
 			log.Infof("Server not yet serving: %v", err)
 			// Retry after some sleep.
 			wait *= 2
+			time.Sleep(wait)
 			continue
 		}
-
+		res.Body.Close()
 		log.Infof("Successfully serving on %s", ms.URL)
 		atomic.StoreUint64(&ms.OpenIDHitNum, 0)
 		atomic.StoreUint64(&ms.PubKeyHitNum, 0)
@@ -197,6 +223,11 @@ func (ms *MockOpenIDDiscoveryServer) jwtPubKey(w http.ResponseWriter, req *http.
 
 	if atomic.LoadUint64(&ms.PubKeyHitNum) == ms.ReturnErrorForFirstNumHits+1 {
 		fmt.Fprintf(w, "%v", JwtPubKey1)
+		return
+	}
+
+	if ms.ReturnReorderedKeyAfterFirstNumHits != 0 && atomic.LoadUint64(&ms.PubKeyHitNum) >= ms.ReturnReorderedKeyAfterFirstNumHits+1 {
+		fmt.Fprintf(w, "%v", JwtPubKey1Reordered)
 		return
 	}
 

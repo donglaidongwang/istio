@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,7 @@ package basicmeta
 // Embed the core metadata file containing the collections as a resource
 //go:generate go-bindata --nocompress --nometadata --pkg basicmeta -o basicmeta.gen.go basicmeta.yaml basicmeta2.yaml
 
-// Create static initializers file
-//go:generate go run $REPO_ROOT/galley/pkg/config/meta/schema/codegen/tools/staticinit.main.go basicmeta basicmeta.yaml staticinit.gen.go
-
 // Create collection constants
-//go:generate go run $REPO_ROOT/galley/pkg/config/meta/schema/codegen/tools/collections.main.go basicmeta basicmeta.yaml collections.gen.go
+//go:generate go run $REPO_ROOT/pkg/config/schema/codegen/tools/collections.main.go basicmeta basicmeta.yaml collections.gen.go
 
 //go:generate goimports -w -local istio.io "$REPO_ROOT/galley/pkg/config/testing/basicmeta/collections.gen.go"
-//go:generate goimports -w -local istio.io "$REPO_ROOT/galley/pkg/config/testing/basicmeta/staticinit.gen.go"

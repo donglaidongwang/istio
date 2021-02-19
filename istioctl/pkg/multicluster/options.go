@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,12 +18,11 @@ import (
 	"errors"
 
 	"github.com/spf13/pflag"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 // TODO(ayj) - add to istio.io/api/annotations
-const clusterContextAnnotationKey = "istio.io/clusterContext"
+const clusterNameAnnotationKey = "networking.istio.io/cluster"
 
 // KubeOptions contains kubernetes options common to all commands.
 type KubeOptions struct {
@@ -47,7 +46,7 @@ func (o *KubeOptions) prepare(flags *pflag.FlagSet) {
 	}
 
 	if o.Namespace == "" {
-		o.Namespace = v1.NamespaceDefault
+		o.Namespace = defaultIstioNamespace
 
 		configAccess := clientcmd.NewDefaultPathOptions()
 		configAccess.GlobalFile = o.Kubeconfig
@@ -66,7 +65,7 @@ type filenameOption struct {
 func (f *filenameOption) addFlags(flagset *pflag.FlagSet) {
 	if flagset.Lookup("filename") == nil {
 		flagset.StringVarP(&f.filename, "filename", "f", "",
-			"filename of the multicluster mesh description")
+			"Filename of the multicluster mesh description")
 	}
 }
 

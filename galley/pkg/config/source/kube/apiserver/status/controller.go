@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,32 +15,32 @@
 package status
 
 import (
+	"context"
 	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 
 	"istio.io/istio/galley/pkg/config/analysis/diag"
-	"istio.io/istio/galley/pkg/config/meta/schema"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
 	"istio.io/istio/galley/pkg/config/scope"
 	"istio.io/istio/galley/pkg/config/source/kube/rt"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
 )
 
 // Controller is the interface for a status controller. It is mainly used to separate implementation from
 // interface, so that code can be tested separately.
 type Controller interface {
-	Start(p *rt.Provider, resources []schema.KubeResource)
+	Start(p *rt.Provider, resources []collection.Schema)
 	Stop()
-	UpdateResourceStatus(col collection.Name, name resource.Name, version resource.Version, status interface{})
+	UpdateResourceStatus(col collection.Name, name resource.FullName, version resource.Version, status interface{})
 	Report(messages diag.Messages)
 }
 
 // ControllerImpl keeps track of status information for a given K8s style collection and continuously reconciles.
 type ControllerImpl struct {
 	// Protects the top-level start/stop state of the controller
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Internal state of the controller. It keeps track of known status, desired status, and work queue.
 	state *state
@@ -62,7 +62,7 @@ func NewController(subfield string) *ControllerImpl {
 }
 
 // Start the controller. This will reset the internal state.
-func (c *ControllerImpl) Start(p *rt.Provider, resources []schema.KubeResource) {
+func (c *ControllerImpl) Start(p *rt.Provider, resources []collection.Schema) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -73,15 +73,15 @@ func (c *ControllerImpl) Start(p *rt.Provider, resources []schema.KubeResource) 
 
 	ifaces := make(map[collection.Name]dynamic.NamespaceableResourceInterface)
 	for _, r := range resources {
-		if r.Disabled {
+		if r.IsDisabled() {
 			continue
 		}
 
-		iface, err := p.GetDynamicResourceInterface(r)
+		iface, err := p.GetDynamicResourceInterface(r.Resource())
 		if err != nil {
-			scope.Source.Errorf("Unable to create a dynamic resource interface for resource %v", r.CanonicalResourceName())
+			scope.Source.Errorf("Unable to create a dynamic resource interface for resource %v", r.Resource().GroupVersionKind())
 		}
-		ifaces[r.Collection.Name] = iface
+		ifaces[r.Name()] = iface
 	}
 
 	c.wg.Add(1)
@@ -101,14 +101,17 @@ func (c *ControllerImpl) Stop() {
 
 // UpdateResourceStatus is called by the source to relay the currently observed status of a resource.
 func (c *ControllerImpl) UpdateResourceStatus(
-	col collection.Name, name resource.Name, version resource.Version, status interface{}) {
+	col collection.Name, name resource.FullName, version resource.Version, status interface{}) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.state != nil {
+		// Extract the subfield this controller manages
+		// If the status field was something other than a map, treat it like it was an empty map
+		// for the purpose of "observed"
+		statusMap, _ := status.(map[string]interface{})
 
-	// Extract the subfield this controller manages
-	// If the status field was something other than a map, treat it like it was an empty map
-	// for the purpose of "observed"
-	statusMap, _ := status.(map[string]interface{})
-
-	c.state.setObserved(col, name, version, statusMap[c.subfield])
+		c.state.setObserved(col, name, version, statusMap[c.subfield])
+	}
 }
 
 // Report the given set of messages towards particular resources.
@@ -119,13 +122,19 @@ func (c *ControllerImpl) Report(messages diag.Messages) {
 
 	for _, m := range messages {
 
-		if m.Origin == nil {
+		if m.Resource == nil {
+			// This should not happen. All messages should be reported against at least one resource.
+			scope.Source.Errorf("Encountered a diagnostic message without a resource: %v", m)
+			continue
+		}
+
+		if m.Resource.Origin == nil {
 			// This should not happen. All messages should be reported against at least one origin.
 			scope.Source.Errorf("Encountered a diagnostic message without an origin: %v", m)
 			continue
 		}
 
-		origin, ok := m.Origin.(*rt.Origin)
+		origin, ok := m.Resource.Origin.(*rt.Origin)
 		if !ok {
 			// This should not happen. All messages should be routed back to the appropriate source.
 			scope.Source.Errorf("Encountered a diagnostic message with unrecognized origin: %v", m)
@@ -135,6 +144,12 @@ func (c *ControllerImpl) Report(messages diag.Messages) {
 		msgs.Add(origin, m)
 	}
 
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.state == nil {
+		scope.Analysis.Warn("Analysis reporting after controller stopped")
+		return
+	}
 	c.state.applyMessages(msgs)
 }
 
@@ -152,8 +167,9 @@ mainloop:
 			continue
 		}
 
-		ns, n := st.key.res.InterpretAsNamespaceAndName()
-		u, err := iface.Namespace(ns).Get(n, metav1.GetOptions{ResourceVersion: string(st.observedVersion)})
+		ns := string(st.key.res.Namespace)
+		n := string(st.key.res.Name)
+		u, err := iface.Namespace(ns).Get(context.TODO(), n, metav1.GetOptions{ResourceVersion: string(st.observedVersion)})
 		if err != nil {
 			scope.Source.Errorf("Unable to read the resource while trying to update status: %v(%v): %v",
 				st.key.col, st.key.res, err)
@@ -191,7 +207,7 @@ mainloop:
 			}
 		}
 
-		_, err = iface.Namespace(ns).UpdateStatus(u, metav1.UpdateOptions{})
+		_, err = iface.Namespace(ns).UpdateStatus(context.TODO(), u, metav1.UpdateOptions{})
 		if err != nil {
 			// TODO: Reinsert work? It probably makes sense to reinsert (with a delay), in case of a transient failure.
 			scope.Source.Errorf("Unable to update status of Resource %v(%v): %v", st.key.col, st.key.res, err)

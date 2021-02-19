@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,100 +15,22 @@
 package common_test
 
 import (
-	"bytes"
 	"context"
-	"fmt"
-	"io/ioutil"
-	"testing"
-
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/jsonpb"
 
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/echo/client"
 	"istio.io/istio/pkg/test/echo/proto"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/echo/common"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/util/structpath"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
-func TestCheckOutboundConfig(t *testing.T) {
-	configDump, err := ioutil.ReadFile("testdata/config_dump.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cfg := &envoyAdmin.ConfigDump{}
-	if err := jsonpb.Unmarshal(bytes.NewReader(configDump), cfg); err != nil {
-		t.Fatal(err)
-	}
-
-	cfgs := []testConfig{
-		{
-			protocol:    protocol.HTTP,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 80,
-			address:     "10.43.241.185",
-		},
-		{
-			protocol:    protocol.HTTP,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 8080,
-			address:     "10.43.241.185",
-		},
-		{
-			protocol:    protocol.TCP,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 90,
-			address:     "10.43.241.185",
-		},
-		{
-			protocol:    protocol.HTTPS,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 9090,
-			address:     "10.43.241.185",
-		},
-		{
-			protocol:    protocol.HTTP2,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 70,
-			address:     "10.43.241.185",
-		},
-		{
-			protocol:    protocol.GRPC,
-			service:     "b",
-			namespace:   "apps-1-99281",
-			domain:      "cluster.local",
-			servicePort: 7070,
-			address:     "10.43.241.185",
-		},
-	}
-
-	validator := structpath.ForProto(cfg)
-
-	for _, cfg := range cfgs {
-		t.Run(fmt.Sprintf("%s_%d[%s]", cfg.service, cfg.servicePort, cfg.protocol), func(t *testing.T) {
-			if err := common.CheckOutboundConfig(&cfg, cfg.Config().Ports[0], validator); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-var _ echo.Instance = &testConfig{}
-var _ echo.Workload = &testConfig{}
+var (
+	_ echo.Instance = &testConfig{}
+	_ echo.Workload = &testConfig{}
+)
 
 type testConfig struct {
 	protocol    protocol.Instance
@@ -117,6 +39,7 @@ type testConfig struct {
 	service     string
 	domain      string
 	namespace   string
+	cluster     cluster.Cluster
 }
 
 func (e *testConfig) Owner() echo.Instance {
@@ -136,6 +59,7 @@ func (e *testConfig) Address() string {
 
 func (e *testConfig) Config() echo.Config {
 	return echo.Config{
+		Cluster: e.cluster,
 		Service: e.service,
 		Namespace: &fakeNamespace{
 			name: e.namespace,
@@ -154,11 +78,15 @@ func (e *testConfig) Workloads() ([]echo.Workload, error) {
 	return []echo.Workload{e}, nil
 }
 
+func (e *testConfig) PodName() string {
+	panic("not implemented")
+}
+
 func (*testConfig) ID() resource.ID {
 	panic("not implemented")
 }
 
-func (*testConfig) WorkloadsOrFail(t test.Failer) []echo.Workload {
+func (*testConfig) WorkloadsOrFail(_ test.Failer) []echo.Workload {
 	panic("not implemented")
 }
 
@@ -178,11 +106,23 @@ func (*testConfig) CallOrFail(_ test.Failer, _ echo.CallOptions) client.ParsedRe
 	panic("not implemented")
 }
 
+func (e *testConfig) CallWithRetry(_ echo.CallOptions, _ ...retry.Option) (client.ParsedResponses, error) {
+	panic("implement me")
+}
+
+func (e *testConfig) CallWithRetryOrFail(_ test.Failer, _ echo.CallOptions, _ ...retry.Option) client.ParsedResponses {
+	panic("implement me")
+}
+
 func (*testConfig) Sidecar() echo.Sidecar {
 	panic("not implemented")
 }
 
-func (*testConfig) ForwardEcho(context.Context, *proto.ForwardEchoRequest) (client.ParsedResponses, error) {
+func (*testConfig) ForwardEcho(_ context.Context, _ *proto.ForwardEchoRequest) (client.ParsedResponses, error) {
+	panic("not implemented")
+}
+
+func (*testConfig) Restart() error {
 	panic("not implemented")
 }
 
@@ -195,6 +135,14 @@ func (n *fakeNamespace) Name() string {
 }
 
 func (n *fakeNamespace) ID() resource.ID {
+	panic("not implemented")
+}
+
+func (n *fakeNamespace) SetLabel(key, value string) error {
+	panic("not implemented")
+}
+
+func (n *fakeNamespace) RemoveLabel(key string) error {
 	panic("not implemented")
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,15 @@
 package virtualservice
 
 import (
-	"istio.io/api/networking/v1alpha3"
+	"fmt"
 
+	"istio.io/api/networking/v1alpha3"
 	"istio.io/istio/galley/pkg/config/analysis"
 	"istio.io/istio/galley/pkg/config/analysis/analyzers/util"
 	"istio.io/istio/galley/pkg/config/analysis/msg"
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
 )
 
 // DestinationHostAnalyzer checks the destination hosts associated with each virtual service
@@ -31,84 +32,128 @@ type DestinationHostAnalyzer struct{}
 var _ analysis.Analyzer = &DestinationHostAnalyzer{}
 
 type hostAndSubset struct {
-	host   resource.Name
+	host   resource.FullName
 	subset string
 }
 
 // Metadata implements Analyzer
-func (d *DestinationHostAnalyzer) Metadata() analysis.Metadata {
+func (a *DestinationHostAnalyzer) Metadata() analysis.Metadata {
 	return analysis.Metadata{
-		Name: "virtualservice.DestinationHostAnalyzer",
+		Name:        "virtualservice.DestinationHostAnalyzer",
+		Description: "Checks the destination hosts associated with each virtual service",
 		Inputs: collection.Names{
-			metadata.IstioNetworkingV1Alpha3SyntheticServiceentries,
-			metadata.IstioNetworkingV1Alpha3Serviceentries,
-			metadata.IstioNetworkingV1Alpha3Virtualservices,
+			collections.IstioNetworkingV1Alpha3Serviceentries.Name(),
+			collections.IstioNetworkingV1Alpha3Virtualservices.Name(),
+			collections.K8SCoreV1Services.Name(),
 		},
 	}
 }
 
 // Analyze implements Analyzer
-func (d *DestinationHostAnalyzer) Analyze(ctx analysis.Context) {
+func (a *DestinationHostAnalyzer) Analyze(ctx analysis.Context) {
 	// Precompute the set of service entry hosts that exist (there can be more than one defined per ServiceEntry CRD)
-	serviceEntryHosts := initServiceEntryHostNames(ctx)
+	serviceEntryHosts := util.InitServiceEntryHostMap(ctx)
 
-	ctx.ForEach(metadata.IstioNetworkingV1Alpha3Virtualservices, func(r *resource.Entry) bool {
-		d.analyzeVirtualService(r, ctx, serviceEntryHosts)
+	ctx.ForEach(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), func(r *resource.Instance) bool {
+		a.analyzeVirtualService(r, ctx, serviceEntryHosts)
 		return true
 	})
 }
 
-func (d *DestinationHostAnalyzer) analyzeVirtualService(r *resource.Entry, ctx analysis.Context,
-	serviceEntryHosts map[util.ScopedFqdn]bool) {
+func (a *DestinationHostAnalyzer) analyzeVirtualService(r *resource.Instance, ctx analysis.Context,
+	serviceEntryHosts map[util.ScopedFqdn]*v1alpha3.ServiceEntry) {
+	vs := r.Message.(*v1alpha3.VirtualService)
 
-	vs := r.Item.(*v1alpha3.VirtualService)
-	ns, _ := r.Metadata.Name.InterpretAsNamespaceAndName()
+	for _, d := range getRouteDestinations(vs) {
+		s := util.GetDestinationHost(r.Metadata.FullName.Namespace, d.Destination.GetHost(), serviceEntryHosts)
+		if s == nil {
 
-	destinations := getRouteDestinations(vs)
+			m := msg.NewReferencedResourceNotFound(r, "host", d.Destination.GetHost())
 
-	for _, destination := range destinations {
-		if !d.checkDestinationHost(ns, destination, ctx, serviceEntryHosts) {
-			ctx.Report(metadata.IstioNetworkingV1Alpha3Virtualservices,
-				msg.NewReferencedResourceNotFound(r, "host", destination.GetHost()))
+			key := fmt.Sprintf(util.DestinationHost, d.RouteRule, d.ServiceIndex, d.DestinationIndex)
+			if line, found := util.ErrorLine(r, key); found {
+				m.Line = line
+			}
+
+			ctx.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
+			continue
 		}
+		checkServiceEntryPorts(ctx, r, d, s)
+	}
+
+	for _, d := range getHTTPMirrorDestinations(vs) {
+		s := util.GetDestinationHost(r.Metadata.FullName.Namespace, d.Destination.GetHost(), serviceEntryHosts)
+		if s == nil {
+
+			m := msg.NewReferencedResourceNotFound(r, "mirror host", d.Destination.GetHost())
+
+			key := fmt.Sprintf(util.MirrorHost, d.ServiceIndex)
+			if line, ok := util.ErrorLine(r, key); ok {
+				m.Line = line
+			}
+
+			ctx.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
+			continue
+		}
+		checkServiceEntryPorts(ctx, r, d, s)
 	}
 }
 
-func (d *DestinationHostAnalyzer) checkDestinationHost(vsNamespace string, destination *v1alpha3.Destination,
-	ctx analysis.Context, serviceEntryHosts map[util.ScopedFqdn]bool) bool {
-	host := destination.GetHost()
+func checkServiceEntryPorts(ctx analysis.Context, r *resource.Instance, d *AnnotatedDestination, s *v1alpha3.ServiceEntry) {
+	if d.Destination.GetPort() == nil {
+		// If destination port isn't specified, it's only a problem if the service being referenced exposes multiple ports.
+		if len(s.GetPorts()) > 1 {
+			var portNumbers []int
+			for _, p := range s.GetPorts() {
+				portNumbers = append(portNumbers, int(p.GetNumber()))
+			}
 
-	// Check explicitly defined ServiceEntries as well as services discovered from the platform
+			m := msg.NewVirtualServiceDestinationPortSelectorRequired(r, d.Destination.GetHost(), portNumbers)
 
-	// ServiceEntries can be either namespace scoped or exposed to all namespaces
-	nsScopedFqdn := util.GetScopedFqdnHostname(vsNamespace, vsNamespace, host)
-	if _, ok := serviceEntryHosts[nsScopedFqdn]; ok {
-		return true
+			if d.RouteRule == "http.mirror" {
+				key := fmt.Sprintf(util.MirrorHost, d.ServiceIndex)
+				if line, ok := util.ErrorLine(r, key); ok {
+					m.Line = line
+				}
+			} else {
+				key := fmt.Sprintf(util.DestinationHost, d.RouteRule, d.ServiceIndex, d.DestinationIndex)
+				if line, ok := util.ErrorLine(r, key); ok {
+					m.Line = line
+				}
+			}
+
+			ctx.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
+			return
+		}
+
+		// Otherwise, it's not needed and we're done here.
+		return
 	}
 
-	// Check ServiceEntries which are exposed to all namespaces
-	allNsScopedFqdn := util.GetScopedFqdnHostname(util.ExportToAllNamespaces, vsNamespace, host)
-	if _, ok := serviceEntryHosts[allNsScopedFqdn]; ok {
-		return true
+	foundPort := false
+	for _, p := range s.GetPorts() {
+		if d.Destination.GetPort().GetNumber() == p.GetNumber() {
+			foundPort = true
+			break
+		}
 	}
+	if !foundPort {
 
-	name := util.GetResourceNameFromHost(vsNamespace, host)
-	return ctx.Exists(metadata.IstioNetworkingV1Alpha3SyntheticServiceentries, name)
-}
+		m := msg.NewReferencedResourceNotFound(r, "host:port",
+			fmt.Sprintf("%s:%d", d.Destination.GetHost(), d.Destination.GetPort().GetNumber()))
 
-func initServiceEntryHostNames(ctx analysis.Context) map[util.ScopedFqdn]bool {
-	hosts := make(map[util.ScopedFqdn]bool)
-	ctx.ForEach(metadata.IstioNetworkingV1Alpha3Serviceentries, func(r *resource.Entry) bool {
-		s := r.Item.(*v1alpha3.ServiceEntry)
-		ns, _ := r.Metadata.Name.InterpretAsNamespaceAndName()
-		hostsNamespaceScope := ns
-		if util.IsExportToAllNamespaces(s.ExportTo) {
-			hostsNamespaceScope = util.ExportToAllNamespaces
+		if d.RouteRule == "http.mirror" {
+			key := fmt.Sprintf(util.MirrorHost, d.ServiceIndex)
+			if line, ok := util.ErrorLine(r, key); ok {
+				m.Line = line
+			}
+		} else {
+			key := fmt.Sprintf(util.DestinationHost, d.RouteRule, d.ServiceIndex, d.DestinationIndex)
+			if line, ok := util.ErrorLine(r, key); ok {
+				m.Line = line
+			}
 		}
-		for _, h := range s.GetHosts() {
-			hosts[util.GetScopedFqdnHostname(hostsNamespaceScope, ns, h)] = true
-		}
-		return true
-	})
-	return hosts
+
+		ctx.Report(collections.IstioNetworkingV1Alpha3Virtualservices.Name(), m)
+	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
+	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	"github.com/golang/protobuf/ptypes"
 	. "github.com/onsi/gomega"
 
@@ -34,19 +34,17 @@ import (
 	"istio.io/istio/pkg/test/util/tmpl"
 )
 
-var (
-	envoyLogFormat = envoy.LogFormat("[ENVOY][%Y-%m-%d %T.%e][%t][%l][%n] %v")
-)
+var envoyLogFormat = envoy.LogFormat("[ENVOY][%Y-%m-%d %T.%e][%t][%l][%n]")
 
 func TestNewWithoutConfigShouldFail(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	_, err := envoy.New(envoy.Config{})
 	g.Expect(err).ToNot(BeNil())
 }
 
 func TestNewWithDuplicateOptionsShouldFail(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -61,7 +59,7 @@ func TestNewWithDuplicateOptionsShouldFail(t *testing.T) {
 }
 
 func TestNewWithInvalidOptionShouldFail(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	_, err := envoy.New(envoy.Config{
 		BinaryPath: testEnvoy.FindBinaryOrFail(t),
@@ -71,7 +69,7 @@ func TestNewWithInvalidOptionShouldFail(t *testing.T) {
 }
 
 func TestNewWithoutAdminPortShouldFail(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	_, err := envoy.New(envoy.Config{
 		BinaryPath: testEnvoy.FindBinaryOrFail(t),
@@ -81,7 +79,7 @@ func TestNewWithoutAdminPortShouldFail(t *testing.T) {
 }
 
 func TestNewWithoutBinaryPathShouldFail(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -93,7 +91,7 @@ func TestNewWithoutBinaryPathShouldFail(t *testing.T) {
 }
 
 func TestNewWithConfigPathShouldSucceed(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -107,7 +105,7 @@ func TestNewWithConfigPathShouldSucceed(t *testing.T) {
 }
 
 func TestNewWithConfigYamlShouldSucceed(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -127,7 +125,7 @@ func TestStartWithBadBinaryShouldFail(t *testing.T) {
 	defer h.Close()
 
 	i := h.NewOrFail(t, envoy.Config{
-		BinaryPath: absPath("testdata/envoy_bootstrap_v2.json"), // Not a binary file.
+		BinaryPath: absPath("testdata/envoy_bootstrap.json"), // Not a binary file.
 		Options:    options(envoy.ConfigYaml(h.BootstrapContent(t))),
 	})
 
@@ -141,7 +139,7 @@ func TestStartWithBadBinaryShouldFail(t *testing.T) {
 func TestStartEnvoyShouldSucceed(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -184,7 +182,7 @@ func TestStartTwiceShouldDoNothing(t *testing.T) {
 func TestHotRestartTwiceShouldFail(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -209,7 +207,7 @@ func TestHotRestartTwiceShouldFail(t *testing.T) {
 func TestHotRestart(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -250,7 +248,7 @@ func TestHotRestart(t *testing.T) {
 func TestCommandLineArgs(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -308,14 +306,14 @@ func TestCommandLineArgs(t *testing.T) {
 	g.Expect(opts.RestartEpoch).To(Equal(uint32(1)))
 	g.Expect(opts.ServiceCluster).To(Equal("mycluster"))
 	g.Expect(opts.ServiceNode).To(Equal("mynode"))
-	g.Expect(opts.DrainTime).To(Equal(ptypes.DurationProto(drainDuration)))
-	g.Expect(opts.ParentShutdownTime).To(Equal(ptypes.DurationProto(parentShutdownDuration)))
+	g.Expect(opts.DrainTime.AsDuration()).To(Equal(drainDuration))
+	g.Expect(opts.ParentShutdownTime.AsDuration()).To(Equal(parentShutdownDuration))
 }
 
 func TestShutdown(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -341,7 +339,7 @@ func TestShutdown(t *testing.T) {
 func TestKillEnvoy(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -391,7 +389,7 @@ func TestCancelContext(t *testing.T) {
 func TestConfigDump(t *testing.T) {
 	runLinuxOnly(t)
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	h := newBootstrapHelper(t)
 	defer h.Close()
@@ -412,7 +410,7 @@ func TestConfigDump(t *testing.T) {
 
 	// Basic verification of the config dump..
 	for _, c := range cd.Configs {
-		if c.TypeUrl == "type.googleapis.com/envoy.admin.v2alpha.BootstrapConfigDump" {
+		if c.TypeUrl == "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump" {
 			b := envoyAdmin.BootstrapConfigDump{}
 			g.Expect(ptypes.UnmarshalAny(c, &b)).To(BeNil())
 

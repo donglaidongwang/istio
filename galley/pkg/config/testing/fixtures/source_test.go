@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,12 +19,12 @@ import (
 
 	"github.com/onsi/gomega"
 
-	"istio.io/istio/galley/pkg/config/event"
-	"istio.io/istio/galley/pkg/config/testing/data"
+	"istio.io/istio/galley/pkg/config/testing/basicmeta"
+	"istio.io/istio/pkg/config/event"
 )
 
 func TestSource(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := gomega.NewWithT(t)
 
 	s := &Source{}
 
@@ -36,7 +36,7 @@ func TestSource(t *testing.T) {
 }
 
 func TestSource_Dispatch(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := gomega.NewWithT(t)
 
 	a := &Accumulator{}
 
@@ -48,7 +48,7 @@ func TestSource_Dispatch(t *testing.T) {
 }
 
 func TestSource_Handle(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := gomega.NewWithT(t)
 
 	s := &Source{}
 
@@ -58,9 +58,9 @@ func TestSource_Handle(t *testing.T) {
 	s.Start()
 
 	e := event.Event{
-		Kind:   event.Added,
-		Source: data.Collection1,
-		Entry:  nil,
+		Kind:     event.Added,
+		Source:   basicmeta.K8SCollection1,
+		Resource: nil,
 	}
 	s.Handle(e)
 

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,30 +15,34 @@
 package retry_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
+	previouspriorities "github.com/envoyproxy/go-control-plane/envoy/config/retry/previous_priorities"
+	envoyroute "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	gogoTypes "github.com/gogo/protobuf/types"
 	"github.com/golang/protobuf/ptypes"
 	. "github.com/onsi/gomega"
 
 	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3/route/retry"
+	"istio.io/istio/pilot/pkg/networking/util"
 )
 
 func TestNilRetryShouldReturnDefault(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route where no retry policy has been explicitly set.
 	route := networking.HTTPRoute{}
 
 	policy := retry.ConvertPolicy(route.Retries)
 	g.Expect(policy).To(Not(BeNil()))
-	g.Expect(*policy).To(Equal(*retry.DefaultPolicy()))
+	g.Expect(policy).To(Equal(retry.DefaultPolicy()))
 }
 
 func TestZeroAttemptsShouldReturnNilPolicy(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -53,7 +57,7 @@ func TestZeroAttemptsShouldReturnNilPolicy(t *testing.T) {
 }
 
 func TestRetryWithAllFieldsSet(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -76,7 +80,7 @@ func TestRetryWithAllFieldsSet(t *testing.T) {
 }
 
 func TestRetryOnWithEmptyParts(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -94,7 +98,7 @@ func TestRetryOnWithEmptyParts(t *testing.T) {
 }
 
 func TestRetryOnWithWhitespace(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -112,7 +116,7 @@ func TestRetryOnWithWhitespace(t *testing.T) {
 }
 
 func TestRetryOnContainingStatusCodes(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -129,7 +133,7 @@ func TestRetryOnContainingStatusCodes(t *testing.T) {
 }
 
 func TestRetryOnWithInvalidStatusCodesShouldAddToRetryOn(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -146,7 +150,7 @@ func TestRetryOnWithInvalidStatusCodesShouldAddToRetryOn(t *testing.T) {
 }
 
 func TestMissingRetryOnShouldReturnDefaults(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -162,7 +166,7 @@ func TestMissingRetryOnShouldReturnDefaults(t *testing.T) {
 }
 
 func TestMissingPerTryTimeoutShouldReturnNil(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	// Create a route with a retry policy with zero attempts configured.
 	route := networking.HTTPRoute{
@@ -174,4 +178,37 @@ func TestMissingPerTryTimeoutShouldReturnNil(t *testing.T) {
 	policy := retry.ConvertPolicy(route.Retries)
 	g.Expect(policy).To(Not(BeNil()))
 	g.Expect(policy.PerTryTimeout).To(BeNil())
+}
+
+func TestRetryRemoteLocalities(t *testing.T) {
+	g := NewWithT(t)
+
+	// Create a route with a retry policy with RetryRemoteLocalities enabled.
+	route := networking.HTTPRoute{
+		Retries: &networking.HTTPRetry{
+			Attempts: 2,
+			RetryRemoteLocalities: &gogoTypes.BoolValue{
+				Value: true,
+			},
+		},
+	}
+
+	policy := retry.ConvertPolicy(route.Retries)
+	g.Expect(policy).To(Not(BeNil()))
+	g.Expect(policy.RetryOn).To(Equal(retry.DefaultPolicy().RetryOn))
+	g.Expect(policy.RetriableStatusCodes).To(Equal(retry.DefaultPolicy().RetriableStatusCodes))
+
+	previousPrioritiesConfig := &previouspriorities.PreviousPrioritiesConfig{
+		UpdateFrequency: int32(2),
+	}
+	expected := &envoyroute.RetryPolicy_RetryPriority{
+		Name: "envoy.retry_priorities.previous_priorities",
+		ConfigType: &envoyroute.RetryPolicy_RetryPriority_TypedConfig{
+			TypedConfig: util.MessageToAny(previousPrioritiesConfig),
+		},
+	}
+
+	if !reflect.DeepEqual(policy.RetryPriority, expected) {
+		t.Fatalf("Expected %v, actual %v", expected, policy.RetryPriority)
+	}
 }

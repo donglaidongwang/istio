@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,8 @@ import (
 	"reflect"
 	"sync"
 
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
 )
 
 // Status state for a given resource. This contains both desired and last known status of the resource. It also acts
@@ -42,7 +42,7 @@ type status struct {
 
 type key struct {
 	col collection.Name
-	res resource.Name
+	res resource.FullName
 }
 
 var statusPool = sync.Pool{

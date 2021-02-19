@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,116 +20,141 @@ import (
 	"github.com/hashicorp/go-multierror"
 	. "github.com/onsi/gomega"
 
-	"github.com/gogo/protobuf/proto"
-
 	"istio.io/api/networking/v1alpha3"
-	"istio.io/istio/galley/pkg/config/analysis"
-	"istio.io/istio/galley/pkg/config/analysis/diag"
 	"istio.io/istio/galley/pkg/config/analysis/msg"
-	"istio.io/istio/galley/pkg/config/meta/metadata"
-	"istio.io/istio/galley/pkg/config/meta/schema/collection"
-	"istio.io/istio/galley/pkg/config/resource"
-	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/galley/pkg/config/analysis/testing/fixtures"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/resource"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	resource2 "istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/config/validation"
 )
 
-type testContext struct {
-	entries []*resource.Entry
-	reports []diag.Message
-}
+func TestCorrectArgs(t *testing.T) {
+	g := NewWithT(t)
 
-var _ analysis.Context = &testContext{}
+	m1 := &v1alpha3.VirtualService{}
 
-// Report implements analysis.Context
-func (ctx *testContext) Report(c collection.Name, t diag.Message) {
-	ctx.reports = append(ctx.reports, t)
-}
-
-// Find implements analysis.Context
-func (ctx *testContext) Find(c collection.Name, name resource.Name) *resource.Entry { return nil }
-
-// Exists implements analysis.Context
-func (ctx *testContext) Exists(c collection.Name, name resource.Name) bool { return false }
-
-// ForEach implements analysis.Context
-func (ctx *testContext) ForEach(c collection.Name, fn analysis.IteratorFn) {
-	for _, r := range ctx.entries {
-		fn(r)
+	testSchema := schemaWithValidateFn(func(cfg config.Config) (warnings validation.Warning, errs error) {
+		g.Expect(cfg.Name).To(Equal("name"))
+		g.Expect(cfg.Namespace).To(Equal("ns"))
+		g.Expect(cfg.Spec).To(Equal(m1))
+		return nil, nil
+	})
+	ctx := &fixtures.Context{
+		Resources: []*resource.Instance{
+			{
+				Message: &v1alpha3.VirtualService{},
+				Metadata: resource.Metadata{
+					FullName: resource.NewFullName("ns", "name"),
+				},
+				Origin: fakeOrigin{},
+			},
+		},
 	}
+	a := ValidationAnalyzer{s: testSchema}
+	a.Analyze(ctx)
 }
-
-// Canceled implements analysis.Context
-func (ctx *testContext) Canceled() bool { return false }
 
 func TestSchemaValidationWrapper(t *testing.T) {
-	testCol := metadata.IstioNetworkingV1Alpha3Virtualservices
+	testCol := collections.IstioNetworkingV1Alpha3Virtualservices.Name()
 
 	m1 := &v1alpha3.VirtualService{}
 	m2 := &v1alpha3.VirtualService{}
 	m3 := &v1alpha3.VirtualService{}
 
-	testSchema := schema.Instance{
-		Collection: testCol.String(),
-		Validate: func(_, _ string, msg proto.Message) (errs error) {
-			if msg == m1 {
-				return nil
-			}
-			if msg == m2 {
-				return fmt.Errorf("")
-			}
-			if msg == m3 {
-				return multierror.Append(fmt.Errorf(""), fmt.Errorf(""))
-			}
-			return nil
-		},
-	}
+	testSchema := schemaWithValidateFn(func(cfg config.Config) (warnings validation.Warning, errs error) {
+		if cfg.Spec == m1 {
+			return nil, nil
+		}
+		if cfg.Spec == m2 {
+			return nil, fmt.Errorf("")
+		}
+		if cfg.Spec == m3 {
+			return nil, multierror.Append(fmt.Errorf(""), fmt.Errorf(""))
+		}
+		return nil, nil
+	})
 
 	a := ValidationAnalyzer{s: testSchema}
 
 	t.Run("CheckMetadataInputs", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 		g.Expect(a.Metadata().Inputs).To(ConsistOf(testCol))
 	})
 
 	t.Run("NoErrors", func(t *testing.T) {
-		g := NewGomegaWithT(t)
-		ctx := &testContext{
-			entries: []*resource.Entry{
+		g := NewWithT(t)
+		ctx := &fixtures.Context{
+			Resources: []*resource.Instance{
 				{
-					Item: m1,
+					Message: m1,
 				},
 			},
 		}
 		a.Analyze(ctx)
-		g.Expect(ctx.reports).To(BeEmpty())
+		g.Expect(ctx.Reports).To(BeEmpty())
 	})
 
 	t.Run("SingleError", func(t *testing.T) {
-		g := NewGomegaWithT(t)
+		g := NewWithT(t)
 
-		ctx := &testContext{
-			entries: []*resource.Entry{
+		ctx := &fixtures.Context{
+			Resources: []*resource.Instance{
 				{
-					Item: m2,
+					Message: m2,
+					Origin:  fakeOrigin{},
 				},
 			},
 		}
 		a.Analyze(ctx)
-		g.Expect(ctx.reports).To(HaveLen(1))
-		g.Expect(ctx.reports[0].Type).To(Equal(msg.SchemaValidationError))
+		g.Expect(ctx.Reports).To(HaveLen(1))
+		g.Expect(ctx.Reports[0].Type).To(Equal(msg.SchemaValidationError))
 	})
 
 	t.Run("MultiError", func(t *testing.T) {
-		g := NewGomegaWithT(t)
-		ctx := &testContext{
-			entries: []*resource.Entry{
+		g := NewWithT(t)
+		ctx := &fixtures.Context{
+			Resources: []*resource.Instance{
 				{
-					Item: m3,
+					Message: m3,
+					Origin:  fakeOrigin{},
 				},
 			},
 		}
 		a.Analyze(ctx)
-		g.Expect(ctx.reports).To(HaveLen(2))
-		g.Expect(ctx.reports[0].Type).To(Equal(msg.SchemaValidationError))
-		g.Expect(ctx.reports[1].Type).To(Equal(msg.SchemaValidationError))
+		g.Expect(ctx.Reports).To(HaveLen(2))
+		g.Expect(ctx.Reports[0].Type).To(Equal(msg.SchemaValidationError))
+		g.Expect(ctx.Reports[1].Type).To(Equal(msg.SchemaValidationError))
 	})
 }
+
+func schemaWithValidateFn(validateFn func(cfg config.Config) (validation.Warning, error)) collection.Schema {
+	original := collections.IstioNetworkingV1Alpha3Virtualservices
+	return collection.Builder{
+		Name: original.Name().String(),
+		Resource: resource2.Builder{
+			ClusterScoped: original.Resource().IsClusterScoped(),
+			Kind:          original.Resource().Kind(),
+			Plural:        original.Resource().Plural(),
+			Group:         original.Resource().Group(),
+			Version:       original.Resource().Version(),
+			Proto:         original.Resource().Proto(),
+			ProtoPackage:  original.Resource().ProtoPackage(),
+			ValidateProto: validateFn,
+		}.MustBuild(),
+	}.MustBuild()
+}
+
+type fakeOrigin struct{}
+
+func (fakeOrigin) FriendlyName() string          { return "myFriendlyName" }
+func (fakeOrigin) Comparator() string            { return "myFriendlyName" }
+func (fakeOrigin) Namespace() resource.Namespace { return "myNamespace" }
+func (fakeOrigin) Reference() resource.Reference { return fakeReference{} }
+func (fakeOrigin) FieldMap() map[string]int      { return make(map[string]int) }
+
+type fakeReference struct{}
+
+func (fakeReference) String() string { return "" }
