@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,17 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/ghodss/yaml"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/yaml"
 
-	mixervalidate "istio.io/istio/mixer/pkg/validate"
+	"istio.io/istio/istioctl/pkg/cli"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 const (
@@ -81,85 +83,85 @@ metadata:
   selfLink: ""`
 	invalidSvcList = `
 apiVersion: v1
-items: 
-  - 
+items:
+  -
     apiVersion: v1
     kind: Service
-    metadata: 
+    metadata:
       name: details
-    spec: 
-      ports: 
-        - 
+    spec:
+      ports:
+        -
           name: details
           port: 9080
-  - 
+  -
     apiVersion: v1
     kind: Service
-    metadata: 
+    metadata:
       name: hello
-    spec: 
-      ports: 
-        - 
+    spec:
+      ports:
+        -
           port: 80
           protocol: TCP
 kind: List
-metadata: 
+metadata:
   resourceVersion: ""`
 	udpService = `
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
-    - 
+spec:
+  ports:
+    -
       protocol: udp`
 	skippedService = `
 kind: Service
-metadata: 
+metadata:
   name: hello
   namespace: istio-system
-spec: 
-  ports: 
-    - 
+spec:
+  ports:
+    -
       name: http
       port: 9080`
 	validPortNamingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: http
       port: 9080`
 	validPortNamingWithSuffixSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: http-hello
       port: 9080`
 	invalidPortNamingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
     - name: hello
       port: 9080`
 	portNameMissingSvc = `
 apiVersion: v1
 kind: Service
-metadata: 
+metadata:
   name: hello
-spec: 
-  ports: 
+spec:
+  ports:
   - protocol: TCP`
-	validVirtualService = `
-apiVersion: networking.istio.io/v1alpha3
+	validVirtualServiceYAML = `
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: valid-virtual-service
@@ -176,8 +178,40 @@ spec:
           host: c
           subset: v2
         weight: 25`
-	validVirtualService1 = `
-apiVersion: networking.istio.io/v1alpha3
+	validVirtualServiceJSON = `{
+"apiVersion": "networking.istio.io/v1alpha3",
+"kind": "VirtualService",
+"metadata": {
+	"name": "valid-virtual-service"
+},
+"spec": {
+	"hosts": [
+	"c"
+	],
+	"http": [
+	{
+		"route": [
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v1"
+			},
+			"weight": 75
+		},
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v2"
+			},
+			"weight": 25
+		}
+		]
+	}
+	]
+}
+}`
+	validVirtualService1YAML = `
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: valid-virtual-service1
@@ -194,8 +228,82 @@ spec:
           host: c
           subset: v2
         weight: 25`
-	invalidVirtualService = `
-apiVersion: networking.istio.io/v1alpha3
+	validVirtualService1JSON = `{
+"apiVersion": "networking.istio.io/v1alpha3",
+"kind": "VirtualService",
+"metadata": {
+	"name": "valid-virtual-service1"
+},
+"spec": {
+	"hosts": [
+	"d"
+	],
+	"http": [
+	{
+		"route": [
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v1"
+			},
+			"weight": 75
+		},
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v2"
+			},
+			"weight": 25
+		}
+		]
+	}
+	]
+}
+}`
+	validVirtualService2YAML = `
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: valid-virtual-service2
+spec:
+  exportTo:
+  - '.'
+  hosts:
+  - d
+  http:
+  - route:
+    - destination:
+        host: c
+        subset: v1`
+	validVirtualService2JSON = `{
+"apiVersion": "networking.istio.io/v1alpha3",
+"kind": "VirtualService",
+"metadata": {
+	"name": "valid-virtual-service2"
+},
+"spec": {
+	"exportTo": [
+	"."
+	],
+	"hosts": [
+	"d"
+	],
+	"http": [
+	{
+		"route": [
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v1"
+			}
+		}
+		]
+	}
+	]
+}
+}`
+	invalidVirtualServiceYAML = `
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: invalid-virtual-service
@@ -209,52 +317,79 @@ spec:
       - destination:
           host: c
           subset: v2
-        weight: 25`
-	validMixerRule = `
-apiVersion: "config.istio.io/v1alpha2"
-kind: rule
+        weight: -15`
+	invalidVirtualServiceJSON = `{
+"apiVersion": "networking.istio.io/v1alpha3",
+"kind": "VirtualService",
+"metadata": {
+	"name": "invalid-virtual-service"
+},
+"spec": {
+	"http": [
+	{
+		"route": [
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v1"
+			},
+			"weight": 75
+		},
+		{
+			"destination": {
+			"host": "c",
+			"subset": "v2"
+			},
+			"weight": -15
+		}
+		]
+	}
+	]
+}
+}
+`
+	invalidVirtualServiceV1Beta1 = `
+apiVersion: networking.istio.io/v1
+kind: VirtualService
 metadata:
-  name: valid-rule
+  name: invalid-virtual-service
 spec:
-  match: request.headers["clnt"] == "abc"
-  actions:
-  - handler: handler-for-valid-rule.denier
-    instances:
-    - instance-for-valid-rule.checknothing`
-	invalidMixerRule = `
-apiVersion: "config.istio.io/v1alpha2"
-kind: rule
+  http:
+`
+	warnDestinationRule = `apiVersion: networking.istio.io/v1
+kind: DestinationRule
 metadata:
-  name: valid-rule
+  name: reviews-cb-policy
 spec:
-  badField: oops
-  match: request.headers["clnt"] == "abc"
-  actions:
-  - handler: handler-for-valid-rule.denier
-    instances:
-    - instance-for-valid-rule.checknothing`
+  host: reviews.prod.svc.cluster.local
+  trafficPolicy:
+    outlierDetection:
+      consecutiveErrors: 7
+`
 	invalidYAML = `
 (...!)`
 	validKubernetesYAML = `
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: istio-system`
-	invalidMixerKind = `
-apiVersion: config.istio.io/v1alpha2
-kind: validator
-metadata:
-  name: invalid-kind
-spec:`
+  name: istio-system
+`
+	validKubernetesJSON = `{
+"apiVersion": "v1",
+"kind": "Namespace",
+"metadata": {
+	"name": "istio-system"
+}
+}`
 	invalidUnsupportedKey = `
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: DestinationRule
 metadata:
   name: productpage
 unexpected_junk:
    still_more_junk:
 spec:
-	host: productpage`
+  host: productpage`
 	versionLabelMissingDeployment = `
 apiVersion: apps/v1
 kind: Deployment
@@ -264,10 +399,126 @@ spec:`
 	skippedDeployment = `
 apiVersion: apps/v1
 kind: Deployment
-metadata: 
+metadata:
   name: hello
   namespace: istio-system
 spec: ~`
+	invalidIstioConfig = `
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: istio-system
+  name: example-istiocontrolplane
+spec:
+  dummy:
+  traffic_management:
+    components:
+    namespace: istio-traffic-management
+`
+	validIstioConfig = `
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+metadata:
+  namespace: istio-system
+  name: example-istiocontrolplane
+spec:
+  components:
+    pilot:
+      enabled: true
+`
+	invalidDuplicateKey = `
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: productpage
+spec:
+trafficPolicy: {}
+trafficPolicy:
+  tls:
+    mode: ISTIO_MUTUAL
+`
+	validDeployment = `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helloworld-v1
+  labels:
+    app: helloworld
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: helloworld
+      version: v1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/bootstrapOverride: "istio-custom-bootstrap-config"
+      labels:
+        app: helloworld
+        version: v1
+    spec:
+      containers:
+        - name: helloworld
+          image: registry.istio.io/release/examples-helloworld-v1
+          resources:
+            requests:
+              cpu: "100m"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5000
+`
+	validPortNamingSvcWithAppProtocol = `
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  ports:
+    - appProtocol: http
+      port: 9080`
+	validPortNamingSvcWithAppProtocol2 = `
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  ports:
+    - appProtocol: http
+      name: fake # should not have error since the appProtocol field
+      port: 9080`
+	inValidPortNamingSvcWithAppProtocol = `
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+spec:
+  ports:
+    - appProtocol: fake
+      port: 9080`
+	validK8sRecommendedLabels = `
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: helloworld-v1
+  labels:
+    app.kubernetes.io/name: helloworld
+    app.kubernetes.io/version: v1
+spec:
+  replicas: 1
+`
+	validIstioCanonical = `
+apiVersion: v1
+kind: Deployment
+metadata:
+  name: helloworld-v1
+  labels:
+    service.istio.io/canonical-name: helloworld
+    service.istio.io/canonical-revision: v1
+spec:
+  replicas: 1
+`
 )
 
 func fromYAML(in string) *unstructured.Unstructured {
@@ -277,30 +528,27 @@ func fromYAML(in string) *unstructured.Unstructured {
 	}
 	return &un
 }
+
 func TestValidateResource(t *testing.T) {
 	cases := []struct {
 		name  string
 		in    string
 		valid bool
+		warn  bool
 	}{
 		{
 			name:  "valid pilot configuration",
-			in:    validVirtualService,
+			in:    validVirtualServiceYAML,
 			valid: true,
 		},
 		{
 			name:  "invalid pilot configuration",
-			in:    invalidVirtualService,
+			in:    invalidVirtualServiceYAML,
 			valid: false,
 		},
 		{
-			name:  "valid mixer configuration",
-			in:    validMixerRule,
-			valid: true,
-		},
-		{
-			name:  "invalid mixer configuration",
-			in:    invalidMixerRule,
+			name:  "invalid pilot configuration v1beta1",
+			in:    invalidVirtualServiceV1Beta1,
 			valid: false,
 		},
 		{
@@ -353,22 +601,71 @@ func TestValidateResource(t *testing.T) {
 			in:    udpService,
 			valid: true,
 		},
+		{
+			name:  "invalid Istio Operator config",
+			in:    invalidIstioConfig,
+			valid: false,
+		},
+		{
+			name:  "valid Istio Operator config",
+			in:    validIstioConfig,
+			valid: true,
+		},
+		{
+			name:  "warning",
+			in:    warnDestinationRule,
+			valid: true,
+			warn:  true,
+		},
+		{
+			name:  "exportTo=.",
+			in:    validVirtualService2YAML,
+			valid: true,
+		},
+		{
+			name:  "appProtocol=http",
+			in:    validPortNamingSvcWithAppProtocol,
+			valid: true,
+		},
+		{
+			name:  "appProtocol=http,name=fake",
+			in:    validPortNamingSvcWithAppProtocol2,
+			valid: true,
+		},
+		{
+			name:  "appProtocol=fake",
+			in:    inValidPortNamingSvcWithAppProtocol,
+			valid: false,
+		},
+		{
+			name:  "metric labels k8s recommended",
+			in:    validK8sRecommendedLabels,
+			valid: true,
+		},
+		{
+			name:  "metric labels istio canonical",
+			in:    validIstioCanonical,
+			valid: true,
+		},
 	}
 
 	for i, c := range cases {
 		t.Run(fmt.Sprintf("[%v] %v ", i, c.name), func(tt *testing.T) {
-			v := &validator{
-				mixerValidator: mixervalidate.NewDefaultValidator(false),
-			}
-			err := v.validateResource("istio-system", fromYAML(c.in))
+			defer func() { recover() }()
+			v := &validator{}
+			var writer io.Writer
+			warn, err := v.validateResource("istio-system", "", fromYAML(c.in), writer)
 			if (err == nil) != c.valid {
-				tt.Fatalf("unexpected validation result: got %v want %v: err=%q", err == nil, c.valid, err)
+				tt.Fatalf("unexpected validation result: got %v want %v: err=%v", err == nil, c.valid, err)
+			}
+			if (warn != nil) != c.warn {
+				tt.Fatalf("unexpected validation warning result: got %v want %v: warn=%v", warn != nil, c.warn, warn)
 			}
 		})
 	}
 }
 
-func buildMultiDocYAML(docs []string) string {
+func buildMultiDocConfig(docs []string) string {
 	var b strings.Builder
 	for _, r := range docs {
 		if r != "" {
@@ -381,7 +678,7 @@ func buildMultiDocYAML(docs []string) string {
 
 func createTestFile(t *testing.T, data string) (string, io.Closer) {
 	t.Helper()
-	validFile, err := ioutil.TempFile("", "TestValidateCommand")
+	validFile, err := os.CreateTemp("", "TestValidateCommand")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,19 +688,43 @@ func createTestFile(t *testing.T, data string) (string, io.Closer) {
 	return validFile.Name(), validFile
 }
 
+func createTestDirectory(t *testing.T, files map[string]string) string {
+	t.Helper()
+	tempDir, err := os.MkdirTemp("", "TestValidateCommand")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, content := range files {
+		filePath := filepath.Join(tempDir, name)
+		if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return tempDir
+}
+
 func TestValidateCommand(t *testing.T) {
-	valid := buildMultiDocYAML([]string{validVirtualService, validVirtualService1})
-	invalid := buildMultiDocYAML([]string{invalidVirtualService, validVirtualService1})
-	unsupportedMixerRule := buildMultiDocYAML([]string{validVirtualService, validMixerRule})
+	validYAML := buildMultiDocConfig([]string{validVirtualServiceYAML, validVirtualService1YAML})
+	invalidYAML := buildMultiDocConfig([]string{invalidVirtualServiceYAML, validVirtualService1YAML})
+	warningsYAML := buildMultiDocConfig([]string{invalidVirtualServiceYAML, validVirtualService1YAML, warnDestinationRule})
 
-	validFilename, closeValidFile := createTestFile(t, valid)
-	defer closeValidFile.Close()
+	validJSON := buildMultiDocConfig([]string{validVirtualServiceJSON, validVirtualService1JSON})
+	invalidJSON := buildMultiDocConfig([]string{invalidVirtualServiceJSON, validVirtualService1JSON})
+	warningsJSON := buildMultiDocConfig([]string{invalidVirtualServiceYAML, validVirtualService1YAML, warnDestinationRule})
 
-	invalidFilename, closeInvalidFile := createTestFile(t, invalid)
-	defer closeInvalidFile.Close()
+	validFilenameYAML, closeValidYAMLFile := createTestFile(t, validYAML)
+	defer closeValidYAMLFile.Close()
 
-	unsupportedMixerRuleFilename, closeMixerRuleFile := createTestFile(t, unsupportedMixerRule)
-	defer closeMixerRuleFile.Close()
+	validFilenameJSON, closeValidJSONFile := createTestFile(t, validJSON)
+	defer closeValidJSONFile.Close()
+
+	invalidFilenameYAML, closeInvalidYAMLFile := createTestFile(t, invalidYAML)
+	defer closeInvalidYAMLFile.Close()
+
+	warningFilename, closeWarningFile := createTestFile(t, warningsYAML)
+	defer closeWarningFile.Close()
 
 	invalidYAMLFile, closeInvalidYAMLFile := createTestFile(t, invalidYAML)
 	defer closeInvalidYAMLFile.Close()
@@ -411,8 +732,8 @@ func TestValidateCommand(t *testing.T) {
 	validKubernetesYAMLFile, closeKubernetesYAMLFile := createTestFile(t, validKubernetesYAML)
 	defer closeKubernetesYAMLFile.Close()
 
-	invalidMixerKindFile, closeInvalidMixerKindFile := createTestFile(t, invalidMixerKind)
-	defer closeInvalidMixerKindFile.Close()
+	validKubernetesJSONFile, closeKubernetesJSONFile := createTestFile(t, validKubernetesYAML)
+	defer closeKubernetesJSONFile.Close()
 
 	versionLabelMissingDeploymentFile, closeVersionLabelMissingDeploymentFile := createTestFile(t, versionLabelMissingDeployment)
 	defer closeVersionLabelMissingDeploymentFile.Close()
@@ -423,6 +744,9 @@ func TestValidateCommand(t *testing.T) {
 	unsupportedKeyFilename, closeUnsupportedKeyFile := createTestFile(t, invalidUnsupportedKey)
 	defer closeUnsupportedKeyFile.Close()
 
+	duplicateKeyFilename, closeUnsupportedKeyFile := createTestFile(t, invalidDuplicateKey)
+	defer closeUnsupportedKeyFile.Close()
+
 	validPortNamingSvcFile, closeValidPortNamingSvcFile := createTestFile(t, validPortNamingSvc)
 	defer closeValidPortNamingSvcFile.Close()
 
@@ -431,6 +755,33 @@ func TestValidateCommand(t *testing.T) {
 
 	invalidPortNamingSvcFile, closeInvalidPortNamingSvcFile := createTestFile(t, invalidPortNamingSvc)
 	defer closeInvalidPortNamingSvcFile.Close()
+
+	tempDirYAML := createTestDirectory(t, map[string]string{
+		"valid.yaml":       validYAML,
+		"invalid.yaml":     invalidYAML,
+		"warning.yaml":     warningsYAML,
+		"invalidYAML.yaml": invalidYAML,
+	})
+	validTempDirYAML := createTestDirectory(t, map[string]string{
+		"valid.yaml": validYAML,
+	})
+
+	tempDirJSON := createTestDirectory(t, map[string]string{
+		"valid.json":       validJSON,
+		"invalid.json":     invalidJSON,
+		"warning.json":     warningsJSON,
+		"invalidYAML.json": invalidJSON,
+	})
+	validTempDirJSON := createTestDirectory(t, map[string]string{
+		"valid.json": validJSON,
+	})
+
+	t.Cleanup(func() {
+		os.RemoveAll(tempDirYAML)
+		os.RemoveAll(validTempDirYAML)
+		os.RemoveAll(tempDirJSON)
+		os.RemoveAll(validTempDirJSON)
+	})
 
 	cases := []struct {
 		name           string
@@ -459,21 +810,16 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name: "valid resources from file",
-			args: []string{"--filename", validFilename},
+			args: []string{"--filename", validFilenameYAML},
 		},
 		{
 			name:      "extra args",
-			args:      []string{"--filename", validFilename, "extra-arg"},
+			args:      []string{"--filename", validFilenameYAML, "extra-arg"},
 			wantError: true,
 		},
 		{
 			name:      "invalid resources from file",
-			args:      []string{"--filename", invalidFilename},
-			wantError: true,
-		},
-		{
-			name:      "unsupported mixer rule",
-			args:      []string{"--filename", unsupportedMixerRuleFilename},
+			args:      []string{"--filename", invalidFilenameYAML},
 			wantError: true,
 		},
 		{
@@ -494,14 +840,17 @@ $`),
 			wantError: false,
 		},
 		{
-			name:      "invalid Mixer kind",
-			args:      []string{"--filename", invalidMixerKindFile},
-			wantError: true,
+			name: "valid Kubernetes JSON",
+			args: []string{"--filename", validKubernetesJSONFile},
+			expectedRegexp: regexp.MustCompile(`^".*" is valid
+$`),
+			wantError: false,
 		},
 		{
-			name:      "invalid top-level key",
-			args:      []string{"--filename", unsupportedKeyFilename},
-			wantError: true,
+			name:           "invalid top-level key",
+			args:           []string{"--filename", unsupportedKeyFilename},
+			expectedRegexp: regexp.MustCompile(`.*unknown field "unexpected_junk"`),
+			wantError:      true,
 		},
 		{
 			name:      "version label missing deployment",
@@ -513,20 +862,90 @@ $`),
 			args:      []string{"--filename", portNameMissingSvcFile},
 			wantError: true,
 		},
+		{
+			name:           "duplicate key",
+			args:           []string{"--filename", duplicateKeyFilename},
+			expectedRegexp: regexp.MustCompile(`.*key ".*" already set`),
+			wantError:      true,
+		},
+		{
+			name: "warning",
+			args: []string{"--filename", warningFilename},
+			expectedRegexp: regexp.MustCompile(`(?m)".*" has warnings: 
+	\* DestinationRule//reviews-cb-policy: outlier detection consecutive errors is deprecated, use consecutiveGatewayErrors or consecutive5xxErrors instead
+
+Error: 1 error occurred:
+	\* VirtualService//invalid-virtual-service: weight -15 < 0`),
+			wantError: true,
+		},
+		{
+			name:      "validate all yaml files in a directory",
+			args:      []string{"--filename", tempDirYAML},
+			wantError: true, // Since the directory has invalid files
+		},
+		{
+			name:      "validate valid yaml files in a directory",
+			args:      []string{"--filename", validTempDirYAML},
+			wantError: false,
+		},
+		{
+			name:      "validate combination of yaml files and directories with valid files",
+			args:      []string{"--filename", validFilenameYAML, "--filename", validTempDirYAML},
+			wantError: false,
+		},
+		{
+			name:      "validate combination of yaml files and directories with valid files and invalid files",
+			args:      []string{"--filename", validFilenameYAML, "--filename", tempDirYAML, "--filename", validTempDirYAML},
+			wantError: true, // Since the directory has invalid files
+		},
+		{
+			name:      "validate all json files in a directory",
+			args:      []string{"--filename", tempDirJSON},
+			wantError: true, // Since the directory has invalid files
+		},
+		{
+			name:      "validate valid json files in a directory",
+			args:      []string{"--filename", validTempDirJSON},
+			wantError: false,
+		},
+		{
+			name:      "validate combination of json files and directories with valid files",
+			args:      []string{"--filename", validFilenameJSON, "--filename", validTempDirJSON},
+			wantError: false,
+		},
+		{
+			name:      "validate combination of json files and directories with valid files and invalid files",
+			args:      []string{"--filename", validFilenameJSON, "--filename", tempDirJSON, "--filename", validTempDirJSON},
+			wantError: true, // Since the directory has invalid files
+		},
+		{
+			name:      "validate mix of yaml and json directories with valid files",
+			args:      []string{"--filename", validTempDirYAML, "--filename", validTempDirJSON},
+			wantError: false,
+		},
+		{
+			name:      "validate combination of yaml and json and yaml directories with invalid files",
+			args:      []string{"--filename", tempDirYAML, "--filename", tempDirJSON},
+			wantError: true, // Since the directory has invalid files
+		},
 	}
-	istioNamespace := "istio-system"
 	for i, c := range cases {
-		t.Run(fmt.Sprintf("[%v] %v ", i, c.name), func(tt *testing.T) {
-			validateCmd := NewValidateCommand(&istioNamespace)
+		t.Run(fmt.Sprintf("[%v] %v", i, c.name), func(t *testing.T) {
+			ctx := cli.NewFakeContext(&cli.NewFakeContextOption{
+				IstioNamespace: "istio-system",
+			})
+			validateCmd := NewValidateCommand(ctx)
+			validateCmd.SilenceUsage = true
 			validateCmd.SetArgs(c.args)
 
 			// capture output to keep test logs clean
 			var out bytes.Buffer
-			validateCmd.SetOutput(&out)
+			validateCmd.SetOut(&out)
+			validateCmd.SetErr(&out)
 
 			err := validateCmd.Execute()
 			if (err != nil) != c.wantError {
-				tt.Errorf("unexpected validate return status: got %v want %v: \nerr=%v",
+				t.Errorf("unexpected validate return status: got %v want %v: \nerr=%v",
 					err != nil, c.wantError, err)
 			}
 			output := out.String()
@@ -536,4 +955,17 @@ $`),
 			}
 		})
 	}
+}
+
+func TestGetTemplateLabels(t *testing.T) {
+	un := fromYAML(validDeployment)
+
+	labels, err := GetTemplateLabels(un)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, labels, map[string]string{
+		"app":     "helloworld",
+		"version": "v1",
+	})
 }

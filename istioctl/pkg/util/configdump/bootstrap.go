@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,17 @@
 package configdump
 
 import (
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/ptypes"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 )
 
 // GetBootstrapConfigDump retrieves the bootstrap config dump from the ConfigDump
-func (w *Wrapper) GetBootstrapConfigDump() (*adminapi.BootstrapConfigDump, error) {
+func (w *Wrapper) GetBootstrapConfigDump() (*admin.BootstrapConfigDump, error) {
 	bootstrapDumpAny, err := w.getSection(bootstrap)
 	if err != nil {
 		return nil, err
 	}
-	bootstrapDump := &adminapi.BootstrapConfigDump{}
-	err = ptypes.UnmarshalAny(&bootstrapDumpAny, bootstrapDump)
+	bootstrapDump := &admin.BootstrapConfigDump{}
+	err = bootstrapDumpAny.UnmarshalTo(bootstrapDump)
 	if err != nil {
 		return nil, err
 	}

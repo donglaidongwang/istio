@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,14 @@
 // limitations under the License.
 
 package model
+
+import (
+	"sync"
+
+	"istio.io/istio/pkg/cluster"
+)
+
+type ServiceHandler func(*Service, *Service, Event)
 
 // Controller defines an event controller loop.  Proxy agent registers itself
 // with the controller loop and receives notifications on changes to the
@@ -29,15 +37,83 @@ package model
 // Handlers receive the notification event and the associated object.  Note
 // that all handlers must be appended before starting the controller.
 type Controller interface {
-	// AppendServiceHandler notifies about changes to the service catalog.
-	AppendServiceHandler(f func(*Service, Event)) error
+	// Note: AppendXXXHandler is used to register high level handlers.
+	// For per cluster handlers, they should be registered by the `AppendXXXHandlerForCluster` interface.
 
-	// AppendInstanceHandler notifies about changes to the service instances
-	// for a service.
-	AppendInstanceHandler(f func(*ServiceInstance, Event)) error
+	// AppendServiceHandler notifies about changes to the service catalog.
+	AppendServiceHandler(f ServiceHandler)
+
+	// AppendWorkloadHandler notifies about changes to workloads. This differs from InstanceHandler,
+	// which deals with service instances (the result of a merge of Service and Workload)
+	AppendWorkloadHandler(f func(*WorkloadInstance, Event))
 
 	// Run until a signal is received
 	Run(stop <-chan struct{})
+
+	// HasSynced returns true after initial cache synchronization is complete
+	HasSynced() bool
+}
+
+// AggregateController is a wrapper of Controller, it supports registering handlers of a specific cluster。
+type AggregateController interface {
+	Controller
+	// AppendServiceHandlerForCluster is similar to Controller.AppendServiceHandler,
+	// but it is used to store the handler from a specific cluster.
+	AppendServiceHandlerForCluster(clusterID cluster.ID, f ServiceHandler)
+	UnRegisterHandlersForCluster(clusterID cluster.ID)
+}
+
+// ControllerHandlers is a utility to help Controller implementations manage their lists of handlers.
+type ControllerHandlers struct {
+	mutex            sync.RWMutex
+	serviceHandlers  []ServiceHandler
+	workloadHandlers []func(*WorkloadInstance, Event)
+}
+
+func (c *ControllerHandlers) AppendServiceHandler(f ServiceHandler) {
+	// Copy on write.
+	c.mutex.Lock()
+	handlers := make([]ServiceHandler, 0, len(c.serviceHandlers)+1)
+	handlers = append(handlers, c.serviceHandlers...)
+	handlers = append(handlers, f)
+	c.serviceHandlers = handlers
+	c.mutex.Unlock()
+}
+
+func (c *ControllerHandlers) AppendWorkloadHandler(f func(*WorkloadInstance, Event)) {
+	// Copy on write.
+	c.mutex.Lock()
+	handlers := make([]func(*WorkloadInstance, Event), 0, len(c.workloadHandlers)+1)
+	handlers = append(handlers, c.workloadHandlers...)
+	handlers = append(handlers, f)
+	c.workloadHandlers = handlers
+	c.mutex.Unlock()
+}
+
+func (c *ControllerHandlers) GetServiceHandlers() []ServiceHandler {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	// Return a shallow copy of the array
+	return c.serviceHandlers
+}
+
+func (c *ControllerHandlers) GetWorkloadHandlers() []func(*WorkloadInstance, Event) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	// Return a shallow copy of the array
+	return c.workloadHandlers
+}
+
+func (c *ControllerHandlers) NotifyServiceHandlers(prev, curr *Service, event Event) {
+	for _, f := range c.GetServiceHandlers() {
+		f(prev, curr, event)
+	}
+}
+
+func (c *ControllerHandlers) NotifyWorkloadHandlers(w *WorkloadInstance, event Event) {
+	for _, f := range c.GetWorkloadHandlers() {
+		f(w, event)
+	}
 }
 
 // Event represents a registry update event

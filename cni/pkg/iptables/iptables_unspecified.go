@@ -1,0 +1,56 @@
+//go:build !linux
+
+// Copyright Istio Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package iptables
+
+import (
+	"errors"
+	"net/netip"
+
+	"istio.io/istio/cni/pkg/config"
+	istiolog "istio.io/istio/pkg/log"
+)
+
+func (cfg *IptablesConfigurator) createInpodRulesKata(_ *istiolog.Scope, _ config.PodLevelOverrides) error {
+	return errors.New("not implemented on this platform")
+}
+
+func AddInpodMarkIPRule(cfg *config.AmbientConfig) error {
+	return errors.New("not implemented on this platform")
+}
+
+func DelInpodMarkIPRule(cfg *config.AmbientConfig) error {
+	return errors.New("not implemented on this platform")
+}
+
+func AddLoopbackRoutes(cfg *config.AmbientConfig) error {
+	return errors.New("not implemented on this platform")
+}
+
+func DelLoopbackRoutes(cfg *config.AmbientConfig) error {
+	return errors.New("not implemented on this platform")
+}
+
+func discoverDefaultGateway() (netip.Addr, netip.Addr, string) {
+	return netip.Addr{}, netip.Addr{}, ""
+}
+
+func discoverPodIPs() ([]netip.Addr, []netip.Addr) {
+	return nil, nil
+}
+
+func writeSysctl(key, value string) error {
+	return errors.New("not implemented on this platform")
+}

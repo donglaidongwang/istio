@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,3 +16,10 @@ package resource
 
 // SetupFn is a function used for performing setup actions.
 type SetupFn func(ctx Context) error
+
+// TeardownFn is a function used for performing tear-down actions.
+type TeardownFn func(ctx Context)
+
+// ShouldSkipFn is a function used for performing skip actions; if it returns true a job is skipped
+// Note: function may be called multiple times during the setup process.
+type ShouldSkipFn func(ctx Context) bool

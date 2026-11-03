@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,23 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+
+	"istio.io/istio/pkg/env"
 )
 
 const (
 	// Infinity is the maximum possible duration for keepalive values
 	Infinity = time.Duration(math.MaxInt64)
+)
+
+var (
+	// grpcKeepaliveInterval sets the gRPC KeepAlive Interval
+	grpcKeepaliveInterval = env.Register("GRPC_KEEPALIVE_INTERVAL", 30*time.Second, "gRPC Keepalive Interval").Get()
+
+	// grpcKeepAliveTimeout sets the gRPC KeepAlive Timeout
+	grpcKeepaliveTimeout = env.Register("GRPC_KEEPALIVE_TIMEOUT", 10*time.Second, "gRPC Keepalive Timeout").Get()
 )
 
 // Options defines the set of options used for grpc keepalive.
@@ -46,11 +58,19 @@ type Options struct {
 	MaxServerConnectionAgeGrace time.Duration // default value 10s
 }
 
+// ConvertToClientOption convert Options to grpc client option used for grpc keepalive.
+func (o *Options) ConvertToClientOption() grpc.DialOption {
+	return grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:    o.Time,
+		Timeout: o.Timeout,
+	})
+}
+
 // DefaultOption returns the default keepalive options.
 func DefaultOption() *Options {
 	return &Options{
-		Time:                        30 * time.Second,
-		Timeout:                     10 * time.Second,
+		Time:                        grpcKeepaliveInterval,
+		Timeout:                     grpcKeepaliveTimeout,
 		MaxServerConnectionAge:      Infinity,
 		MaxServerConnectionAgeGrace: 10 * time.Second,
 	}

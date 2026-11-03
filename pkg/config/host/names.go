@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,13 +32,17 @@ func (h Names) Len() int {
 }
 
 func (h Names) Less(i, j int) bool {
-	a, b := h[i], h[j]
+	return MoreSpecific(h[i], h[j])
+}
+
+// MoreSpecific returns true if hostname a is more specific than b.
+func MoreSpecific(a, b Name) bool {
 	if len(a) == 0 && len(b) == 0 {
 		return true // doesn't matter, they're both the empty string
 	}
 
 	// we sort longest to shortest, alphabetically, with wildcards last
-	ai, aj := string(a[0]) == "*", string(b[0]) == "*"
+	ai, aj := strings.HasPrefix(a.String(), "*"), strings.HasPrefix(b.String(), "*")
 	if ai && !aj {
 		// h[i] is a wildcard, but h[j] isn't; therefore h[j] < h[i]
 		return false
@@ -70,11 +74,12 @@ func (h Names) Contains(host Name) bool {
 
 // Intersection returns the subset of host names that are covered by both h and other.
 // e.g.:
-//  Names(["foo.com","bar.com"]).Intersection(Names(["*.com"]))         = Names(["foo.com","bar.com"])
-//  Names(["foo.com","*.net"]).Intersection(Names(["*.com","bar.net"])) = Names(["foo.com","bar.net"])
-//  Names(["foo.com","*.net"]).Intersection(Names(["*.bar.net"]))       = Names(["*.bar.net"])
-//  Names(["foo.com"]).Intersection(Names(["bar.com"]))                 = Names([])
-//  Names([]).Intersection(Names(["bar.com"])                           = Names([])
+//
+//	Names(["foo.com","bar.com"]).Intersection(Names(["*.com"]))         = Names(["foo.com","bar.com"])
+//	Names(["foo.com","*.net"]).Intersection(Names(["*.com","bar.net"])) = Names(["foo.com","bar.net"])
+//	Names(["foo.com","*.net"]).Intersection(Names(["*.bar.net"]))       = Names(["*.bar.net"])
+//	Names(["foo.com"]).Intersection(Names(["bar.com"]))                 = Names([])
+//	Names([]).Intersection(Names(["bar.com"])                           = Names([])
 func (h Names) Intersection(other Names) Names {
 	result := make(Names, 0, len(h))
 	for _, hHost := range h {
@@ -115,13 +120,12 @@ func NewNames(hosts []string) Names {
 func NamesForNamespace(hosts []string, namespace string) Names {
 	result := make(Names, 0, len(hosts))
 	for _, host := range hosts {
-		if strings.Contains(host, "/") {
-			parts := strings.Split(host, "/")
-			if parts[0] != namespace && parts[0] != "*" {
+		if ns, name, found := strings.Cut(host, "/"); found {
+			if ns != namespace && ns != "*" {
 				continue
 			}
-			//strip the namespace
-			host = parts[1]
+			// strip the namespace
+			host = name
 		}
 		result = append(result, Name(host))
 	}

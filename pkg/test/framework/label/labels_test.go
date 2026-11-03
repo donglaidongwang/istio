@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ func TestLabels(t *testing.T) {
 		{filter: "", labels: NewSet(Postsubmit), expected: true},
 		{filter: "", labels: NewSet(Postsubmit, CustomSetup), expected: true},
 		{filter: "$requires.kube", labels: NewSet(Postsubmit, CustomSetup), err: true},
-		{filter: "zoo", labels: NewSet(Postsubmit, CustomSetup), err: true},
+		{filter: "zoo", labels: NewSet(Postsubmit, CustomSetup), expected: true},
 		{filter: "postsubmit", labels: NewSet(Postsubmit), expected: true},
 		{filter: "postsubmit", labels: NewSet(CustomSetup), expected: false},
 		{filter: "postsubmit", labels: NewSet(CustomSetup, Postsubmit), expected: true},
@@ -40,6 +40,12 @@ func TestLabels(t *testing.T) {
 		{filter: "postsubmit,+customsetup", labels: NewSet(Postsubmit, CustomSetup), expected: true},
 		{filter: "-postsubmit", labels: NewSet(), expected: true},
 		{filter: "-postsubmit", labels: NewSet(Postsubmit), expected: false},
+		{filter: "-multicluster", labels: NewSet(), expected: true},
+		{filter: "-multicluster", labels: NewSet(Multicluster), expected: false},
+		{filter: "multicluster", labels: NewSet(Multicluster), expected: true},
+		{filter: "-full", labels: NewSet(), expected: true},
+		{filter: "-full", labels: NewSet(Full), expected: false},
+		{filter: "full", labels: NewSet(Full), expected: true},
 		{filter: "-postsubmit,-customsetup", labels: NewSet(), expected: true},
 		{filter: "-postsubmit,customsetup", labels: NewSet(Postsubmit, CustomSetup), expected: false},
 		{filter: "-postsubmit,customsetup", labels: NewSet(CustomSetup), expected: true},

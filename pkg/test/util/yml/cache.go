@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package yml
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -44,14 +43,6 @@ type CacheKey struct {
 type resourceState struct {
 	part Part
 	file string
-}
-
-// NewCache returns a new Cache instance
-func NewCache(dir string) *Cache {
-	return &Cache{
-		resources: make(map[CacheKey]*resourceState),
-		dir:       dir,
-	}
 }
 
 // Apply adds the given yamlText contents as part of a given context name. If there is an existing context
@@ -162,7 +153,7 @@ func (c *Cache) GetFileFor(k CacheKey) string {
 }
 
 func (c *Cache) writeFile(file string, contents string) error {
-	return ioutil.WriteFile(file, []byte(contents), os.ModePerm)
+	return os.WriteFile(file, []byte(contents), os.ModePerm)
 }
 
 func (c *Cache) deleteFile(file string) error {

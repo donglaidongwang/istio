@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,14 @@ package request
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
 
+	"istio.io/istio/pkg/ptr"
 	"istio.io/istio/tests/util"
 )
 
@@ -44,7 +45,7 @@ func (p *pilotStubHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == p.States[0].wantMethod {
 		if r.URL.Path == p.States[0].wantPath {
 			defer r.Body.Close()
-			body, _ := ioutil.ReadAll(r.Body)
+			body, _ := io.ReadAll(r.Body)
 			if err := util.Compare(body, p.States[0].wantBody); err == nil {
 				w.WriteHeader(p.States[0].StatusCode)
 				w.Write([]byte(p.States[0].Response))
@@ -60,6 +61,8 @@ func (p *pilotStubHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(fmt.Sprintf("wanted method %q got %q", p.States[0].wantMethod, r.Method)))
 	}
+
+	p.States[0] = ptr.Empty[pilotStubState]()
 	p.States = p.States[1:]
 	p.Unlock()
 }

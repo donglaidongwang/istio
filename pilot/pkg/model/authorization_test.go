@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,352 +19,22 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
+	"k8s.io/apimachinery/pkg/types"
 
-	mesh "istio.io/api/mesh/v1alpha1"
-	rbacproto "istio.io/api/rbac/v1alpha1"
+	"istio.io/api/label"
+	meshconfig "istio.io/api/mesh/v1alpha1"
 	authpb "istio.io/api/security/v1beta1"
 	selectorpb "istio.io/api/type/v1beta1"
+	"istio.io/istio/pilot/pkg/features"
+	"istio.io/istio/pilot/pkg/serviceregistry/provider"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/schema"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/mesh/meshwatcher"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/util/protomarshal"
 )
-
-func TestGetAuthorizationPolicies(t *testing.T) {
-	testNS := "test-ns"
-	roleCfg := Config{
-		ConfigMeta: ConfigMeta{
-			Type: schemas.ServiceRole.Type, Name: "test-role-1", Namespace: testNS},
-		Spec: &rbacproto.ServiceRole{
-			Rules: []*rbacproto.AccessRule{{Services: []string{"test-svc-1"}}},
-		},
-	}
-	bindingCfg := Config{
-		ConfigMeta: ConfigMeta{
-			Type: schemas.ServiceRoleBinding.Type, Name: "test-binding-1", Namespace: testNS},
-		Spec: &rbacproto.ServiceRoleBinding{
-			Subjects: []*rbacproto.Subject{{User: "test-user-1"}},
-			RoleRef:  &rbacproto.RoleRef{Kind: "ServiceRole", Name: "test-role-1"},
-		},
-	}
-	invalidateBindingCfg := Config{
-		ConfigMeta: ConfigMeta{
-			Type: schemas.ServiceRoleBinding.Type, Name: "test-binding-1", Namespace: testNS},
-		Spec: &rbacproto.ServiceRoleBinding{
-			Subjects: []*rbacproto.Subject{{User: "test-user-1"}},
-			RoleRef:  &rbacproto.RoleRef{Kind: "ServiceRole", Name: ""},
-		},
-	}
-
-	cases := []struct {
-		name   string
-		config []Config
-		want   *RolesAndBindings
-	}{
-		{
-			name:   "add ServiceRole",
-			config: []Config{roleCfg},
-			want: &RolesAndBindings{
-				Roles:    []Config{roleCfg},
-				Bindings: map[string][]*rbacproto.ServiceRoleBinding{}},
-		},
-		{
-			name:   "add invalidate ServiceRoleBinding",
-			config: []Config{invalidateBindingCfg},
-			want:   nil,
-		},
-		{
-			name:   "add ServiceRoleBinding",
-			config: []Config{bindingCfg},
-			want: &RolesAndBindings{
-				Bindings: map[string][]*rbacproto.ServiceRoleBinding{
-					"test-role-1": {&rbacproto.ServiceRoleBinding{
-						Subjects: []*rbacproto.Subject{{User: "test-user-1"}},
-						RoleRef:  &rbacproto.RoleRef{Kind: "ServiceRole", Name: "test-role-1"},
-					}},
-				},
-			},
-		},
-		{
-			name:   "add ServiceRoleBinding and ServiceRole",
-			config: []Config{roleCfg, bindingCfg},
-			want: &RolesAndBindings{
-				Roles: []Config{roleCfg},
-				Bindings: map[string][]*rbacproto.ServiceRoleBinding{
-					"test-role-1": {bindingCfg.Spec.(*rbacproto.ServiceRoleBinding)},
-				},
-			},
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(c.config, t)
-			got := authzPolicies.namespaceToV1alpha1Policies[testNS]
-			if !reflect.DeepEqual(c.want, got) {
-				t.Errorf("want:\n%s\n, got:\n%s\n", c.want, got)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicies_ListNamespacesOfServiceRoles(t *testing.T) {
-	role := &rbacproto.ServiceRole{}
-	binding := &rbacproto.ServiceRoleBinding{
-		Subjects: []*rbacproto.Subject{
-			{
-				User: "user-1",
-			},
-		},
-		RoleRef: &rbacproto.RoleRef{
-			Kind: "ServiceRole",
-			Name: "role-1",
-		},
-	}
-
-	cases := []struct {
-		name    string
-		ns      string
-		configs []Config
-		want    []string
-	}{
-		{
-			name: "no roles",
-			ns:   "foo",
-			want: []string{},
-		},
-		{
-			name: "role and binding same namespace",
-			ns:   "bar",
-			configs: []Config{
-				newConfig("role", "bar", role),
-				newConfig("binding", "bar", binding),
-			},
-			want: []string{"bar"},
-		},
-		{
-			name: "two roles different namespaces",
-			ns:   "bar",
-			configs: []Config{
-				newConfig("role-1", "foo", role),
-				newConfig("role-2", "bar", role),
-			},
-			want: []string{"foo", "bar"},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(tc.configs, t)
-
-			got := authzPolicies.ListNamespacesOfToV1alpha1Policies()
-			if diff := cmp.Diff(tc.want, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
-				t.Errorf("want:%v\n got: %v diff %v\n", tc.want, got, diff)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicies_ListServiceRolesRoles(t *testing.T) {
-	role := &rbacproto.ServiceRole{}
-	binding := &rbacproto.ServiceRoleBinding{
-		Subjects: []*rbacproto.Subject{
-			{
-				User: "user-1",
-			},
-		},
-		RoleRef: &rbacproto.RoleRef{
-			Kind: "ServiceRole",
-			Name: "role-1",
-		},
-	}
-
-	cases := []struct {
-		name    string
-		ns      string
-		configs []Config
-		want    []Config
-	}{
-		{
-			name: "no roles",
-			ns:   "foo",
-			want: nil,
-		},
-		{
-			name: "only binding",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("binding", "foo", binding),
-			},
-			want: nil,
-		},
-		{
-			name: "no roles in namespace foo",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("role", "bar", role),
-				newConfig("binding", "bar", binding),
-			},
-			want: nil,
-		},
-		{
-			name: "one role",
-			ns:   "bar",
-			configs: []Config{
-				newConfig("role", "bar", role),
-				newConfig("binding", "bar", binding),
-			},
-			want: []Config{
-				newConfig("role", "bar", role),
-			},
-		},
-		{
-			name: "two roles",
-			ns:   "bar",
-			configs: []Config{
-				newConfig("role-1", "foo", role),
-				newConfig("role-1", "bar", role),
-				newConfig("role-2", "bar", role),
-			},
-			want: []Config{
-				newConfig("role-1", "bar", role),
-				newConfig("role-2", "bar", role),
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(tc.configs, t)
-
-			got := authzPolicies.ListServiceRoles(tc.ns)
-			if !reflect.DeepEqual(tc.want, got) {
-				t.Errorf("want:%v\n but got: %v\n", tc.want, got)
-			}
-		})
-	}
-}
-
-func TestAuthorizationPolicies_ListServiceRoleBindings(t *testing.T) {
-	role := &rbacproto.ServiceRole{}
-	binding := &rbacproto.ServiceRoleBinding{
-		Subjects: []*rbacproto.Subject{
-			{
-				User: "user-1",
-			},
-		},
-		RoleRef: &rbacproto.RoleRef{
-			Kind: "ServiceRole",
-			Name: "role-1",
-		},
-	}
-	binding2 := &rbacproto.ServiceRoleBinding{
-		Subjects: []*rbacproto.Subject{
-			{
-				User: "user-2",
-			},
-		},
-		RoleRef: &rbacproto.RoleRef{
-			Kind: "ServiceRole",
-			Name: "role-2",
-		},
-	}
-
-	cases := []struct {
-		name    string
-		ns      string
-		configs []Config
-		want    map[string][]*rbacproto.ServiceRoleBinding
-	}{
-		{
-			name: "no configs",
-			ns:   "foo",
-			want: map[string][]*rbacproto.ServiceRoleBinding{},
-		},
-		{
-			name: "no configs in namespace foo",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("role-1", "bar", role),
-				newConfig("binding-1", "bar", binding),
-			},
-			want: map[string][]*rbacproto.ServiceRoleBinding{},
-		},
-		{
-			name: "no bindings in namespace foo",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("role-1", "foo", role),
-				newConfig("role-1", "bar", role),
-				newConfig("binding-1", "bar", binding),
-			},
-			want: map[string][]*rbacproto.ServiceRoleBinding{},
-		},
-		{
-			name: "one binding",
-			ns:   "bar",
-			configs: []Config{
-				newConfig("role-1", "bar", role),
-				newConfig("binding-1", "bar", binding),
-				newConfig("role-2", "foo", role),
-				newConfig("binding-2", "foo", binding2),
-			},
-			want: map[string][]*rbacproto.ServiceRoleBinding{
-				"role-1": {
-					binding,
-				},
-			},
-		},
-		{
-			name: "two bindings",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("role-1", "foo", role),
-				newConfig("binding-1", "foo", binding),
-				newConfig("role-2", "foo", role),
-				newConfig("binding-2", "foo", binding2),
-			},
-			want: map[string][]*rbacproto.ServiceRoleBinding{
-				"role-1": {
-					binding,
-				},
-				"role-2": {
-					binding2,
-				},
-			},
-		},
-		{
-			name: "multiple bindings for same role",
-			ns:   "foo",
-			configs: []Config{
-				newConfig("role-1", "foo", role),
-				newConfig("binding-1", "foo", binding),
-				newConfig("binding-2", "foo", binding),
-				newConfig("binding-3", "foo", binding),
-			},
-			want: map[string][]*rbacproto.ServiceRoleBinding{
-				"role-1": {
-					binding,
-					binding,
-					binding,
-				},
-			},
-		},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(tc.configs, t)
-
-			got := authzPolicies.ListServiceRoleBindings(tc.ns)
-			if !reflect.DeepEqual(tc.want, got) {
-				t.Errorf("want: %v\n but got: %v", tc.want, got)
-			}
-		})
-	}
-}
 
 func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 	policy := &authpb.AuthorizationPolicy{
@@ -387,321 +57,455 @@ func TestAuthorizationPolicies_ListAuthorizationPolicies(t *testing.T) {
 			},
 		},
 	}
-	policyWithSelector := proto.Clone(policy).(*authpb.AuthorizationPolicy)
+	policyWithSelector := protomarshal.Clone(policy)
 	policyWithSelector.Selector = &selectorpb.WorkloadSelector{
-		MatchLabels: map[string]string{
+		MatchLabels: labels.Instance{
 			"app":     "httpbin",
 			"version": "v1",
 		},
 	}
+	policyWithTargetRef := protomarshal.Clone(policy)
+	policyWithTargetRef.TargetRef = &selectorpb.PolicyTargetReference{
+		Group:     gvk.KubernetesGateway.Group,
+		Kind:      gvk.KubernetesGateway.Kind,
+		Name:      "my-gateway",
+		Namespace: "bar",
+	}
+
+	policyWithServiceRef := protomarshal.Clone(policy)
+	policyWithServiceRef.TargetRef = &selectorpb.PolicyTargetReference{
+		Group:     gvk.Service.Group,
+		Kind:      gvk.Service.Kind,
+		Name:      "foo-svc",
+		Namespace: "foo",
+	}
+	policyWithGWClassRef := protomarshal.Clone(policy)
+	policyWithGWClassRef.TargetRef = &selectorpb.PolicyTargetReference{
+		Group: gvk.GatewayClass.Group,
+		Kind:  gvk.GatewayClass.Kind,
+		Name:  "istio-waypoint",
+	}
+
+	denyPolicy := protomarshal.Clone(policy)
+	denyPolicy.Action = authpb.AuthorizationPolicy_DENY
+
+	auditPolicy := protomarshal.Clone(policy)
+	auditPolicy.Action = authpb.AuthorizationPolicy_AUDIT
+
+	customPolicy := protomarshal.Clone(policy)
+	customPolicy.Action = authpb.AuthorizationPolicy_CUSTOM
 
 	cases := []struct {
-		name           string
-		ns             string
-		workloadLabels map[string]string
-		configs        []Config
-		want           []Config
+		name          string
+		selectionOpts WorkloadPolicyMatcher
+		configs       []config.Config
+		wantDeny      []AuthorizationPolicy
+		wantAllow     []AuthorizationPolicy
+		wantAudit     []AuthorizationPolicy
+		wantCustom    []AuthorizationPolicy
 	}{
 		{
 			name: "no policies",
-			ns:   "foo",
-			want: nil,
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "foo",
+			},
+			wantAllow: nil,
 		},
 		{
 			name: "no policies in namespace foo",
-			ns:   "foo",
-			configs: []Config{
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "foo",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
 				newConfig("authz-2", "bar", policy),
 			},
-			want: nil,
+			wantAllow: nil,
 		},
 		{
-			name: "one policy",
-			ns:   "bar",
-			configs: []Config{
+			name: "no policies with a targetRef in namespace foo",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway",
+				},
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", policyWithTargetRef),
+			},
+			wantAllow: nil,
+		},
+		{
+			name: "one allow policy",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
 			},
-			want: []Config{
-				newConfig("authz-1", "bar", policy),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policy,
+				},
+			},
+		},
+		{
+			name: "one deny policy",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", denyPolicy),
+			},
+			wantDeny: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      denyPolicy,
+				},
+			},
+		},
+		{
+			name: "one audit policy",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", auditPolicy),
+			},
+			wantAudit: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      auditPolicy,
+				},
+			},
+		},
+		{
+			name: "one custom policy",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", customPolicy),
+			},
+			wantCustom: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      customPolicy,
+				},
 			},
 		},
 		{
 			name: "two policies",
-			ns:   "bar",
-			configs: []Config{
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "foo", policy),
 				newConfig("authz-1", "bar", policy),
 				newConfig("authz-2", "bar", policy),
 			},
-			want: []Config{
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policy,
+				},
+				{
+					Name:      "authz-2",
+					Namespace: "bar",
+					Spec:      policy,
+				},
+			},
+		},
+		{
+			name: "mixing allow, deny, and audit policies",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policy),
-				newConfig("authz-2", "bar", policy),
+				newConfig("authz-2", "bar", denyPolicy),
+				newConfig("authz-3", "bar", auditPolicy),
+				newConfig("authz-4", "bar", auditPolicy),
+			},
+			wantDeny: []AuthorizationPolicy{
+				{
+					Name:      "authz-2",
+					Namespace: "bar",
+					Spec:      denyPolicy,
+				},
+			},
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policy,
+				},
+			},
+			wantAudit: []AuthorizationPolicy{
+				{
+					Name:      "authz-3",
+					Namespace: "bar",
+					Spec:      auditPolicy,
+				},
+				{
+					Name:      "authz-4",
+					Namespace: "bar",
+					Spec:      auditPolicy,
+				},
+			},
+		},
+		{
+			name: "targetRef is an exact match",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway",
+				},
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", policyWithTargetRef),
+			},
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policyWithTargetRef,
+				},
 			},
 		},
 		{
 			name: "selector exact match",
-			ns:   "bar",
-			workloadLabels: map[string]string{
-				"app":     "httpbin",
-				"version": "v1",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+				WorkloadLabels: labels.Instance{
+					"app":     "httpbin",
+					"version": "v1",
+				},
 			},
-			configs: []Config{
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policyWithSelector),
 			},
-			want: []Config{
-				newConfig("authz-1", "bar", policyWithSelector),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policyWithSelector,
+				},
 			},
 		},
 		{
 			name: "selector subset match",
-			ns:   "bar",
-			workloadLabels: map[string]string{
-				"app":     "httpbin",
-				"version": "v1",
-				"env":     "dev",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+				WorkloadLabels: labels.Instance{
+					"app":     "httpbin",
+					"version": "v1",
+					"env":     "dev",
+				},
 			},
-			configs: []Config{
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policyWithSelector),
 			},
-			want: []Config{
-				newConfig("authz-1", "bar", policyWithSelector),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "bar",
+					Spec:      policyWithSelector,
+				},
 			},
+		},
+		{
+			name: "targetRef is not a match",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "my-gateway2",
+				},
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "bar", policyWithTargetRef),
+			},
+			wantAllow: nil,
 		},
 		{
 			name: "selector not match",
-			ns:   "bar",
-			workloadLabels: map[string]string{
-				"app":     "httpbin",
-				"version": "v2",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+				WorkloadLabels: labels.Instance{
+					"app":     "httpbin",
+					"version": "v2",
+				},
 			},
-			configs: []Config{
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policyWithSelector),
 			},
-			want: nil,
+			wantAllow: nil,
 		},
 		{
 			name: "namespace not match",
-			ns:   "foo",
-			workloadLabels: map[string]string{
-				"app":     "httpbin",
-				"version": "v1",
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					"app":     "httpbin",
+					"version": "v1",
+				},
 			},
-			configs: []Config{
+			configs: []config.Config{
 				newConfig("authz-1", "bar", policyWithSelector),
 			},
-			want: nil,
+			wantAllow: nil,
 		},
 		{
 			name: "root namespace",
-			ns:   "bar",
-			configs: []Config{
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
 			},
-			want: []Config{
-				newConfig("authz-1", "istio-config", policy),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "istio-config",
+					Spec:      policy,
+				},
 			},
 		},
 		{
 			name: "root namespace equals config namespace",
-			ns:   "istio-config",
-			configs: []Config{
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "istio-config",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
 			},
-			want: []Config{
-				newConfig("authz-1", "istio-config", policy),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "istio-config",
+					Spec:      policy,
+				},
 			},
 		},
 		{
 			name: "root namespace and config namespace",
-			ns:   "bar",
-			configs: []Config{
+			selectionOpts: WorkloadPolicyMatcher{
+				WorkloadNamespace: "bar",
+			},
+			configs: []config.Config{
 				newConfig("authz-1", "istio-config", policy),
 				newConfig("authz-2", "bar", policy),
 			},
-			want: []Config{
-				newConfig("authz-1", "istio-config", policy),
-				newConfig("authz-2", "bar", policy),
+			wantAllow: []AuthorizationPolicy{
+				{
+					Name:      "authz-1",
+					Namespace: "istio-config",
+					Spec:      policy,
+				},
+				{
+					Name:      "authz-2",
+					Namespace: "bar",
+					Spec:      policy,
+				},
+			},
+		},
+		{
+			name: "waypoint service attached",
+			selectionOpts: WorkloadPolicyMatcher{
+				IsWaypoint: true,
+				Services: []ServiceInfoForPolicyMatcher{
+					{Name: "foo-svc", Namespace: "foo", Registry: provider.Kubernetes},
+				},
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "foo-waypoint",
+					// labels match in selector policy but ignore them for waypoint
+					"app":     "httpbin",
+					"version": "v1",
+				},
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "foo", policyWithServiceRef),
+				newConfig("authz-2", "foo", policyWithSelector),
+			},
+			wantAllow: []AuthorizationPolicy{
+				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
+			},
+		},
+		{
+			name: "waypoint with default policies",
+			selectionOpts: WorkloadPolicyMatcher{
+				IsWaypoint: true,
+				Services: []ServiceInfoForPolicyMatcher{
+					{Name: "foo-svc", Namespace: "foo", Registry: provider.Kubernetes},
+				},
+				WorkloadNamespace: "foo",
+				WorkloadLabels: labels.Instance{
+					label.IoK8sNetworkingGatewayGatewayName.Name: "foo-waypoint",
+					// labels match in selector policy but ignore them for waypoint
+					"app":     "httpbin",
+					"version": "v1",
+				},
+				RootNamespace: "istio-config",
+			},
+			configs: []config.Config{
+				newConfig("authz-1", "foo", policyWithServiceRef),
+				newConfig("default", "istio-config", policyWithGWClassRef),
+				newConfig("default-non-waypoint", "istio-config", policyWithSelector),
+			},
+			wantAllow: []AuthorizationPolicy{
+				{Name: "default", Namespace: "istio-config", Spec: policyWithGWClassRef},
+				{Name: "authz-1", Namespace: "foo", Spec: policyWithServiceRef},
 			},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(tc.configs, t)
+			authzPolicies := createFakeAuthorizationPolicies(tc.configs)
 
-			got := authzPolicies.ListAuthorizationPolicies(
-				tc.ns, []labels.Instance{labels.Instance(tc.workloadLabels)})
-			if !reflect.DeepEqual(tc.want, got) {
-				t.Errorf("want:%v\n but got: %v\n", tc.want, got)
+			result := authzPolicies.ListAuthorizationPolicies(tc.selectionOpts)
+			if !reflect.DeepEqual(tc.wantAllow, result.Allow) {
+				t.Errorf("wantAllow:%v\n but got: %v\n", tc.wantAllow, result.Allow)
+			}
+			if !reflect.DeepEqual(tc.wantDeny, result.Deny) {
+				t.Errorf("wantDeny:%v\n but got: %v\n", tc.wantDeny, result.Deny)
+			}
+			if !reflect.DeepEqual(tc.wantAudit, result.Audit) {
+				t.Errorf("wantAudit:%v\n but got: %v\n", tc.wantAudit, result.Audit)
+			}
+			if !reflect.DeepEqual(tc.wantCustom, result.Custom) {
+				t.Errorf("wantCustom:%v\n but got: %v\n", tc.wantCustom, result.Custom)
 			}
 		})
 	}
 }
 
-func TestAuthorizationPolicies_IsRBACEnabled(t *testing.T) {
-	target := &rbacproto.RbacConfig_Target{
-		Services:   []string{"review.default.svc", "product.default.svc"},
-		Namespaces: []string{"special"},
-	}
-
-	testCases := []struct {
-		name      string
-		config    []Config
-		service   string
-		namespace string
-		want      bool
-	}{
-		{
-			name: "enabled",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode: rbacproto.RbacConfig_ON,
-					}),
-			},
-			want: true,
-		},
-		{
-			name: "enabled with permissive",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode:            rbacproto.RbacConfig_ON,
-						EnforcementMode: rbacproto.EnforcementMode_PERMISSIVE,
-					}),
-			},
-			want: true,
-		},
-		{
-			name: "enabled by inclusion.service",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode:      rbacproto.RbacConfig_ON_WITH_INCLUSION,
-						Inclusion: target,
-					}),
-			},
-			service:   "product.default.svc",
-			namespace: "default",
-			want:      true,
-		},
-		{
-			name: "enabled by inclusion.namespace",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode:      rbacproto.RbacConfig_ON,
-						Inclusion: target,
-					}),
-			},
-			service:   "other.special.svc",
-			namespace: "special",
-			want:      true,
-		},
-		{
-			name: "enabled by ClusterRbacConfig overriding RbacConfig",
-			config: []Config{
-				{
-					ConfigMeta: ConfigMeta{
-						Type:      schemas.RbacConfig.Type,
-						Name:      "default",
-						Namespace: "",
-					},
-					Spec: &rbacproto.RbacConfig{
-						Mode: rbacproto.RbacConfig_OFF,
-					},
-				},
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode: rbacproto.RbacConfig_ON,
-					}),
-			},
-			want: true,
-		},
-		{
-			name: "disabled by default",
-		},
-		{
-			name: "disabled",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode: rbacproto.RbacConfig_OFF,
-					}),
-			},
-		},
-		{
-			name: "disabled by exclusion.service",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode:      rbacproto.RbacConfig_ON_WITH_EXCLUSION,
-						Exclusion: target,
-					}),
-			},
-			service:   "product.default.svc",
-			namespace: "default",
-		},
-		{
-			name: "disabled by exclusion.namespace",
-			config: []Config{
-				newConfig("default", "",
-					&rbacproto.RbacConfig{
-						Mode:      rbacproto.RbacConfig_ON_WITH_EXCLUSION,
-						Exclusion: target,
-					}),
-			},
-			service:   "other.special.svc",
-			namespace: "special",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			authzPolicies := createFakeAuthorizationPolicies(tc.config, t)
-			got := authzPolicies.IsRBACEnabled(tc.service, tc.namespace)
-			if tc.want != got {
-				t.Errorf("want %v but got %v", tc.want, got)
-			}
-		})
-	}
-}
-
-func createFakeAuthorizationPolicies(configs []Config, t *testing.T) *AuthorizationPolicies {
+func createFakeAuthorizationPolicies(configs []config.Config) *AuthorizationPolicies {
 	store := &authzFakeStore{}
 	for _, cfg := range configs {
 		store.add(cfg)
 	}
 	environment := &Environment{
-		IstioConfigStore: MakeIstioStore(store),
-		Mesh:             &mesh.MeshConfig{RootNamespace: "istio-config"},
+		ConfigStore: store,
+		Watcher:     meshwatcher.NewTestWatcher(&meshconfig.MeshConfig{RootNamespace: "istio-config"}),
 	}
-	authzPolicies, err := GetAuthorizationPolicies(environment)
-	if err != nil {
-		t.Fatalf("GetAuthorizationPolicies failed: %v", err)
-	}
+	authzPolicies := GetAuthorizationPolicies(environment)
 	return authzPolicies
 }
 
-func newConfig(name, ns string, spec proto.Message) Config {
-	var typ string
-
-	switch spec.(type) {
-	case *rbacproto.RbacConfig:
-		typ = schemas.ClusterRbacConfig.Type
-	case *rbacproto.ServiceRole:
-		typ = schemas.ServiceRole.Type
-	case *rbacproto.ServiceRoleBinding:
-		typ = schemas.ServiceRoleBinding.Type
-	case *authpb.AuthorizationPolicy:
-		typ = schemas.AuthorizationPolicy.Type
-	}
-	return Config{
-		ConfigMeta: ConfigMeta{
-			Type:      typ,
-			Name:      name,
-			Namespace: ns,
+func newConfig(name, ns string, spec config.Spec) config.Config {
+	return config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.AuthorizationPolicy,
+			Name:             name,
+			Namespace:        ns,
 		},
 		Spec: spec,
 	}
@@ -709,34 +513,34 @@ func newConfig(name, ns string, spec proto.Message) Config {
 
 type authzFakeStore struct {
 	data []struct {
-		typ string
+		typ config.GroupVersionKind
 		ns  string
-		cfg Config
+		cfg config.Config
 	}
 }
 
-func (fs *authzFakeStore) add(config Config) {
+func (fs *authzFakeStore) add(cfg config.Config) {
 	fs.data = append(fs.data, struct {
-		typ string
+		typ config.GroupVersionKind
 		ns  string
-		cfg Config
+		cfg config.Config
 	}{
-		typ: config.Type,
-		ns:  config.Namespace,
-		cfg: config,
+		typ: cfg.GroupVersionKind,
+		ns:  cfg.Namespace,
+		cfg: cfg,
 	})
 }
 
-func (fs *authzFakeStore) ConfigDescriptor() schema.Set {
+func (fs *authzFakeStore) Schemas() collection.Schemas {
+	return collection.SchemasFor()
+}
+
+func (fs *authzFakeStore) Get(_ config.GroupVersionKind, _, _ string) *config.Config {
 	return nil
 }
 
-func (fs *authzFakeStore) Get(typ, name, namespace string) *Config {
-	return nil
-}
-
-func (fs *authzFakeStore) List(typ, namespace string) ([]Config, error) {
-	var configs []Config
+func (fs *authzFakeStore) List(typ config.GroupVersionKind, namespace string) []config.Config {
+	var configs []config.Config
 	for _, data := range fs.data {
 		if data.typ == typ {
 			if namespace != "" && data.ns == namespace {
@@ -745,23 +549,248 @@ func (fs *authzFakeStore) List(typ, namespace string) ([]Config, error) {
 			configs = append(configs, data.cfg)
 		}
 	}
-	return configs, nil
+	return configs
 }
 
-func (fs *authzFakeStore) Delete(typ, name, namespace string) error {
+func (fs *authzFakeStore) Delete(_ config.GroupVersionKind, _, _ string, _ *string) error {
 	return fmt.Errorf("not implemented")
 }
-func (fs *authzFakeStore) Create(config Config) (string, error) {
+
+func (fs *authzFakeStore) Create(config.Config) (string, error) {
 	return "not implemented", nil
 }
 
-func (fs *authzFakeStore) Update(config Config) (string, error) {
+func (fs *authzFakeStore) Update(config.Config) (string, error) {
 	return "not implemented", nil
 }
 
-func (fs *authzFakeStore) Version() string {
-	return "not implemented"
-}
-func (fs *authzFakeStore) GetResourceAtVersion(version string, key string) (resourceVersion string, err error) {
+func (fs *authzFakeStore) UpdateStatus(config.Config) (string, error) {
 	return "not implemented", nil
+}
+
+func httpRouteTargetRefPolicy(action authpb.AuthorizationPolicy_Action, routeName string) *authpb.AuthorizationPolicy {
+	return &authpb.AuthorizationPolicy{
+		Action: action,
+		TargetRef: &selectorpb.PolicyTargetReference{
+			Group: gvk.HTTPRoute.Group,
+			Kind:  gvk.HTTPRoute.Kind,
+			Name:  routeName,
+		},
+	}
+}
+
+func TestListAuthorizationPoliciesForHTTPRoute(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIHTTPRouteAuth, true)
+	allowRouteA := httpRouteTargetRefPolicy(authpb.AuthorizationPolicy_ALLOW, "route-a")
+	denyRouteA := httpRouteTargetRefPolicy(authpb.AuthorizationPolicy_DENY, "route-a")
+	allowRouteB := httpRouteTargetRefPolicy(authpb.AuthorizationPolicy_ALLOW, "route-b")
+	// AUDIT is not a valid action for an HTTPRoute targetRef and must not be indexed.
+	auditRouteA := httpRouteTargetRefPolicy(authpb.AuthorizationPolicy_AUDIT, "route-a")
+	// A workload-wide policy must never show up in the route index.
+	workloadWide := &authpb.AuthorizationPolicy{Action: authpb.AuthorizationPolicy_ALLOW}
+
+	configs := []config.Config{
+		newConfig("allow-a", "foo", allowRouteA),
+		newConfig("deny-a", "foo", denyRouteA),
+		newConfig("allow-b", "foo", allowRouteB),
+		newConfig("audit-a", "foo", auditRouteA),
+		newConfig("workload-wide", "foo", workloadWide),
+		// Same route name in a different namespace must be a distinct key.
+		newConfig("allow-a-other-ns", "bar", allowRouteA),
+	}
+	authzPolicies := createFakeAuthorizationPolicies(configs)
+
+	cases := []struct {
+		name      string
+		route     types.NamespacedName
+		wantAllow []string
+		wantDeny  []string
+	}{
+		{
+			name:      "allow and deny targeting the route",
+			route:     types.NamespacedName{Name: "route-a", Namespace: "foo"},
+			wantAllow: []string{"allow-a"},
+			wantDeny:  []string{"deny-a"},
+		},
+		{
+			name:      "only allow targeting the route",
+			route:     types.NamespacedName{Name: "route-b", Namespace: "foo"},
+			wantAllow: []string{"allow-b"},
+		},
+		{
+			name:      "route in another namespace is a distinct key",
+			route:     types.NamespacedName{Name: "route-a", Namespace: "bar"},
+			wantAllow: []string{"allow-a-other-ns"},
+		},
+		{
+			name:  "unknown route has no policies",
+			route: types.NamespacedName{Name: "missing", Namespace: "foo"},
+		},
+		{
+			name:  "zero value route has no policies",
+			route: types.NamespacedName{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := authzPolicies.ListAuthorizationPoliciesForHTTPRoute(tc.route)
+			assertPolicyNames(t, "allow", got.Allow, tc.wantAllow)
+			assertPolicyNames(t, "deny", got.Deny, tc.wantDeny)
+			// Only ALLOW/DENY are valid for HTTPRoute targetRefs.
+			if len(got.Audit) != 0 {
+				t.Errorf("expected no audit policies, got %d", len(got.Audit))
+			}
+			if len(got.Custom) != 0 {
+				t.Errorf("expected no custom policies, got %d", len(got.Custom))
+			}
+		})
+	}
+}
+
+func assertPolicyNames(t *testing.T, action string, got []AuthorizationPolicy, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: got %d policies, want %d", action, len(got), len(want))
+	}
+	for i, name := range want {
+		if got[i].Name != name {
+			t.Errorf("%s[%d]: got %q, want %q", action, i, got[i].Name, name)
+		}
+	}
+}
+
+func TestIndexHTTPRoutePoliciesFeatureGate(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIHTTPRouteAuth, false)
+	configs := []config.Config{
+		newConfig("allow-a", "foo", httpRouteTargetRefPolicy(authpb.AuthorizationPolicy_ALLOW, "route-a")),
+	}
+	got := createFakeAuthorizationPolicies(configs).
+		ListAuthorizationPoliciesForHTTPRoute(types.NamespacedName{Name: "route-a", Namespace: "foo"})
+	if len(got.Allow) != 0 || len(got.Deny) != 0 {
+		t.Errorf("expected empty route index when the feature is disabled, got allow=%d deny=%d", len(got.Allow), len(got.Deny))
+	}
+}
+
+// The index must match on exact name, exact namespace and the HTTPRoute group/kind only.
+// Each case here corresponds to a guard in indexHTTPRoutePolicies; deleting any one of them
+// must fail this test.
+func TestIndexHTTPRoutePoliciesRejectsNonMatchingTargets(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIHTTPRouteAuth, true)
+
+	targeted := func(ref *selectorpb.PolicyTargetReference) *authpb.AuthorizationPolicy {
+		return &authpb.AuthorizationPolicy{
+			Action:    authpb.AuthorizationPolicy_ALLOW,
+			TargetRef: ref,
+			Rules:     []*authpb.Rule{{}},
+		}
+	}
+
+	cases := []struct {
+		name string
+		ref  *selectorpb.PolicyTargetReference
+	}{
+		{
+			name: "other namespace explicitly targeted",
+			ref: &selectorpb.PolicyTargetReference{
+				Group: gvk.HTTPRoute.Group, Kind: gvk.HTTPRoute.Kind,
+				Name: "route-a", Namespace: "bar",
+			},
+		},
+		{
+			name: "service of the same name",
+			ref:  &selectorpb.PolicyTargetReference{Group: "", Kind: "Service", Name: "route-a"},
+		},
+		{
+			name: "grpcroute of the same name",
+			ref: &selectorpb.PolicyTargetReference{
+				Group: gvk.HTTPRoute.Group, Kind: "GRPCRoute", Name: "route-a",
+			},
+		},
+		{
+			name: "right kind in the wrong group",
+			ref: &selectorpb.PolicyTargetReference{
+				Group: "networking.istio.io", Kind: gvk.HTTPRoute.Kind, Name: "route-a",
+			},
+		},
+		{
+			name: "empty name",
+			ref: &selectorpb.PolicyTargetReference{
+				Group: gvk.HTTPRoute.Group, Kind: gvk.HTTPRoute.Kind, Name: "",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policies := createFakeAuthorizationPolicies([]config.Config{
+				newConfig("policy", "foo", targeted(tc.ref)),
+			})
+			// Neither the authoring namespace nor the referenced namespace may pick it up.
+			for _, key := range []types.NamespacedName{
+				{Name: "route-a", Namespace: "foo"},
+				{Name: "route-a", Namespace: "bar"},
+			} {
+				got := policies.ListAuthorizationPoliciesForHTTPRoute(key)
+				if len(got.Allow)+len(got.Deny) != 0 {
+					t.Errorf("policy was indexed under %s: allow=%d deny=%d", key, len(got.Allow), len(got.Deny))
+				}
+			}
+		})
+	}
+}
+
+// Guards the positive case, so the negative test above cannot pass by indexing nothing.
+func TestIndexHTTPRoutePoliciesMatchesOwnNamespace(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIHTTPRouteAuth, true)
+	for _, ns := range []string{"", "foo"} {
+		policies := createFakeAuthorizationPolicies([]config.Config{
+			newConfig("policy", "foo", &authpb.AuthorizationPolicy{
+				Action: authpb.AuthorizationPolicy_ALLOW,
+				TargetRef: &selectorpb.PolicyTargetReference{
+					Group: gvk.HTTPRoute.Group, Kind: gvk.HTTPRoute.Kind,
+					Name: "route-a", Namespace: ns,
+				},
+				Rules: []*authpb.Rule{{}},
+			}),
+		})
+		got := policies.ListAuthorizationPoliciesForHTTPRoute(types.NamespacedName{Name: "route-a", Namespace: "foo"})
+		if len(got.Allow) != 1 {
+			t.Errorf("targetRef namespace %q: got %d allow policies, want 1", ns, len(got.Allow))
+		}
+	}
+}
+
+// A policy that targets an HTTPRoute must apply at route scope only. Mixing an HTTPRoute
+// targetRef with a Gateway targetRef previously applied the same policy workload-wide as well,
+// which for ALLOW widens access across every route on the gateway.
+func TestHTTPRouteTargetedPolicyDoesNotAttachWorkloadWide(t *testing.T) {
+	test.SetForTest(t, &features.EnableGatewayAPIHTTPRouteAuth, true)
+
+	mixed := &authpb.AuthorizationPolicy{
+		Action: authpb.AuthorizationPolicy_ALLOW,
+		TargetRefs: []*selectorpb.PolicyTargetReference{
+			{Group: gvk.KubernetesGateway.Group, Kind: gvk.KubernetesGateway.Kind, Name: "gw"},
+			{Group: gvk.HTTPRoute.Group, Kind: gvk.HTTPRoute.Kind, Name: "route-a"},
+		},
+		Rules: []*authpb.Rule{{}},
+	}
+	policies := createFakeAuthorizationPolicies([]config.Config{newConfig("mixed", "foo", mixed)})
+
+	// Route scope: still indexed, so the test cannot pass by the policy vanishing entirely.
+	got := policies.ListAuthorizationPoliciesForHTTPRoute(types.NamespacedName{Name: "route-a", Namespace: "foo"})
+	if len(got.Allow) != 1 {
+		t.Fatalf("route scope: got %d allow policies, want 1", len(got.Allow))
+	}
+
+	// Workload scope: must not attach.
+	opts := WorkloadPolicyMatcher{
+		WorkloadNamespace: "foo",
+		WorkloadLabels:    labels.Instance{label.IoK8sNetworkingGatewayGatewayName.Name: "gw"},
+		RootNamespace:     "istio-config",
+	}
+	workload := policies.ListAuthorizationPolicies(opts)
+	if len(workload.Allow) != 0 {
+		t.Errorf("policy attached workload-wide: got %d allow policies, want 0", len(workload.Allow))
+	}
 }

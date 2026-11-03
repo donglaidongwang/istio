@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/security/pkg/pki/util"
-	"istio.io/pkg/log"
 )
 
 var (
@@ -32,22 +31,19 @@ var (
 	outCsr  = flag.String("out-csr", "csr.pem", "Output csr file.")
 	outPriv = flag.String("out-priv", "priv.pem", "Output private key file.")
 	keySize = flag.Int("key-size", 2048, "Size of the generated private key")
+	ec      = flag.String("ec-sig-alg", "", "Generate an elliptical curve private key with the specified algorithm")
+	curve   = flag.String("curve", "P256", "Specify the elliptic curve to use to generate an elliptical curve private key")
 )
 
-func fatalf(template string, args ...interface{}) {
-	log.Errorf(template, args...)
-	os.Exit(-1)
-}
-
 func saveCreds(csrPem []byte, privPem []byte) {
-	err := ioutil.WriteFile(*outCsr, csrPem, 0644)
+	err := os.WriteFile(*outCsr, csrPem, 0o644)
 	if err != nil {
-		fatalf("Could not write output certificate request: %s.", err)
+		log.Fatalf("Could not write output certificate request: %s.", err)
 	}
 
-	err = ioutil.WriteFile(*outPriv, privPem, 0600)
+	err = os.WriteFile(*outPriv, privPem, 0o600)
 	if err != nil {
-		fatalf("Could not write output private key: %s.", err)
+		log.Fatalf("Could not write output private key: %s.", err)
 	}
 }
 
@@ -58,10 +54,11 @@ func main() {
 		Host:       *host,
 		Org:        *org,
 		RSAKeySize: *keySize,
+		ECSigAlg:   util.SupportedECSignatureAlgorithms(*ec),
+		ECCCurve:   util.SupportedEllipticCurves(*curve),
 	})
-
 	if err != nil {
-		fatalf("Failed to generate CSR: %s.", err)
+		log.Fatalf("Failed to generate CSR: %s.", err)
 	}
 
 	saveCreds(csrPem, privPem)

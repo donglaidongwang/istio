@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,52 +15,43 @@
 package option_test
 
 import (
-	"encoding/base64"
-	"net"
 	"testing"
 	"time"
 
-	"github.com/gogo/protobuf/types"
 	. "github.com/onsi/gomega"
+	"google.golang.org/protobuf/types/known/durationpb"
 
-	meshAPI "istio.io/api/mesh/v1alpha1"
 	networkingAPI "istio.io/api/networking/v1alpha3"
-
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/bootstrap/option"
+	"istio.io/istio/pkg/model"
 )
 
+// nolint: lll
 func TestOptions(t *testing.T) {
 	cases := []struct {
 		testName    string
 		key         string
 		option      option.Instance
 		expectError bool
-		expected    interface{}
+		expected    any
 	}{
 		{
 			testName: "proxy config",
 			key:      "config",
-			option:   option.ProxyConfig(&meshAPI.ProxyConfig{DiscoveryAddress: "fake"}),
-			expected: &meshAPI.ProxyConfig{DiscoveryAddress: "fake"},
+			option:   option.ProxyConfig(&model.NodeMetaProxyConfig{DiscoveryAddress: "fake"}),
+			expected: &model.NodeMetaProxyConfig{DiscoveryAddress: "fake"},
 		},
 		{
 			testName: "pilotSAN",
 			key:      "pilot_SAN",
 			option:   option.PilotSubjectAltName([]string{"fake"}),
-			expected: []string{"fake"},
+			expected: `[{"exact":"fake"}]`,
 		},
 		{
-			testName: "mixerSAN",
-			key:      "MixerSubjectAltName",
-			option:   option.MixerSubjectAltName([]string{"fake"}),
-			expected: "fake",
-		},
-		{
-			testName: "mixerSAN empty",
-			key:      "MixerSubjectAltName",
-			option:   option.MixerSubjectAltName(make([]string, 0)),
-			expected: nil,
+			testName: "pilotSAN multi",
+			key:      "pilot_SAN",
+			option:   option.PilotSubjectAltName([]string{"fake", "other"}),
+			expected: `[{"exact":"fake"},{"exact":"other"}]`,
 		},
 		{
 			testName: "nil connect timeout",
@@ -71,7 +62,7 @@ func TestOptions(t *testing.T) {
 		{
 			testName: "connect timeout",
 			key:      "connect_timeout",
-			option:   option.ConnectTimeout(types.DurationProto(time.Second)),
+			option:   option.ConnectTimeout(durationpb.New(time.Second)),
 			expected: "1s",
 		},
 		{
@@ -113,9 +104,11 @@ func TestOptions(t *testing.T) {
 		{
 			testName: "node metadata",
 			key:      "meta_json_str",
-			option: option.NodeMetadata(&model.NodeMetadata{
-				IstioVersion: "fake",
-			}, map[string]interface{}{
+			option: option.NodeMetadata(&model.BootstrapNodeMetadata{
+				NodeMetadata: model.NodeMetadata{
+					IstioVersion: "fake",
+				},
+			}, map[string]any{
 				"key": "value",
 			}),
 			expected: "{\"ISTIO_VERSION\":\"fake\",\"key\":\"value\"}",
@@ -125,12 +118,6 @@ func TestOptions(t *testing.T) {
 			key:      "discovery_address",
 			option:   option.DiscoveryAddress("fake"),
 			expected: "fake",
-		},
-		{
-			testName: "dns refresh rate",
-			key:      "dns_refresh_rate",
-			option:   option.DNSRefreshRate("1s"),
-			expected: "1s",
 		},
 		{
 			testName: "localhost v4",
@@ -166,50 +153,15 @@ func TestOptions(t *testing.T) {
 			testName: "dns lookup family v6",
 			key:      "dns_lookup_family",
 			option:   option.DNSLookupFamily(option.DNSLookupFamilyIPv6),
-			expected: option.DNSLookupFamilyValue("AUTO"),
+			expected: option.DNSLookupFamilyValue("V6_ONLY"),
 		},
 		{
-			testName: "pod name",
-			key:      "PodName",
-			option:   option.PodName("fake"),
-			expected: "fake",
+			testName: "dns lookup family dual stack",
+			key:      "dns_lookup_family",
+			option:   option.DNSLookupFamily(option.DNSLookupFamilyIPS),
+			expected: option.DNSLookupFamilyValue("ALL"),
 		},
-		{
-			testName: "pod namespace",
-			key:      "PodNamespace",
-			option:   option.PodNamespace("fake"),
-			expected: "fake",
-		},
-		{
-			testName: "pod ip",
-			key:      "PodIP",
-			option:   option.PodIP(net.IPv4(127, 0, 0, 1)),
-			expected: base64.StdEncoding.EncodeToString(net.IPv4(127, 0, 0, 1)),
-		},
-		{
-			testName: "control plane auth true",
-			key:      "ControlPlaneAuth",
-			option:   option.ControlPlaneAuth(true),
-			expected: "enable",
-		},
-		{
-			testName: "control plane auth false",
-			key:      "ControlPlaneAuth",
-			option:   option.ControlPlaneAuth(false),
-			expected: nil,
-		},
-		{
-			testName: "disable report calls true",
-			key:      "DisableReportCalls",
-			option:   option.DisableReportCalls(true),
-			expected: "true",
-		},
-		{
-			testName: "disable report calls false",
-			key:      "DisableReportCalls",
-			option:   option.DisableReportCalls(false),
-			expected: nil,
-		},
+
 		{
 			testName: "lightstep address empty",
 			key:      "lightstep",
@@ -256,18 +208,6 @@ func TestOptions(t *testing.T) {
 			testName: "lightstep token",
 			key:      "lightstepToken",
 			option:   option.LightstepToken("fake"),
-			expected: "fake",
-		},
-		{
-			testName: "lightstep secure",
-			key:      "lightstepSecure",
-			option:   option.LightstepSecure(true),
-			expected: true,
-		},
-		{
-			testName: "lightstep CA cert path",
-			key:      "lightstepCacertPath",
-			option:   option.LightstepCACertPath("fake"),
 			expected: "fake",
 		},
 		{
@@ -519,16 +459,16 @@ func TestOptions(t *testing.T) {
 		{
 			testName: "envoy metrics tls nil",
 			key:      "envoy_metrics_service_tls",
-			option:   option.EnvoyMetricsServiceTLS(nil, &model.NodeMetadata{}),
+			option:   option.EnvoyMetricsServiceTLS(nil, &model.BootstrapNodeMetadata{}),
 			expected: nil,
 		},
 		{
 			testName: "envoy metrics tls",
 			key:      "envoy_metrics_service_tls",
-			option: option.EnvoyMetricsServiceTLS(&networkingAPI.TLSSettings{
-				Mode: networkingAPI.TLSSettings_ISTIO_MUTUAL,
-			}, &model.NodeMetadata{}),
-			expected: "{\"common_tls_context\":{\"tls_certificates\":[{\"certificate_chain\":{\"filename\":\"/etc/certs/root-cert.pem\"},\"private_key\":{\"filename\":\"/etc/certs/key.pem\"}}],\"validation_context\":{\"trusted_ca\":{\"filename\":\"/etc/certs/cert-chain.pem\"}},\"alpn_protocols\":[\"istio\",\"h2\"]},\"sni\":\"envoy_metrics_service\"}", // nolint: lll
+			option: option.EnvoyMetricsServiceTLS(&networkingAPI.ClientTLSSettings{
+				Mode: networkingAPI.ClientTLSSettings_ISTIO_MUTUAL,
+			}, &model.BootstrapNodeMetadata{}),
+			expected: `{"name":"envoy.transport_sockets.tls","typed_config":{"@type":"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext","common_tls_context":{"alpn_protocols":["istio","h2"],"combined_validation_context":{"default_validation_context":{},"validation_context_sds_secret_config":{"name":"ROOTCA","sds_config":{"api_config_source":{"api_type":"GRPC","grpc_services":[{"envoy_grpc":{"cluster_name":"sds-grpc"}}],"set_node_on_first_message_only":true,"transport_api_version":"V3"},"initial_fetch_timeout":"0s","resource_api_version":"V3"}}},"tls_certificate_sds_secret_configs":[{"name":"default","sds_config":{"api_config_source":{"api_type":"GRPC","grpc_services":[{"envoy_grpc":{"cluster_name":"sds-grpc"}}],"set_node_on_first_message_only":true,"transport_api_version":"V3"},"initial_fetch_timeout":"0s","resource_api_version":"V3"}}]},"sni":"envoy_metrics_service"}}`,
 		},
 		{
 			testName: "envoy metrics keepalive nil",
@@ -540,7 +480,7 @@ func TestOptions(t *testing.T) {
 			testName: "envoy metrics keepalive",
 			key:      "envoy_metrics_service_tcp_keepalive",
 			option: option.EnvoyMetricsServiceTCPKeepalive(&networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive{
-				Time: types.DurationProto(time.Second),
+				Time: durationpb.New(time.Second),
 			}),
 			expected: "{\"tcp_keepalive\":{\"keepalive_time\":{\"value\":1}}}",
 		},
@@ -589,16 +529,16 @@ func TestOptions(t *testing.T) {
 		{
 			testName: "envoy accesslog tls nil",
 			key:      "envoy_accesslog_service_tls",
-			option:   option.EnvoyAccessLogServiceTLS(nil, &model.NodeMetadata{}),
+			option:   option.EnvoyAccessLogServiceTLS(nil, &model.BootstrapNodeMetadata{}),
 			expected: nil,
 		},
 		{
 			testName: "envoy access log tls",
 			key:      "envoy_accesslog_service_tls",
-			option: option.EnvoyAccessLogServiceTLS(&networkingAPI.TLSSettings{
-				Mode: networkingAPI.TLSSettings_ISTIO_MUTUAL,
-			}, &model.NodeMetadata{}),
-			expected: "{\"common_tls_context\":{\"tls_certificates\":[{\"certificate_chain\":{\"filename\":\"/etc/certs/root-cert.pem\"},\"private_key\":{\"filename\":\"/etc/certs/key.pem\"}}],\"validation_context\":{\"trusted_ca\":{\"filename\":\"/etc/certs/cert-chain.pem\"}},\"alpn_protocols\":[\"istio\",\"h2\"]},\"sni\":\"envoy_accesslog_service\"}", // nolint: lll
+			option: option.EnvoyAccessLogServiceTLS(&networkingAPI.ClientTLSSettings{
+				Mode: networkingAPI.ClientTLSSettings_ISTIO_MUTUAL,
+			}, &model.BootstrapNodeMetadata{}),
+			expected: `{"name":"envoy.transport_sockets.tls","typed_config":{"@type":"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext","common_tls_context":{"alpn_protocols":["istio","h2"],"combined_validation_context":{"default_validation_context":{},"validation_context_sds_secret_config":{"name":"ROOTCA","sds_config":{"api_config_source":{"api_type":"GRPC","grpc_services":[{"envoy_grpc":{"cluster_name":"sds-grpc"}}],"set_node_on_first_message_only":true,"transport_api_version":"V3"},"initial_fetch_timeout":"0s","resource_api_version":"V3"}}},"tls_certificate_sds_secret_configs":[{"name":"default","sds_config":{"api_config_source":{"api_type":"GRPC","grpc_services":[{"envoy_grpc":{"cluster_name":"sds-grpc"}}],"set_node_on_first_message_only":true,"transport_api_version":"V3"},"initial_fetch_timeout":"0s","resource_api_version":"V3"}}]},"sni":"envoy_accesslog_service"}}`,
 		},
 		{
 			testName: "envoy access log keepalive nil",
@@ -610,7 +550,7 @@ func TestOptions(t *testing.T) {
 			testName: "envoy access log keepalive",
 			key:      "envoy_accesslog_service_tcp_keepalive",
 			option: option.EnvoyAccessLogServiceTCPKeepalive(&networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive{
-				Time: types.DurationProto(time.Second),
+				Time: durationpb.New(time.Second),
 			}),
 			expected: "{\"tcp_keepalive\":{\"keepalive_time\":{\"value\":1}}}",
 		},
@@ -669,22 +609,91 @@ func TestOptions(t *testing.T) {
 			expected: []string{"fake"},
 		},
 		{
-			testName: "sds uds path",
-			key:      "sds_uds_path",
-			option:   option.SDSUDSPath("fake"),
-			expected: "fake",
+			testName: "sts enabled",
+			key:      "sts",
+			option:   option.STSEnabled(true),
+			expected: true,
 		},
 		{
-			testName: "sds token path",
-			key:      "sds_token_path",
-			option:   option.SDSTokenPath("fake"),
-			expected: "fake",
+			testName: "sts port",
+			key:      "sts_port",
+			option:   option.STSPort(5555),
+			expected: 5555,
+		},
+		{
+			testName: "workload identity socket file",
+			key:      "workload_identity_socket_file",
+			option:   option.WorkloadIdentitySocketFile("sheboygan.sock"),
+			expected: "sheboygan.sock",
+		},
+		{
+			testName: "project id",
+			key:      "gcp_project_id",
+			option:   option.GCPProjectID("project"),
+			expected: "project",
+		},
+		{
+			testName: "tracing tls nil",
+			key:      "tracing_tls",
+			option:   option.TracingTLS(nil, &model.BootstrapNodeMetadata{}, false),
+			expected: nil,
+		},
+		{
+			testName: "tracing tls",
+			key:      "tracing_tls",
+			option: option.TracingTLS(&networkingAPI.ClientTLSSettings{
+				Mode:           networkingAPI.ClientTLSSettings_SIMPLE,
+				CaCertificates: "/etc/tracing/ca.pem",
+			}, &model.BootstrapNodeMetadata{}, false),
+			expected: `{"name":"envoy.transport_sockets.tls","typed_config":{"@type":"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext","common_tls_context":{"combined_validation_context":{"default_validation_context":{},"validation_context_sds_secret_config":{"name":"file-root:/etc/tracing/ca.pem","sds_config":{"api_config_source":{"api_type":"GRPC","grpc_services":[{"envoy_grpc":{"cluster_name":"sds-grpc"}}],"set_node_on_first_message_only":true,"transport_api_version":"V3"},"resource_api_version":"V3"}}}}}}`,
+		},
+		{
+			testName: "stats eviction interval normal",
+			key:      "stats_eviction_interval",
+			option:   option.EnvoyStatsEvictionInterval(durationpb.New(time.Second * 10)),
+			expected: "10s",
+		},
+		{
+			testName: "stats eviction interval fractional",
+			key:      "stats_eviction_interval",
+			option:   option.EnvoyStatsEvictionInterval(durationpb.New(time.Second*2 + time.Millisecond*5)),
+			expected: "2.005000000s",
+		},
+		{
+			testName: "stats eviction interval longer than 60s",
+			key:      "stats_eviction_interval",
+			option:   option.EnvoyStatsEvictionInterval(durationpb.New(time.Second * 120)),
+			expected: "120s",
+		},
+		{
+			testName: "secure metrics port zero skipped",
+			key:      "secure_metrics_port",
+			option:   option.SecureMetricsPort(0),
+			expected: nil,
+		},
+		{
+			testName: "secure metrics port non-zero",
+			key:      "secure_metrics_port",
+			option:   option.SecureMetricsPort(15091),
+			expected: 15091,
+		},
+		{
+			testName: "secure merged metrics port zero skipped",
+			key:      "secure_merged_metrics_port",
+			option:   option.SecureMergedMetricsPort(0),
+			expected: nil,
+		},
+		{
+			testName: "secure merged metrics port non-zero",
+			key:      "secure_merged_metrics_port",
+			option:   option.SecureMergedMetricsPort(15092),
+			expected: 15092,
 		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.testName, func(t *testing.T) {
-			g := NewGomegaWithT(t)
+			g := NewWithT(t)
 
 			params, err := option.NewTemplateParams(c.option)
 			if c.expectError {

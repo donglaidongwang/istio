@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,72 +15,55 @@
 package kube
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	envoyAdmin "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	"google.golang.org/protobuf/proto"
+	corev1 "k8s.io/api/core/v1"
 
+	// Import all XDS config types
+	_ "istio.io/istio/pkg/config/xds"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
-	"istio.io/istio/pkg/test/framework/components/echo/common"
-	"istio.io/istio/pkg/test/kube"
 	"istio.io/istio/pkg/test/util/retry"
-
-	kubeCore "k8s.io/api/core/v1"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 const (
 	proxyContainerName = "istio-proxy"
-	proxyAdminPort     = 15000
+
+	// DefaultTimeout the default timeout for the entire retry operation
+	defaultConfigTimeout = time.Second * 30
+
+	// DefaultDelay the default delay between successive retry attempts
+	defaultConfigDelay = time.Millisecond * 100
 )
 
 var _ echo.Sidecar = &sidecar{}
 
 type sidecar struct {
-	nodeID       string
 	podNamespace string
 	podName      string
-	accessor     *kube.Accessor
+	cluster      cluster.Cluster
 }
 
-func newSidecar(pod kubeCore.Pod, accessor *kube.Accessor) (*sidecar, error) {
+func newSidecar(pod corev1.Pod, cluster cluster.Cluster) *sidecar {
 	sidecar := &sidecar{
 		podNamespace: pod.Namespace,
 		podName:      pod.Name,
-		accessor:     accessor,
+		cluster:      cluster,
 	}
 
-	// Extract the node ID from Envoy.
-	if err := sidecar.WaitForConfig(func(cfg *envoyAdmin.ConfigDump) (bool, error) {
-		for _, c := range cfg.Configs {
-			if c.TypeUrl == "type.googleapis.com/envoy.admin.v2alpha.BootstrapConfigDump" {
-				cd := envoyAdmin.BootstrapConfigDump{}
-				if err := ptypes.UnmarshalAny(c, &cd); err != nil {
-					return false, err
-				}
-
-				sidecar.nodeID = cd.Bootstrap.Node.Id
-				return true, nil
-			}
-		}
-		return false, errors.New("envoy Bootstrap not found in config dump")
-	}); err != nil {
-		return nil, err
-	}
-
-	return sidecar, nil
+	return sidecar
 }
 
-func (s *sidecar) NodeID() string {
-	return s.nodeID
-}
-
-func (s *sidecar) Info() (*envoyAdmin.ServerInfo, error) {
-	msg := &envoyAdmin.ServerInfo{}
+func (s *sidecar) Info() (*admin.ServerInfo, error) {
+	msg := &admin.ServerInfo{}
 	if err := s.adminRequest("server_info", msg); err != nil {
 		return nil, err
 	}
@@ -88,7 +71,7 @@ func (s *sidecar) Info() (*envoyAdmin.ServerInfo, error) {
 	return msg, nil
 }
 
-func (s *sidecar) InfoOrFail(t test.Failer) *envoyAdmin.ServerInfo {
+func (s *sidecar) InfoOrFail(t test.Failer) *admin.ServerInfo {
 	t.Helper()
 	info, err := s.Info()
 	if err != nil {
@@ -97,8 +80,8 @@ func (s *sidecar) InfoOrFail(t test.Failer) *envoyAdmin.ServerInfo {
 	return info
 }
 
-func (s *sidecar) Config() (*envoyAdmin.ConfigDump, error) {
-	msg := &envoyAdmin.ConfigDump{}
+func (s *sidecar) Config() (*admin.ConfigDump, error) {
+	msg := &admin.ConfigDump{}
 	if err := s.adminRequest("config_dump", msg); err != nil {
 		return nil, err
 	}
@@ -106,7 +89,7 @@ func (s *sidecar) Config() (*envoyAdmin.ConfigDump, error) {
 	return msg, nil
 }
 
-func (s *sidecar) ConfigOrFail(t test.Failer) *envoyAdmin.ConfigDump {
+func (s *sidecar) ConfigOrFail(t test.Failer) *admin.ConfigDump {
 	t.Helper()
 	cfg, err := s.Config()
 	if err != nil {
@@ -115,19 +98,63 @@ func (s *sidecar) ConfigOrFail(t test.Failer) *envoyAdmin.ConfigDump {
 	return cfg
 }
 
-func (s *sidecar) WaitForConfig(accept func(*envoyAdmin.ConfigDump) (bool, error), options ...retry.Option) error {
-	return common.WaitForConfig(s.Config, accept, options...)
+func (s *sidecar) WaitForConfig(accept func(*admin.ConfigDump) (bool, error), options ...retry.Option) error {
+	options = append([]retry.Option{retry.BackoffDelay(defaultConfigDelay), retry.Timeout(defaultConfigTimeout)}, options...)
+
+	var cfg *admin.ConfigDump
+	_, err := retry.UntilComplete(func() (result any, completed bool, err error) {
+		cfg, err = s.Config()
+		if err != nil {
+			if strings.Contains(err.Error(), "could not resolve Any message type") {
+				// Unable to parse an Any in the message, likely due to missing imports.
+				// This is not a recoverable error.
+				return nil, true, nil
+			}
+			if strings.Contains(err.Error(), `Any JSON doesn't have '@type'`) {
+				// Unable to parse an Any in the message, likely due to an older version.
+				// This is not a recoverable error.
+				return nil, true, nil
+			}
+			return nil, false, err
+		}
+
+		accepted, err := accept(cfg)
+		if err != nil {
+			// Accept returned an error - retry.
+			return nil, false, err
+		}
+
+		if accepted {
+			// The configuration was accepted.
+			return nil, true, nil
+		}
+
+		// The configuration was rejected, don't try again.
+		return nil, true, errors.New("envoy config rejected")
+	}, options...)
+	if err != nil {
+		configDumpStr := "nil"
+		if cfg != nil {
+			b, err := protomarshal.MarshalIndent(cfg, "  ")
+			if err == nil {
+				configDumpStr = string(b)
+			}
+		}
+
+		return fmt.Errorf("failed waiting for Envoy configuration: %v. Last config_dump:\n%s", err, configDumpStr)
+	}
+	return nil
 }
 
-func (s *sidecar) WaitForConfigOrFail(t test.Failer, accept func(*envoyAdmin.ConfigDump) (bool, error), options ...retry.Option) {
+func (s *sidecar) WaitForConfigOrFail(t test.Failer, accept func(*admin.ConfigDump) (bool, error), options ...retry.Option) {
 	t.Helper()
 	if err := s.WaitForConfig(accept, options...); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func (s *sidecar) Clusters() (*envoyAdmin.Clusters, error) {
-	msg := &envoyAdmin.Clusters{}
+func (s *sidecar) Clusters() (*admin.Clusters, error) {
+	msg := &admin.Clusters{}
 	if err := s.adminRequest("clusters?format=json", msg); err != nil {
 		return nil, err
 	}
@@ -135,7 +162,7 @@ func (s *sidecar) Clusters() (*envoyAdmin.Clusters, error) {
 	return msg, nil
 }
 
-func (s *sidecar) ClustersOrFail(t test.Failer) *envoyAdmin.Clusters {
+func (s *sidecar) ClustersOrFail(t test.Failer) *admin.Clusters {
 	t.Helper()
 	clusters, err := s.Clusters()
 	if err != nil {
@@ -144,8 +171,8 @@ func (s *sidecar) ClustersOrFail(t test.Failer) *envoyAdmin.Clusters {
 	return clusters
 }
 
-func (s *sidecar) Listeners() (*envoyAdmin.Listeners, error) {
-	msg := &envoyAdmin.Listeners{}
+func (s *sidecar) Listeners() (*admin.Listeners, error) {
+	msg := &admin.Listeners{}
 	if err := s.adminRequest("listeners?format=json", msg); err != nil {
 		return nil, err
 	}
@@ -153,7 +180,7 @@ func (s *sidecar) Listeners() (*envoyAdmin.Listeners, error) {
 	return msg, nil
 }
 
-func (s *sidecar) ListenersOrFail(t test.Failer) *envoyAdmin.Listeners {
+func (s *sidecar) ListenersOrFail(t test.Failer) *admin.Listeners {
 	t.Helper()
 	listeners, err := s.Listeners()
 	if err != nil {
@@ -164,22 +191,21 @@ func (s *sidecar) ListenersOrFail(t test.Failer) *envoyAdmin.Listeners {
 
 func (s *sidecar) adminRequest(path string, out proto.Message) error {
 	// Exec onto the pod and make a curl request to the admin port, writing
-	command := fmt.Sprintf("curl http://127.0.0.1:%d/%s", proxyAdminPort, path)
-	response, err := s.accessor.Exec(s.podNamespace, s.podName, proxyContainerName, command)
+	command := fmt.Sprintf("pilot-agent request GET %s", path)
+	stdout, stderr, err := s.cluster.PodExec(s.podName, s.podNamespace, proxyContainerName, command)
 	if err != nil {
 		return fmt.Errorf("failed exec on pod %s/%s: %v. Command: %s. Output:\n%s",
-			s.podNamespace, s.podName, err, command, response)
+			s.podNamespace, s.podName, err, command, stdout+stderr)
 	}
 
-	jspb := jsonpb.Unmarshaler{AllowUnknownFields: true}
-	if err := jspb.Unmarshal(strings.NewReader(response), out); err != nil {
-		return fmt.Errorf("failed parsing Envoy admin response from '/%s': %v\nResponse JSON: %s", path, err, response)
+	if err := protomarshal.UnmarshalAllowUnknown([]byte(stdout), out); err != nil {
+		return fmt.Errorf("failed parsing Envoy admin response from '/%s': %v\nResponse JSON: %s", path, err, stdout)
 	}
 	return nil
 }
 
 func (s *sidecar) Logs() (string, error) {
-	return s.accessor.Logs(s.podNamespace, s.podName, proxyContainerName, false)
+	return s.cluster.PodLogs(context.TODO(), s.podName, s.podNamespace, proxyContainerName, false)
 }
 
 func (s *sidecar) LogsOrFail(t test.Failer) string {

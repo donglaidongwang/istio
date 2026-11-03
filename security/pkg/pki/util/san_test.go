@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ package util
 import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"net"
+	"net/netip"
 	"reflect"
 	"testing"
 )
 
-func getSANExtension(identites []Identity, t *testing.T) *pkix.Extension {
-	ext, err := BuildSANExtension(identites)
+func getSANExtension(identities []Identity, t *testing.T) *pkix.Extension {
+	ext, err := BuildSANExtension(identities)
 	if err != nil {
 		t.Errorf("A unexpected error has been encountered (error: %v)", err)
 	}
@@ -32,7 +32,7 @@ func getSANExtension(identites []Identity, t *testing.T) *pkix.Extension {
 
 func TestBuildSubjectAltNameExtension(t *testing.T) {
 	uriIdentity := Identity{Type: TypeURI, Value: []byte("spiffe://test.domain.com/ns/default/sa/default")}
-	ipIdentity := Identity{Type: TypeIP, Value: net.ParseIP("10.0.0.1").To4()}
+	ipIdentity := Identity{Type: TypeIP, Value: netip.MustParseAddr("10.0.0.1").AsSlice()}
 	dnsIdentity := Identity{Type: TypeDNS, Value: []byte("test.domain.com")}
 
 	testCases := map[string]struct {
@@ -77,16 +77,16 @@ func TestBuildAndExtractIdentities(t *testing.T) {
 		t.Errorf("A unexpected error has been encountered (error: %v)", err)
 	}
 
-	actualIds, err := ExtractIDsFromSAN(san)
+	actualIDs, err := ExtractIDsFromSAN(san)
 	if err != nil {
 		t.Errorf("A unexpected error has been encountered (error: %v)", err)
 	}
 
-	if !reflect.DeepEqual(actualIds, ids) {
-		t.Errorf("Unmatched identities: before encoding: %v, after decoding %v", ids, actualIds)
+	if !reflect.DeepEqual(actualIDs, ids) {
+		t.Errorf("Unmatched identities: before encoding: %v, after decoding %v", ids, actualIDs)
 	}
 
-	if san.Critical == false {
+	if !san.Critical {
 		t.Errorf("SAN field is not critical.")
 	}
 }
@@ -109,7 +109,7 @@ func TestExtractIDsFromSANWithError(t *testing.T) {
 		},
 		"Wrong encoding": {
 			ext: &pkix.Extension{
-				Id:    oidSubjectAlternativeName,
+				Id:    OidSubjectAlternativeName,
 				Value: []byte("bad value"),
 			},
 		},
@@ -124,7 +124,7 @@ func TestExtractIDsFromSANWithError(t *testing.T) {
 
 func TestExtractIDsFromSANWithBadEncoding(t *testing.T) {
 	ext := &pkix.Extension{
-		Id:    oidSubjectAlternativeName,
+		Id:    OidSubjectAlternativeName,
 		Value: []byte("bad value"),
 	}
 

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,163 +15,225 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
-	"strings"
-
-	"istio.io/istio/tools/istio-iptables/pkg/config"
-	"istio.io/istio/tools/istio-iptables/pkg/constants"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/flag"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/tools/common/config"
+	"istio.io/istio/tools/common/tproxy"
+	"istio.io/istio/tools/istio-iptables/pkg/capture"
+	"istio.io/istio/tools/istio-iptables/pkg/constants"
+	dep "istio.io/istio/tools/istio-iptables/pkg/dependencies"
+	"istio.io/istio/tools/istio-iptables/pkg/validation"
+	nftables "istio.io/istio/tools/istio-nftables/pkg/nft"
 )
 
-var rootCmd = &cobra.Command{
-	Use:  "istio-iptables",
-	Long: "Script responsible for setting up port forwarding for Istio sidecar.",
-	Run: func(cmd *cobra.Command, args []string) {
-		config := constructConfig()
-		run(config)
-	},
+const InvalidDropByIptables = "INVALID_DROP"
+
+func handleErrorWithCode(err error, code int) {
+	log.Error(err)
+	os.Exit(code)
 }
 
-func constructConfig() *config.Config {
-	return &config.Config{
-		ProxyPort:               viper.GetString(constants.EnvoyPort),
-		InboundCapturePort:      viper.GetString(constants.InboundCapturePort),
-		ProxyUID:                viper.GetString(constants.ProxyUID),
-		ProxyGID:                viper.GetString(constants.ProxyGID),
-		InboundInterceptionMode: viper.GetString(constants.InboundInterceptionMode),
-		InboundTProxyMark:       viper.GetString(constants.InboundTProxyMark),
-		InboundTProxyRouteTable: viper.GetString(constants.InboundTProxyRouteTable),
-		InboundPortsInclude:     viper.GetString(constants.InboundPorts),
-		InboundPortsExclude:     viper.GetString(constants.LocalExcludePorts),
-		OutboundPortsExclude:    viper.GetString(constants.LocalOutboundPortsExclude),
-		OutboundIPRangesInclude: viper.GetString(constants.ServiceCidr),
-		OutboundIPRangesExclude: viper.GetString(constants.ServiceExcludeCidr),
-		KubevirtInterfaces:      viper.GetString(constants.KubeVirtInterfaces),
-		DryRun:                  viper.GetBool(constants.DryRun),
-		EnableInboundIPv6s:      nil,
-	}
-}
+func bindCmdlineFlags(cfg *config.Config, cmd *cobra.Command) {
+	fs := cmd.Flags()
+	flag.Bind(fs, constants.EnvoyPort, "p", "Specify the envoy port to which redirect all TCP traffic.", &cfg.ProxyPort)
 
-func handleError(err error) {
-	log.Errora(err)
-	os.Exit(1)
-}
+	flag.BindEnv(fs, constants.InboundCapturePort, "z",
+		"Port to which all inbound TCP traffic to the pod/VM should be redirected to.",
+		&cfg.InboundCapturePort)
 
-func init() {
-	// Read in all environment variables
-	viper.AutomaticEnv()
-	// Replace - with _; so that environment variables are looked up correctly.
-	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	flag.BindEnv(fs, constants.InboundTunnelPort, "e",
+		"Specify the istio tunnel port for inbound tcp traffic.",
+		&cfg.InboundTunnelPort)
 
-	var envoyPort = "15001"
-	var inboundPort = "15006"
+	flag.BindEnv(fs, constants.ProxyUID, "u",
+		"Specify the UID of the user for which the redirection is not applied. Typically, this is the UID of the proxy container.",
+		&cfg.ProxyUID)
 
-	rootCmd.Flags().StringP(constants.EnvoyPort, "p", "", "Specify the envoy port to which redirect all TCP traffic (default $ENVOY_PORT = 15001)")
-	if err := viper.BindPFlag(constants.EnvoyPort, rootCmd.Flags().Lookup(constants.EnvoyPort)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.EnvoyPort, envoyPort)
+	flag.BindEnv(fs, constants.ProxyGID, "g",
+		"Specify the GID of the user for which the redirection is not applied (same default value as -u param).",
+		&cfg.ProxyGID)
 
-	rootCmd.Flags().StringP(constants.InboundCapturePort, "z", "",
-		"Port to which all inbound TCP traffic to the pod/VM should be redirected to (default $INBOUND_CAPTURE_PORT = 15006)")
-	if err := viper.BindPFlag(constants.InboundCapturePort, rootCmd.Flags().Lookup(constants.InboundCapturePort)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.InboundCapturePort, inboundPort)
+	flag.BindEnv(fs, constants.InboundInterceptionMode, "m",
+		"The mode used to redirect inbound connections to Envoy, either \"REDIRECT\" or \"TPROXY\".",
+		&cfg.InboundInterceptionMode)
 
-	rootCmd.Flags().StringP(constants.ProxyUID, "u", "",
-		"Specify the UID of the user for which the redirection is not applied. Typically, this is the UID of the proxy container")
-	if err := viper.BindPFlag(constants.ProxyUID, rootCmd.Flags().Lookup(constants.ProxyUID)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.ProxyUID, "")
-
-	rootCmd.Flags().StringP(constants.ProxyGID, "g", "",
-		"Specify the GID of the user for which the redirection is not applied. (same default value as -u param)")
-	if err := viper.BindPFlag(constants.ProxyGID, rootCmd.Flags().Lookup(constants.ProxyGID)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.ProxyGID, "")
-
-	rootCmd.Flags().StringP(constants.InboundInterceptionMode, "m", "",
-		"The mode used to redirect inbound connections to Envoy, either \"REDIRECT\" or \"TPROXY\"")
-	if err := viper.BindPFlag(constants.InboundInterceptionMode, rootCmd.Flags().Lookup(constants.InboundInterceptionMode)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.InboundInterceptionMode, "")
-
-	rootCmd.Flags().StringP(constants.InboundPorts, "b", "",
+	flag.BindEnv(fs, constants.InboundPorts, "b",
 		"Comma separated list of inbound ports for which traffic is to be redirected to Envoy (optional). "+
-			"The wildcard character \"*\" can be used to configure redirection for all ports. An empty list will disable")
-	if err := viper.BindPFlag(constants.InboundPorts, rootCmd.Flags().Lookup(constants.InboundPorts)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.InboundPorts, "")
+			"The wildcard character \"*\" can be used to configure redirection for all ports. An empty list will disable.",
+		&cfg.InboundPortsInclude)
 
-	rootCmd.Flags().StringP(constants.LocalExcludePorts, "d", "",
+	flag.BindEnv(fs, constants.LocalExcludePorts, "d",
 		"Comma separated list of inbound ports to be excluded from redirection to Envoy (optional). "+
-			"Only applies  when all inbound traffic (i.e. \"*\") is being redirected (default to $ISTIO_LOCAL_EXCLUDE_PORTS)")
-	if err := viper.BindPFlag(constants.LocalExcludePorts, rootCmd.Flags().Lookup(constants.LocalExcludePorts)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.LocalExcludePorts, "")
+			"Only applies when all inbound traffic (i.e. \"*\") is being redirected.",
+		&cfg.InboundPortsExclude)
 
-	rootCmd.Flags().StringP(constants.ServiceCidr, "i", "",
+	flag.BindEnv(fs, constants.ExcludeInterfaces, "c",
+		"Comma separated list of NIC (optional). Neither inbound nor outbound traffic will be captured.",
+		&cfg.ExcludeInterfaces)
+
+	flag.BindEnv(fs, constants.ServiceCidr, "i",
 		"Comma separated list of IP ranges in CIDR form to redirect to envoy (optional). "+
-			"The wildcard character \"*\" can be used to redirect all outbound traffic. An empty list will disable all outbound")
-	if err := viper.BindPFlag(constants.ServiceCidr, rootCmd.Flags().Lookup(constants.ServiceCidr)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.ServiceCidr, "")
+			"The wildcard character \"*\" can be used to redirect all outbound traffic. An empty list will disable all outbound.",
+		&cfg.OutboundIPRangesInclude)
 
-	rootCmd.Flags().StringP(constants.ServiceExcludeCidr, "x", "",
+	flag.BindEnv(fs, constants.ServiceExcludeCidr, "x",
 		"Comma separated list of IP ranges in CIDR form to be excluded from redirection. "+
-			"Only applies when all  outbound traffic (i.e. \"*\") is being redirected (default to $ISTIO_SERVICE_EXCLUDE_CIDR)")
-	if err := viper.BindPFlag(constants.ServiceExcludeCidr, rootCmd.Flags().Lookup(constants.ServiceExcludeCidr)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.ServiceExcludeCidr, "")
+			"Only applies when all  outbound traffic (i.e. \"*\") is being redirected.",
+		&cfg.OutboundIPRangesExclude)
 
-	rootCmd.Flags().StringP(constants.LocalOutboundPortsExclude, "o", "",
-		"Comma separated list of outbound ports to be excluded from redirection to Envoy")
-	if err := viper.BindPFlag(constants.LocalOutboundPortsExclude, rootCmd.Flags().Lookup(constants.LocalOutboundPortsExclude)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.LocalOutboundPortsExclude, "")
+	flag.BindEnv(fs, constants.OutboundPorts, "q",
+		"Comma separated list of outbound ports to be explicitly included for redirection to Envoy.",
+		&cfg.OutboundPortsInclude)
 
-	rootCmd.Flags().StringP(constants.KubeVirtInterfaces, "k", "",
-		"Comma separated list of virtual interfaces whose inbound traffic (from VM) will be treated as outbound")
-	if err := viper.BindPFlag(constants.KubeVirtInterfaces, rootCmd.Flags().Lookup(constants.KubeVirtInterfaces)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.KubeVirtInterfaces, "")
+	flag.BindEnv(fs, constants.LocalOutboundPortsExclude, "o",
+		"Comma separated list of outbound ports to be excluded from redirection to Envoy.",
+		&cfg.OutboundPortsExclude)
 
-	rootCmd.Flags().StringP(constants.InboundTProxyMark, "t", "", "")
-	if err := viper.BindPFlag(constants.InboundTProxyMark, rootCmd.Flags().Lookup(constants.InboundTProxyMark)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.InboundTProxyMark, "1337")
+	flag.BindEnv(fs, constants.RerouteVirtualInterfaces, "k",
+		"Comma separated list of virtual interfaces whose inbound traffic (from VM) will be treated as outbound.",
+		&cfg.RerouteVirtualInterfaces)
 
-	rootCmd.Flags().StringP(constants.InboundTProxyRouteTable, "r", "", "")
-	if err := viper.BindPFlag(constants.InboundTProxyRouteTable, rootCmd.Flags().Lookup(constants.InboundTProxyRouteTable)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.InboundTProxyRouteTable, "133")
+	flag.BindEnv(fs, constants.InboundTProxyMark, "t", "", &cfg.InboundTProxyMark)
 
-	rootCmd.Flags().BoolP(constants.DryRun, "n", true, "Do not call any external dependencies like iptables")
-	if err := viper.BindPFlag(constants.DryRun, rootCmd.Flags().Lookup(constants.DryRun)); err != nil {
-		handleError(err)
-	}
-	viper.SetDefault(constants.DryRun, false)
+	flag.BindEnv(fs, constants.InboundTProxyRouteTable, "r", "", &cfg.InboundTProxyRouteTable)
+
+	flag.BindEnv(fs, constants.DryRun, "n", "Do not call any external dependencies like iptables.",
+		&cfg.DryRun)
+
+	flag.BindEnv(fs, constants.IptablesProbePort, "", "Set listen port for failure detection.", &cfg.IptablesProbePort)
+
+	flag.BindEnv(fs, constants.ProbeTimeout, "", "Failure detection timeout.", &cfg.ProbeTimeout)
+
+	flag.BindEnv(fs, constants.SkipRuleApply, "", "Skip iptables apply.", &cfg.SkipRuleApply)
+
+	flag.BindEnv(fs, constants.RunValidation, "", "Validate iptables.", &cfg.RunValidation)
+
+	flag.BindEnv(fs, constants.RedirectDNS, "", "Enable capture of dns traffic by istio-agent.", &cfg.RedirectDNS)
+	// Allow binding to a different var, for consistency with other components
+	flag.AdditionalEnv(fs, constants.RedirectDNS, "ISTIO_META_DNS_CAPTURE")
+
+	flag.BindEnv(fs, constants.DropInvalid, "", "Enable invalid drop in the iptables rules.", &cfg.DropInvalid)
+	// This could have just used the default but for backwards compat we support the old env.
+	flag.AdditionalEnv(fs, constants.DropInvalid, InvalidDropByIptables)
+
+	flag.BindEnv(fs, constants.DualStack, "", "Enable ipv4/ipv6 redirects for dual-stack.", &cfg.DualStack)
+	// Allow binding to a different var, for consistency with other components
+	flag.AdditionalEnv(fs, constants.DualStack, "ISTIO_DUAL_STACK")
+
+	flag.BindEnv(fs, constants.CaptureAllDNS, "",
+		"Instead of only capturing DNS traffic to DNS server IP, capture all DNS traffic at port 53. This setting is only effective when redirect dns is enabled.",
+		&cfg.CaptureAllDNS)
+
+	flag.BindEnv(fs, constants.NetworkNamespace, "", "The network namespace that iptables rules should be applied to.",
+		&cfg.NetworkNamespace)
+
+	flag.BindEnv(fs, constants.CNIMode, "", "Whether to run as CNI plugin.", &cfg.HostFilesystemPodNetwork)
+
+	flag.BindEnv(fs, constants.Reconcile, "", "Reconcile pre-existing and incompatible iptables rules instead of failing if drift is detected.",
+		&cfg.Reconcile)
+
+	flag.BindEnv(fs, constants.CleanupOnly, "", "Perform a forced cleanup without creating new iptables chains or rules.",
+		&cfg.CleanupOnly)
+
+	// This flag is a safety measure in case the idempotency changes of #50328 backfire.
+	// Allow bypassing of iptables idempotency handling, and attempts to apply iptables rules regardless of table state, which may cause unrecoverable failures.
+	// Consider removing it after several releases with no reported issues.
+	flag.BindEnv(fs, constants.ForceApply, "", "Apply iptables changes even if they appear to already be in place.",
+		&cfg.ForceApply)
+
+	// This mode is an alternative for iptables. It uses nftables rules for traffic redirection.
+	flag.BindEnv(fs, constants.NativeNftables, "", "Use native nftables instead of iptables rules.",
+		&cfg.NativeNftables)
+
+	// This allows the user to specify the iptables version to use.
+	flag.BindEnv(fs, constants.ForceIptablesBinary, "", "Break glass option to choose which iptables binary to use.",
+		&cfg.ForceIptablesBinary)
 }
 
-func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		log.Errora(err)
-		os.Exit(1)
+func GetCommand(logOpts *log.Options) *cobra.Command {
+	cfg := config.DefaultConfig()
+	cmd := &cobra.Command{
+		Use:   "istio-iptables",
+		Short: "Set up iptables rules for Istio Sidecar",
+		Long:  "istio-iptables is responsible for setting up port forwarding for Istio Sidecar.",
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			if err := log.Configure(logOpts); err != nil {
+				return err
+			}
+			return nil
+		},
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := cfg.FillConfigFromEnvironment(); err != nil {
+				handleErrorWithCode(err, 1)
+			}
+			if err := cfg.Validate(); err != nil {
+				handleErrorWithCode(err, 1)
+			}
+			runMethod := ProgramIptables
+
+			// If nftables is enabled, use nft rules for traffic redirection.
+			if cfg.NativeNftables {
+				runMethod = nftables.ProgramNftables
+			}
+
+			if err := runMethod(cfg); err != nil {
+				handleErrorWithCode(err, 1)
+			}
+
+			if cfg.RunValidation {
+				validator := validation.NewValidator(cfg)
+
+				if err := validator.Run(); err != nil {
+					// nolint: revive, stylecheck
+					msg := fmt.Errorf(`iptables validation failed; workload is not ready for Istio.
+When using Istio CNI, this can occur if a pod is scheduled before the node is ready.
+
+If installed with 'cni.repair.deletePods=true', this pod should automatically be deleted and retry.
+Otherwise, this pod will need to be manually removed so that it is scheduled on a node with istio-cni running, allowing iptables rules to be established.
+`)
+					handleErrorWithCode(msg, constants.ValidationErrorCode)
+				}
+			}
+		},
 	}
+	bindCmdlineFlags(cfg, cmd)
+	return cmd
+}
+
+type IptablesError struct {
+	Error    error
+	ExitCode int
+}
+
+func ProgramIptables(cfg *config.Config) error {
+	var ext dep.Dependencies
+	if cfg.DryRun {
+		log.Info("running iptables in dry-run mode, no rule changes will be made")
+		ext = &dep.DependenciesStub{}
+	} else {
+		ext = &dep.RealDependencies{
+			UsePodScopedXtablesLock: cfg.HostFilesystemPodNetwork,
+			NetworkNamespace:        cfg.NetworkNamespace,
+			ForceIptablesBinary:     cfg.ForceIptablesBinary,
+		}
+	}
+
+	if !cfg.SkipRuleApply {
+		iptConfigurator, err := capture.NewIptablesConfigurator(cfg, ext)
+		if err != nil {
+			return err
+		}
+		if err := iptConfigurator.Run(); err != nil {
+			return err
+		}
+		if err := tproxy.ConfigureRoutes(cfg); err != nil {
+			return fmt.Errorf("failed to configure routes: %v", err)
+		}
+	}
+	return nil
 }

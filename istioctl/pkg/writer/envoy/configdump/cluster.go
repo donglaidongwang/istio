@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,10 +21,12 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	"sigs.k8s.io/yaml"
 
-	protio "istio.io/istio/istioctl/pkg/util/proto"
+	"istio.io/istio/istioctl/pkg/util/proto"
 	"istio.io/istio/pilot/pkg/model"
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 	"istio.io/istio/pkg/config/host"
 )
 
@@ -37,7 +39,7 @@ type ClusterFilter struct {
 }
 
 // Verify returns true if the passed cluster matches the filter fields
-func (c *ClusterFilter) Verify(cluster *xdsapi.Cluster) bool {
+func (c *ClusterFilter) Verify(cluster *cluster.Cluster) bool {
 	name := cluster.Name
 	if c.FQDN == "" && c.Port == 0 && c.Subset == "" && c.Direction == "" {
 		return true
@@ -66,17 +68,35 @@ func (c *ConfigWriter) PrintClusterSummary(filter ClusterFilter) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintln(w, "SERVICE FQDN\tPORT\tSUBSET\tDIRECTION\tTYPE")
-	for _, cluster := range clusters {
-		if filter.Verify(cluster) {
-			if len(strings.Split(cluster.Name, "|")) > 3 {
-				direction, subset, fqdn, port := model.ParseSubsetKey(cluster.Name)
+	if includeConfigType {
+		_, _ = fmt.Fprintln(w, "NAME\tSERVICE FQDN\tPORT\tSUBSET\tDIRECTION\tTYPE\tDESTINATION RULE")
+	} else {
+		_, _ = fmt.Fprintln(w, "SERVICE FQDN\tPORT\tSUBSET\tDIRECTION\tTYPE\tDESTINATION RULE")
+	}
+	for _, c := range clusters {
+		if filter.Verify(c) {
+			if len(strings.Split(c.Name, "|")) > 3 {
+				direction, subset, fqdn, port := model.ParseSubsetKey(c.Name)
 				if subset == "" {
 					subset = "-"
 				}
-				_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%s\n", fqdn, port, subset, direction, cluster.GetType())
+				if includeConfigType {
+					c.Name = fmt.Sprintf("cluster/%s", c.Name)
+					_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%s\t%s\n", c.Name, fqdn, port, subset, direction, c.GetType(),
+						describeManagement(c.GetMetadata()))
+				} else {
+					_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%s\t%s\n", fqdn, port, subset, direction, c.GetType(),
+						describeManagement(c.GetMetadata()))
+				}
 			} else {
-				_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%s\n", cluster.Name, "-", "-", "-", cluster.GetType())
+				if includeConfigType && len(c.Name) > 0 {
+					c.Name = fmt.Sprintf("cluster/%s", c.Name)
+					_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%s\t%s\n", c.Name, c.Name, "-", "-", "-", c.GetType(),
+						describeManagement(c.GetMetadata()))
+				} else {
+					_, _ = fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%s\t%s\n", c.Name, "-", "-", "-", c.GetType(),
+						describeManagement(c.GetMetadata()))
+				}
 			}
 		}
 	}
@@ -84,12 +104,12 @@ func (c *ConfigWriter) PrintClusterSummary(filter ClusterFilter) error {
 }
 
 // PrintClusterDump prints the relevant clusters in the config dump to the ConfigWriter stdout
-func (c *ConfigWriter) PrintClusterDump(filter ClusterFilter) error {
+func (c *ConfigWriter) PrintClusterDump(filter ClusterFilter, outputFormat string) error {
 	_, clusters, err := c.setupClusterConfigWriter()
 	if err != nil {
 		return err
 	}
-	filteredClusters := protio.MessageSlice{}
+	filteredClusters := make(proto.MessageSlice, 0, len(clusters))
 	for _, cluster := range clusters {
 		if filter.Verify(cluster) {
 			filteredClusters = append(filteredClusters, cluster)
@@ -99,11 +119,16 @@ func (c *ConfigWriter) PrintClusterDump(filter ClusterFilter) error {
 	if err != nil {
 		return err
 	}
+	if outputFormat == "yaml" {
+		if out, err = yaml.JSONToYAML(out); err != nil {
+			return err
+		}
+	}
 	_, _ = fmt.Fprintln(c.Stdout, string(out))
 	return nil
 }
 
-func (c *ConfigWriter) setupClusterConfigWriter() (*tabwriter.Writer, []*xdsapi.Cluster, error) {
+func (c *ConfigWriter) setupClusterConfigWriter() (*tabwriter.Writer, []*cluster.Cluster, error) {
 	clusters, err := c.retrieveSortedClusterSlice()
 	if err != nil {
 		return nil, nil, err
@@ -112,7 +137,7 @@ func (c *ConfigWriter) setupClusterConfigWriter() (*tabwriter.Writer, []*xdsapi.
 	return w, clusters, nil
 }
 
-func (c *ConfigWriter) retrieveSortedClusterSlice() ([]*xdsapi.Cluster, error) {
+func (c *ConfigWriter) retrieveSortedClusterSlice() ([]*cluster.Cluster, error) {
 	if c.configDump == nil {
 		return nil, fmt.Errorf("config writer has not been primed")
 	}
@@ -120,15 +145,29 @@ func (c *ConfigWriter) retrieveSortedClusterSlice() ([]*xdsapi.Cluster, error) {
 	if err != nil {
 		return nil, err
 	}
-	clusters := make([]*xdsapi.Cluster, 0)
-	for _, cluster := range clusterDump.DynamicActiveClusters {
-		if cluster.Cluster != nil {
-			clusters = append(clusters, cluster.Cluster)
+	clusters := make([]*cluster.Cluster, 0)
+	for _, c := range clusterDump.DynamicActiveClusters {
+		if c.Cluster != nil {
+			clusterTyped := &cluster.Cluster{}
+			// Support v2 or v3 in config dump. See ads.go:RequestedTypes for more info.
+			c.Cluster.TypeUrl = v3.ClusterType
+			err = c.Cluster.UnmarshalTo(clusterTyped)
+			if err != nil {
+				return nil, err
+			}
+			clusters = append(clusters, clusterTyped)
 		}
 	}
-	for _, cluster := range clusterDump.StaticClusters {
-		if cluster.Cluster != nil {
-			clusters = append(clusters, cluster.Cluster)
+	for _, c := range clusterDump.StaticClusters {
+		if c.Cluster != nil {
+			clusterTyped := &cluster.Cluster{}
+			// Support v2 or v3 in config dump. See ads.go:RequestedTypes for more info.
+			c.Cluster.TypeUrl = v3.ClusterType
+			err = c.Cluster.UnmarshalTo(clusterTyped)
+			if err != nil {
+				return nil, err
+			}
+			clusters = append(clusters, clusterTyped)
 		}
 	}
 	if len(clusters) == 0 {

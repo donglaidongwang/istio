@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 
-	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/test/echo/common"
 )
@@ -31,29 +30,51 @@ type OnReadyFunc func()
 
 // Config for a single endpoint Instance.
 type Config struct {
-	IsServerReady IsServerReadyFunc
-	Version       string
-	TLSCert       string
-	TLSKey        string
-	UDSServer     string
-	Dialer        common.Dialer
-	Port          *model.Port
+	IsServerReady       IsServerReadyFunc
+	Version             string
+	Cluster             string
+	TLSCert             string
+	TLSKey              string
+	TLSCACert           string
+	TLSMinVersion       string
+	TLSCurvePreferences []string
+	UDSServer           string
+	Dialer              common.Dialer
+	Port                *common.Port
+	ListenerIP          string
+	IstioVersion        string
+	Namespace           string
+	DisableALPN         bool
+	ReportRequest       func()
+	EndpointPicker      bool
 }
 
 // Instance of an endpoint that serves the Echo application on a single port/protocol.
 type Instance interface {
 	io.Closer
 	Start(onReady OnReadyFunc) error
+	GetConfig() Config
 }
 
 // New creates a new endpoint Instance.
 func New(cfg Config) (Instance, error) {
 	if cfg.Port != nil {
 		switch cfg.Port.Protocol {
-		case protocol.TCP, protocol.HTTP, protocol.HTTPS:
+		case protocol.HBONE:
+			return newHBONE(cfg), nil
+		case protocol.DoubleHBONE:
+			return newDoubleHBONE(cfg), nil
+		case protocol.HTTP, protocol.HTTPS:
 			return newHTTP(cfg), nil
 		case protocol.HTTP2, protocol.GRPC:
+			if cfg.EndpointPicker {
+				return newEndpointPicker(cfg), nil
+			}
 			return newGRPC(cfg), nil
+		case protocol.TCP:
+			return newTCP(cfg), nil
+		case protocol.UDP:
+			return newUDP(cfg), nil
 		default:
 			return nil, fmt.Errorf("unsupported protocol: %s", cfg.Port.Protocol)
 		}

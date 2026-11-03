@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,90 +15,110 @@
 package memory
 
 import (
-	"errors"
-
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/kube/controllers"
+	"istio.io/istio/pkg/kube/krt"
 )
 
-type controller struct {
-	monitor     Monitor
-	configStore model.ConfigStore
+// Controller is an implementation of ConfigStoreController.
+type Controller struct {
+	hasSynced func() bool
+	store     *Store
+	handlers  []krt.HandlerRegistration
+	stop      chan struct{}
 }
 
-// NewController return an implementation of model.ConfigStoreCache
-// This is a client-side monitor that dispatches events as the changes are being
-// made on the client.
-func NewController(cs model.ConfigStore) model.ConfigStoreCache {
-	out := &controller{
-		configStore: cs,
-		monitor:     NewMonitor(cs),
+// Make return an implementation of ConfigStoreController
+func NewController(schemas collection.Schemas, skipValidation bool) *Controller {
+	stop := make(chan struct{})
+	return &Controller{
+		stop:  stop,
+		store: newStore(schemas, skipValidation, stop),
 	}
-	return out
 }
 
-func (c *controller) RegisterEventHandler(typ string, f func(model.Config, model.Event)) {
-	c.monitor.AppendEventHandler(typ, f)
+func (c *Controller) RegisterHasSyncedHandler(cb func() bool) {
+	c.hasSynced = cb
 }
 
-// Memory implementation is always synchronized with cache
-func (c *controller) HasSynced() bool {
+func (c *Controller) RegisterEventHandler(kind config.GroupVersionKind, f model.EventHandler) {
+	if kindStore, ok := c.store.data[kind]; ok {
+		c.handlers = append(c.handlers, kindStore.collection.RegisterBatch(func(o []krt.Event[config.Config]) {
+			for _, event := range o {
+				switch event.Event {
+				case controllers.EventAdd:
+					f(config.Config{}, *event.New, model.Event(event.Event))
+				case controllers.EventUpdate:
+					f(*event.Old, *event.New, model.Event(event.Event))
+				case controllers.EventDelete:
+					f(config.Config{}, *event.Old, model.Event(event.Event))
+				}
+			}
+		}, false))
+	}
+}
+
+// HasSynced return whether store has synced
+// It can be controlled externally (such as by the data source),
+func (c *Controller) HasSynced() bool {
+	if c.hasSynced != nil {
+		return c.hasSynced()
+	}
+
+	if !c.store.hasSynced() {
+		return false
+	}
+
+	for _, handler := range c.handlers {
+		if !handler.HasSynced() {
+			return false
+		}
+	}
+
 	return true
 }
 
-func (c *controller) Version() string {
-	return c.configStore.Version()
+func (c *Controller) Run(stop <-chan struct{}) {
+	// marked as synced on run to allow clients to store data before the store is marked as synced
+	c.store.markSynced()
+	<-stop
+	close(c.stop)
 }
 
-func (c *controller) GetResourceAtVersion(version string, key string) (resourceVersion string, err error) {
-	return c.configStore.GetResourceAtVersion(version, key)
-}
-
-func (c *controller) Run(stop <-chan struct{}) {
-	c.monitor.Run(stop)
-}
-
-func (c *controller) ConfigDescriptor() schema.Set {
-	return c.configStore.ConfigDescriptor()
-}
-
-func (c *controller) Get(typ, key, namespace string) *model.Config {
-	return c.configStore.Get(typ, key, namespace)
-}
-
-func (c *controller) Create(config model.Config) (revision string, err error) {
-	if revision, err = c.configStore.Create(config); err == nil {
-		c.monitor.ScheduleProcessEvent(ConfigEvent{
-			config: config,
-			event:  model.EventAdd,
-		})
+func (c *Controller) KrtCollection(kind config.GroupVersionKind) krt.Collection[config.Config] {
+	if data, ok := c.store.data[kind]; ok {
+		return data.collection.AsCollection()
 	}
-	return
+
+	return nil
 }
 
-func (c *controller) Update(config model.Config) (newRevision string, err error) {
-	if newRevision, err = c.configStore.Update(config); err == nil {
-		c.monitor.ScheduleProcessEvent(ConfigEvent{
-			config: config,
-			event:  model.EventUpdate,
-		})
-	}
-	return
+func (c *Controller) Schemas() collection.Schemas {
+	return c.store.schemas
 }
 
-func (c *controller) Delete(typ, key, namespace string) (err error) {
-	if config := c.Get(typ, key, namespace); config != nil {
-		if err = c.configStore.Delete(typ, key, namespace); err == nil {
-			c.monitor.ScheduleProcessEvent(ConfigEvent{
-				config: *config,
-				event:  model.EventDelete,
-			})
-			return
-		}
-	}
-	return errors.New("Delete failure: config" + key + "does not exist")
+func (c *Controller) Get(kind config.GroupVersionKind, key, namespace string) *config.Config {
+	return c.store.Get(kind, key, namespace)
 }
 
-func (c *controller) List(typ, namespace string) ([]model.Config, error) {
-	return c.configStore.List(typ, namespace)
+func (c *Controller) Create(cfg config.Config) (revision string, err error) {
+	return c.store.Create(cfg)
+}
+
+func (c *Controller) Update(cfg config.Config) (newRevision string, err error) {
+	return c.store.Update(cfg)
+}
+
+func (c *Controller) UpdateStatus(cfg config.Config) (newRevision string, err error) {
+	return c.store.UpdateStatus(cfg)
+}
+
+func (c *Controller) Delete(kind config.GroupVersionKind, key, namespace string, resourceVersion *string) error {
+	return c.store.Delete(kind, key, namespace, resourceVersion)
+}
+
+func (c *Controller) List(kind config.GroupVersionKind, namespace string) []config.Config {
+	return c.store.List(kind, namespace)
 }

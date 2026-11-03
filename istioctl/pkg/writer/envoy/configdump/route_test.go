@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,102 +16,89 @@ package configdump
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
+	"os"
+	"path"
 	"testing"
 
 	"istio.io/istio/pilot/test/util"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
-func TestConfigWriter_PrintRouteSummary(t *testing.T) {
+func TestDescribeRouteDomains(t *testing.T) {
 	tests := []struct {
-		name           string
-		filter         RouteFilter
-		wantOutputFile string
-		callPrime      bool
-		wantErr        bool
+		desc     string
+		domains  []string
+		expected string
 	}{
 		{
-			name:           "display all routes when no filter is passed",
-			filter:         RouteFilter{},
-			wantOutputFile: "testdata/routesummary.txt",
-			callPrime:      true,
+			desc:     "test zero domain",
+			domains:  []string{},
+			expected: "",
 		},
 		{
-			name:           "filter routes in the summary",
-			filter:         RouteFilter{Name: "15004"},
-			wantOutputFile: "testdata/routesummaryfiltered.txt",
-			callPrime:      true,
+			desc:     "test only one domain",
+			domains:  []string{"example.com"},
+			expected: "example.com",
 		},
 		{
-			name:      "errors if config writer is not primed",
-			callPrime: false,
-			wantErr:   true,
+			desc:     "test domains with port",
+			domains:  []string{"example.com", "example.com:8080"},
+			expected: "example.com",
+		},
+		{
+			desc:     "test domains with ipv4 addresses",
+			domains:  []string{"example.com", "example.com:8080", "1.2.3.4", "1.2.3.4:8080"},
+			expected: "example.com, 1.2.3.4",
+		},
+		{
+			desc:     "test domains with ipv6 addresses",
+			domains:  []string{"example.com", "example.com:8080", "[fd00:10:96::7fc7]", "[fd00:10:96::7fc7]:8080"},
+			expected: "example.com, [fd00:10:96::7fc7]",
+		},
+		{
+			desc:     "test with more domains",
+			domains:  []string{"example.com", "example.com:8080", "www.example.com", "www.example.com:8080", "[fd00:10:96::7fc7]", "[fd00:10:96::7fc7]:8080"},
+			expected: "example.com, www.example.com + 1 more...",
 		},
 	}
+
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotOut := &bytes.Buffer{}
-			cw := &ConfigWriter{Stdout: gotOut}
-			cd, _ := ioutil.ReadFile("testdata/configdump.json")
-			if tt.callPrime {
-				cw.Prime(cd)
-			}
-			err := cw.PrintRouteSummary(tt.filter)
-			if tt.wantOutputFile != "" {
-				util.CompareContent(gotOut.Bytes(), tt.wantOutputFile, t)
-			}
-			if err == nil && tt.wantErr {
-				t.Errorf("PrintRouteSummary (%v) did not produce expected err", tt.name)
-			} else if err != nil && !tt.wantErr {
-				t.Errorf("PrintRouteSummary (%v) produced unexpected err: %v", tt.name, err)
+		t.Run(tt.desc, func(t *testing.T) {
+			if got := describeRouteDomains(tt.domains); got != tt.expected {
+				t.Errorf("%s: expect %v got %v", tt.desc, tt.expected, got)
 			}
 		})
 	}
 }
 
-func TestConfigWriter_PrintRouteDump(t *testing.T) {
+func TestPrintRoutesSummary(t *testing.T) {
 	tests := []struct {
-		name           string
-		filter         RouteFilter
-		wantOutputFile string
-		callPrime      bool
-		wantErr        bool
+		name string
 	}{
 		{
-			name:           "display all routes when no filter is passed",
-			filter:         RouteFilter{},
-			wantOutputFile: "testdata/routedump.json",
-			callPrime:      true,
+			name: "empty-gateway",
 		},
 		{
-			name:           "filter routes in the dump",
-			filter:         RouteFilter{Name: "15004"},
-			wantOutputFile: "testdata/routedumpfiltered.json",
-			callPrime:      true,
+			name: "istio-gateway-http-route-prefix",
 		},
 		{
-			name:      "errors if config writer is not primed",
-			callPrime: false,
-			wantErr:   true,
+			name: "k8s-gateway-http-route-path-prefix",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gotOut := &bytes.Buffer{}
 			cw := &ConfigWriter{Stdout: gotOut}
-			cd, _ := ioutil.ReadFile("testdata/configdump.json")
-			if tt.callPrime {
-				cw.Prime(cd)
+			cd, _ := os.ReadFile(fmt.Sprintf("testdata/routes/%s/configdump.json", tt.name))
+			if err := cw.Prime(cd); err != nil {
+				t.Errorf("failed to parse config dump: %s", err)
 			}
-			err := cw.PrintRouteDump(tt.filter)
-			if tt.wantOutputFile != "" {
-				util.CompareContent(gotOut.Bytes(), tt.wantOutputFile, t)
-			}
-			if err == nil && tt.wantErr {
-				t.Errorf("PrintRouteDump (%v) did not produce expected err", tt.name)
-			} else if err != nil && !tt.wantErr {
-				t.Errorf("PrintRouteDump (%v) produced unexpected err: %v", tt.name, err)
-			}
+			err := cw.PrintRouteSummary(RouteFilter{Verbose: true})
+			assert.NoError(t, err)
+
+			wantOutputFile := path.Join("testdata/routes", tt.name, "output.txt")
+			util.CompareContent(t, gotOut.Bytes(), wantOutputFile)
 		})
 	}
 }

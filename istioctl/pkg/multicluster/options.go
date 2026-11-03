@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors.
+// Copyright Istio Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,14 @@
 package multicluster
 
 import (
-	"errors"
-
-	"github.com/spf13/pflag"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"istio.io/istio/istioctl/pkg/cli"
 )
 
-// TODO(ayj) - add to istio.io/api/annotations
-const clusterContextAnnotationKey = "istio.io/clusterContext"
+const (
+	clusterNameAnnotationKey = "networking.istio.io/cluster"
+)
 
 // KubeOptions contains kubernetes options common to all commands.
 type KubeOptions struct {
@@ -35,19 +34,10 @@ type KubeOptions struct {
 // Inherit the common kubernetes flags defined in the root package. This is a bit of a hack,
 // but it allows us to directly get the final values for each of these flags without needing
 // to pass pointers-to-flags through all of the (sub)commands.
-func (o *KubeOptions) prepare(flags *pflag.FlagSet) {
-	if f := flags.Lookup("kubeconfig"); f != nil {
-		o.Kubeconfig = f.Value.String()
-	}
-	if f := flags.Lookup("context"); f != nil {
-		o.Context = f.Value.String()
-	}
-	if f := flags.Lookup("namespace"); f != nil {
-		o.Namespace = f.Value.String()
-	}
-
+func (o *KubeOptions) prepare(ctx cli.Context) {
+	o.Namespace = ctx.Namespace()
 	if o.Namespace == "" {
-		o.Namespace = v1.NamespaceDefault
+		o.Namespace = ctx.IstioNamespace()
 
 		configAccess := clientcmd.NewDefaultPathOptions()
 		configAccess.GlobalFile = o.Kubeconfig
@@ -57,22 +47,4 @@ func (o *KubeOptions) prepare(flags *pflag.FlagSet) {
 			}
 		}
 	}
-}
-
-type filenameOption struct {
-	filename string
-}
-
-func (f *filenameOption) addFlags(flagset *pflag.FlagSet) {
-	if flagset.Lookup("filename") == nil {
-		flagset.StringVarP(&f.filename, "filename", "f", "",
-			"filename of the multicluster mesh description")
-	}
-}
-
-func (f *filenameOption) prepare() error {
-	if len(f.filename) == 0 {
-		return errors.New("must specify -f")
-	}
-	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,13 +22,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
 	"time"
 
 	k8s "k8s.io/api/core/v1"
 
+	"istio.io/istio/security/pkg/pki/ca"
 	"istio.io/istio/security/pkg/pki/util"
 )
 
@@ -45,7 +46,7 @@ const (
 var (
 	host           = flag.String("host", "", "Comma-separated hostnames and IPs to generate a certificate for.")
 	validFrom      = flag.String("start-date", "", "Creation date in format of "+timeLayout)
-	validFor       = flag.Duration("duration", 365*24*time.Hour, "Duration that certificate is valid for.")
+	validFor       = flag.Duration("duration", 10*365*24*time.Hour, "Duration that certificate is valid for.")
 	isCA           = flag.Bool("ca", false, "Whether this cert should be a Certificate Authority.")
 	signerCertFile = flag.String("signer-cert", "", "Signer certificate file (PEM encoded).")
 	signerPrivFile = flag.String("signer-priv", "", "Signer private key file (PEM encoded).")
@@ -55,6 +56,11 @@ var (
 	outPriv        = flag.String("out-priv", "priv.pem", "Output private key file.")
 	keySize        = flag.Int("key-size", 2048, "Size of the generated private key")
 	mode           = flag.String("mode", selfSignedMode, "Supported mode: self-signed, signer, citadel")
+	// Enable this flag if istio mTLS is enabled and the service is running as server side
+	isServer  = flag.Bool("server", false, "Whether this certificate is for a server.")
+	ec        = flag.String("ec-sig-alg", "", "Generate an elliptical curve private key with the specified algorithm")
+	curve     = flag.String("curve", "P256", "Specify the elliptic curve to use to generate an elliptical curve private key")
+	sanFields = flag.String("san", "", "Subject Alternative Names")
 )
 
 func checkCmdLine() {
@@ -80,12 +86,12 @@ func checkCmdLine() {
 }
 
 func saveCreds(certPem []byte, privPem []byte) {
-	err := ioutil.WriteFile(*outCert, certPem, 0644)
+	err := os.WriteFile(*outCert, certPem, 0o644)
 	if err != nil {
 		log.Fatalf("Could not write output certificate: %s.", err)
 	}
 
-	err = ioutil.WriteFile(*outPriv, privPem, 0600)
+	err = os.WriteFile(*outPriv, privPem, 0o600)
 	if err != nil {
 		log.Fatalf("Could not write output private key: %s.", err)
 	}
@@ -104,13 +110,13 @@ func signCertFromCitadel() (*x509.Certificate, crypto.PrivateKey) {
 	if err != nil {
 		log.Fatalf("Unmarshal secret error: %v", err)
 	}
-	key, err := util.ParsePemEncodedKey(secret.Data["ca-key.pem"])
+	key, err := util.ParsePemEncodedKey(secret.Data[ca.CAPrivateKeyFile])
 	if err != nil {
-		log.Fatalf("Unrecogniazed key format from citadel %v", err)
+		log.Fatalf("Unrecognized key format from citadel %v", err)
 	}
-	cert, err := util.ParsePemEncodedCertificate(secret.Data["ca-cert.pem"])
+	cert, err := util.ParsePemEncodedCertificate(secret.Data[ca.CACertFile])
 	if err != nil {
-		log.Fatalf("Unrecogniazed cert format from citadel %v", err)
+		log.Fatalf("Unrecognized cert format from citadel %v", err)
 	}
 	return cert, key
 }
@@ -145,9 +151,12 @@ func main() {
 		IsSelfSigned: *mode == selfSignedMode,
 		IsClient:     *isClient,
 		RSAKeySize:   *keySize,
+		IsServer:     *isServer,
+		ECSigAlg:     util.SupportedECSignatureAlgorithms(*ec),
+		ECCCurve:     util.SupportedEllipticCurves(*curve),
+		DNSNames:     *sanFields,
 	}
 	certPem, privPem, err := util.GenCertKeyFromOptions(opts)
-
 	if err != nil {
 		log.Fatalf("Failed to generate certificate: %v\n", err)
 	}

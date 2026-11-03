@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,59 +15,41 @@
 package configdump
 
 import (
-	"bytes"
-	"reflect"
-	"strings"
-
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	emptypb "github.com/golang/protobuf/ptypes/empty"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
-// nonstrictResolver is an AnyResolver that ignores unknown proto messages
-type nonstrictResolver struct{}
+type resolver struct {
+	*protoregistry.Types
+}
 
-var (
-	envoyResolver nonstrictResolver
-)
+var nonStrictResolver = &resolver{protoregistry.GlobalTypes}
 
-func (m *nonstrictResolver) Resolve(typeURL string) (proto.Message, error) {
-	// See https://github.com/golang/protobuf/issues/747#issuecomment-437463120
-	mname := typeURL
-	if slash := strings.LastIndex(typeURL, "/"); slash >= 0 {
-		mname = mname[slash+1:]
+func (r *resolver) FindMessageByURL(url string) (protoreflect.MessageType, error) {
+	typ, err := r.Types.FindMessageByURL(url)
+	if err != nil {
+		// Here we ignore the error since we want istioctl to ignore unknown types due to the Envoy version change
+		msg := exprpb.Type{TypeKind: &exprpb.Type_Dyn{Dyn: &emptypb.Empty{}}}
+		return msg.ProtoReflect().Type(), nil
 	}
-	mt := proto.MessageType(mname)
-	if mt == nil {
-		// istioctl should keep going if it encounters new Envoy versions; ignore unknown types
-		return &exprpb.Type{TypeKind: &exprpb.Type_Dyn{Dyn: &emptypb.Empty{}}}, nil
-	}
-	return reflect.New(mt.Elem()).Interface().(proto.Message), nil
+	return typ, nil
 }
 
 // Wrapper is a wrapper around the Envoy ConfigDump
 // It has extra helper functions for handling any/struct/marshal protobuf pain
 type Wrapper struct {
-	*adminapi.ConfigDump
-}
-
-// MarshalJSON is a custom marshaller to handle protobuf pain
-func (w *Wrapper) MarshalJSON() ([]byte, error) {
-	buffer := &bytes.Buffer{}
-	err := (&jsonpb.Marshaler{}).Marshal(buffer, w)
-	if err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
+	*admin.ConfigDump
 }
 
 // UnmarshalJSON is a custom unmarshaller to handle protobuf pain
 func (w *Wrapper) UnmarshalJSON(b []byte) error {
-	cd := &adminapi.ConfigDump{}
-	err := (&jsonpb.Unmarshaler{AllowUnknownFields: true,
-		AnyResolver: &envoyResolver}).Unmarshal(bytes.NewReader(b), cd)
+	cd := &admin.ConfigDump{}
+	err := protomarshal.UnmarshalAllowUnknownWithAnyResolver(nonStrictResolver, b, cd)
 	*w = Wrapper{cd}
 	return err
 }

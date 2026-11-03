@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -18,10 +18,17 @@ package scheme
 type Instance string
 
 const (
-	HTTP       Instance = "http"
-	HTTPS      Instance = "https"
-	GRPC       Instance = "grpc"
-	GRPCS      Instance = "grpcs"
-	WebSocket  Instance = "ws"
-	WebSocketS Instance = "wss"
+	HTTP      Instance = "http"
+	HTTPS     Instance = "https"
+	GRPC      Instance = "grpc"
+	XDS       Instance = "xds"
+	WebSocket Instance = "ws"
+	TCP       Instance = "tcp"
+	UDP       Instance = "udp"
+	// TLS sends a TLS connection and reports back the properties of the TLS connection
+	// This is similar to `openssl s_client`
+	// Response data is not returned; only information about the TLS handshake.
+	TLS Instance = "tls"
+	// DNS does a DNS query and reports back the results.
+	DNS Instance = "dns"
 )

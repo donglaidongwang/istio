@@ -26,11 +26,12 @@ ISTIOCTL=bin/istioctl
 go build -o $ISTIOCTL ./istioctl/cmd/istioctl
 
 for f in samples/**/*.yaml; do
-  echo "Validating $f..."
+  if grep -q -e "{{" "$f" ; then
+    echo "Skipping check for helm template $f"
+    continue
+  else
+    echo "Validating $f..."
   $ISTIOCTL validate -x \
-    -f mixer/testdata/config/attributes.yaml \
-    -f mixer/template/metric/template.yaml \
-    -f mixer/test/prometheus/prometheus-nosession.yaml \
-    -f samples/httpbin/policy/keyval-template.yaml \
     -f "$f"
+  fi
 done

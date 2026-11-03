@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,19 +17,35 @@ package configdump
 import (
 	"sort"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/ptypes"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+
+	v3 "istio.io/istio/pilot/pkg/xds/v3"
 )
 
 // GetDynamicClusterDump retrieves a cluster dump with just dynamic active clusters in it
-func (w *Wrapper) GetDynamicClusterDump(stripVersions bool) (*adminapi.ClustersConfigDump, error) {
+func (w *Wrapper) GetDynamicClusterDump(stripVersions bool) (*admin.ClustersConfigDump, error) {
 	clusterDump, err := w.GetClusterConfigDump()
 	if err != nil {
 		return nil, err
 	}
 	dac := clusterDump.GetDynamicActiveClusters()
+	// Allow sorting to work even if we don't have the exact same type
+	for i := range dac {
+		dac[i].Cluster.TypeUrl = v3.ClusterType
+	}
 	sort.Slice(dac, func(i, j int) bool {
-		return dac[i].Cluster.Name < dac[j].Cluster.Name
+		cluster := &cluster.Cluster{}
+		err = dac[i].Cluster.UnmarshalTo(cluster)
+		if err != nil {
+			return false
+		}
+		name := cluster.Name
+		err = dac[j].Cluster.UnmarshalTo(cluster)
+		if err != nil {
+			return false
+		}
+		return name < cluster.Name
 	})
 	if stripVersions {
 		for i := range dac {
@@ -37,17 +53,17 @@ func (w *Wrapper) GetDynamicClusterDump(stripVersions bool) (*adminapi.ClustersC
 			dac[i].LastUpdated = nil
 		}
 	}
-	return &adminapi.ClustersConfigDump{DynamicActiveClusters: dac}, nil
+	return &admin.ClustersConfigDump{DynamicActiveClusters: dac}, nil
 }
 
 // GetClusterConfigDump retrieves the cluster config dump from the ConfigDump
-func (w *Wrapper) GetClusterConfigDump() (*adminapi.ClustersConfigDump, error) {
+func (w *Wrapper) GetClusterConfigDump() (*admin.ClustersConfigDump, error) {
 	clusterDumpAny, err := w.getSection(clusters)
 	if err != nil {
 		return nil, err
 	}
-	clusterDump := &adminapi.ClustersConfigDump{}
-	err = ptypes.UnmarshalAny(&clusterDumpAny, clusterDump)
+	clusterDump := &admin.ClustersConfigDump{}
+	err = clusterDumpAny.UnmarshalTo(clusterDump)
 	if err != nil {
 		return nil, err
 	}

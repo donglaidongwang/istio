@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,68 +17,68 @@ package model_test
 import (
 	"fmt"
 	"reflect"
+	"strconv"
 	"testing"
-	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
 
-	mccpb "istio.io/api/mixer/v1/config/client"
-	networking "istio.io/api/networking/v1alpha3"
-	rbacproto "istio.io/api/rbac/v1alpha1"
-	authz "istio.io/api/security/v1beta1"
-	api "istio.io/api/type/v1beta1"
-
-	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
 	mock_config "istio.io/istio/pilot/test/mock"
-	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
-	"istio.io/istio/pkg/config/schema"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/kind"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // getByMessageName finds a schema by message name if it is available
 // In test setup, we do not have more than one descriptor with the same message type, so this
 // function is ok for testing purpose.
-func getByMessageName(descriptor schema.Set, name string) (schema.Instance, bool) {
-	for _, s := range descriptor {
-		if s.MessageName == name {
+func getByMessageName(schemas collection.Schemas, name string) (resource.Schema, bool) {
+	for _, s := range schemas.All() {
+		if s.Proto() == name {
 			return s, true
 		}
 	}
-	return schema.Instance{}, false
+	return nil, false
+}
+
+func schemaFor(kind, proto string) resource.Schema {
+	return resource.Builder{
+		Kind:   kind,
+		Plural: kind + "s",
+		Proto:  proto,
+	}.BuildNoValidate()
 }
 
 func TestConfigDescriptor(t *testing.T) {
-	a := schema.Instance{Type: "a", MessageName: "proxy.A"}
-	descriptor := schema.Set{
+	a := schemaFor("a", "proxy.A")
+	schemas := collection.SchemasFor(
 		a,
-		schema.Instance{Type: "b", MessageName: "proxy.B"},
-		schema.Instance{Type: "c", MessageName: "proxy.C"},
-	}
+		schemaFor("b", "proxy.B"),
+		schemaFor("c", "proxy.C"))
 	want := []string{"a", "b", "c"}
-	got := descriptor.Types()
+	got := schemas.Kinds()
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("descriptor.Types() => got %+vwant %+v", spew.Sdump(got), spew.Sdump(want))
 	}
 
-	aType, aExists := descriptor.GetByType(a.Type)
+	aType, aExists := schemas.FindByGroupVersionKind(a.GroupVersionKind())
 	if !aExists || !reflect.DeepEqual(aType, a) {
 		t.Errorf("descriptor.GetByType(a) => got %+v, want %+v", aType, a)
 	}
-	if _, exists := descriptor.GetByType("missing"); exists {
+	if _, exists := schemas.FindByGroupVersionKind(config.GroupVersionKind{Kind: "missing"}); exists {
 		t.Error("descriptor.GetByType(missing) => got true, want false")
 	}
 
-	aSchema, aSchemaExists := getByMessageName(descriptor, a.MessageName)
+	aSchema, aSchemaExists := getByMessageName(schemas, a.Proto())
 	if !aSchemaExists || !reflect.DeepEqual(aSchema, a) {
 		t.Errorf("descriptor.GetByMessageName(a) => got %+v, want %+v", aType, a)
 	}
-	_, aSchemaNotExist := getByMessageName(descriptor, "blah")
+	_, aSchemaNotExist := getByMessageName(schemas, "blah")
 	if aSchemaNotExist {
 		t.Errorf("descriptor.GetByMessageName(blah) => got true, want false")
 	}
@@ -130,73 +130,6 @@ func TestPortList(t *testing.T) {
 	}
 }
 
-func TestServiceKey(t *testing.T) {
-	svc := &model.Service{Hostname: "hostname"}
-
-	// Verify Service.Key() delegates to ServiceKey()
-	{
-		want := "hostname|http|a=b,c=d"
-		port := &model.Port{Name: "http", Port: 80, Protocol: protocol.HTTP}
-		l := labels.Instance{"a": "b", "c": "d"}
-		got := svc.Key(port, l)
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("Service.Key() failed: got %v want %v", got, want)
-		}
-	}
-
-	cases := []struct {
-		port model.PortList
-		l    labels.Collection
-		want string
-	}{
-		{
-			port: model.PortList{
-				{Name: "http", Port: 80, Protocol: protocol.HTTP},
-				{Name: "http-alt", Port: 8080, Protocol: protocol.HTTP},
-			},
-			l:    labels.Collection{{"a": "b", "c": "d"}},
-			want: "hostname|http,http-alt|a=b,c=d",
-		},
-		{
-			port: model.PortList{{Name: "http", Port: 80, Protocol: protocol.HTTP}},
-			l:    labels.Collection{{"a": "b", "c": "d"}},
-			want: "hostname|http|a=b,c=d",
-		},
-		{
-			port: model.PortList{{Port: 80, Protocol: protocol.HTTP}},
-			l:    labels.Collection{{"a": "b", "c": "d"}},
-			want: "hostname||a=b,c=d",
-		},
-		{
-			port: model.PortList{},
-			l:    labels.Collection{{"a": "b", "c": "d"}},
-			want: "hostname||a=b,c=d",
-		},
-		{
-			port: model.PortList{{Name: "http", Port: 80, Protocol: protocol.HTTP}},
-			l:    labels.Collection{nil},
-			want: "hostname|http",
-		},
-		{
-			port: model.PortList{{Name: "http", Port: 80, Protocol: protocol.HTTP}},
-			l:    labels.Collection{},
-			want: "hostname|http",
-		},
-		{
-			port: model.PortList{},
-			l:    labels.Collection{},
-			want: "hostname",
-		},
-	}
-
-	for _, c := range cases {
-		got := model.ServiceKey(svc.Hostname, c.port, c.l)
-		if !reflect.DeepEqual(got, c.want) {
-			t.Errorf("Failed: got %q want %q", got, c.want)
-		}
-	}
-}
-
 func TestSubsetKey(t *testing.T) {
 	hostname := host.Name("hostname")
 	cases := []struct {
@@ -239,6 +172,11 @@ func TestLabelsEquals(t *testing.T) {
 		want bool
 	}{
 		{
+			a:    nil,
+			b:    nil,
+			want: true,
+		},
+		{
 			a: nil,
 			b: labels.Instance{"a": "b"},
 		},
@@ -251,6 +189,19 @@ func TestLabelsEquals(t *testing.T) {
 			b:    labels.Instance{"a": "b"},
 			want: true,
 		},
+		{
+			a: labels.Instance{"a": "b"},
+			b: labels.Instance{"a": "b", "c": "d"},
+		},
+		{
+			b: labels.Instance{"a": "b", "c": "d"},
+			a: labels.Instance{"a": "b"},
+		},
+		{
+			b:    labels.Instance{"a": "b", "c": "d"},
+			a:    labels.Instance{"a": "b", "c": "d"},
+			want: true,
+		},
 	}
 	for _, c := range cases {
 		if got := c.a.Equals(c.b); got != c.want {
@@ -261,93 +212,47 @@ func TestLabelsEquals(t *testing.T) {
 
 func TestConfigKey(t *testing.T) {
 	cfg := mock_config.Make("ns", 2)
-	want := "mock-config/ns/mock-config2"
-	if key := cfg.ConfigMeta.Key(); key != want {
-		t.Errorf("config.Key() => got %q, want %q", key, want)
-	}
-}
-
-func TestResolveHostname(t *testing.T) {
-	cases := []struct {
-		meta model.ConfigMeta
-		svc  *mccpb.IstioService
-		want host.Name
-	}{
-		{
-			meta: model.ConfigMeta{Namespace: "default", Domain: "cluster.local"},
-			svc:  &mccpb.IstioService{Name: "hello"},
-			want: "hello.default.svc.cluster.local",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "foo", Domain: "foo"},
-			svc: &mccpb.IstioService{Name: "hello",
-				Namespace: "default", Domain: "svc.cluster.local"},
-			want: "hello.default.svc.cluster.local",
-		},
-		{
-			meta: model.ConfigMeta{},
-			svc:  &mccpb.IstioService{Name: "hello"},
-			want: "hello",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "default"},
-			svc:  &mccpb.IstioService{Name: "hello"},
-			want: "hello.default",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "default", Domain: "cluster.local"},
-			svc:  &mccpb.IstioService{Service: "reviews.service.consul"},
-			want: "reviews.service.consul",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "foo", Domain: "foo"},
-			svc: &mccpb.IstioService{Name: "hello", Service: "reviews.service.consul",
-				Namespace: "default", Domain: "svc.cluster.local"},
-			want: "reviews.service.consul",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "default", Domain: "cluster.local"},
-			svc:  &mccpb.IstioService{Service: "*cnn.com"},
-			want: "*cnn.com",
-		},
-		{
-			meta: model.ConfigMeta{Namespace: "foo", Domain: "foo"},
-			svc: &mccpb.IstioService{Name: "hello", Service: "*cnn.com",
-				Namespace: "default", Domain: "svc.cluster.local"},
-			want: "*cnn.com",
-		},
-	}
-
-	for _, test := range cases {
-		if got := model.ResolveHostname(test.meta, test.svc); got != test.want {
-			t.Errorf("ResolveHostname(%v, %v) => got %q, want %q", test.meta, test.svc, got, test.want)
-		}
+	want := "test.istio.io/v1/MockConfig/ns/mock-config2"
+	if key := cfg.Meta.Key(); key != want {
+		t.Fatalf("config.Key() => got %q, want %q", key, want)
 	}
 }
 
 func TestResolveShortnameToFQDN(t *testing.T) {
 	tests := []struct {
 		name string
-		meta model.ConfigMeta
+		meta config.Meta
 		out  host.Name
 	}{
 		{
-			"*", model.ConfigMeta{}, "*",
+			"*", config.Meta{}, "*",
 		},
 		{
-			"*", model.ConfigMeta{Namespace: "default", Domain: "cluster.local"}, "*",
+			"*", config.Meta{Namespace: "default", Domain: "cluster.local"}, "*",
 		},
 		{
-			"foo", model.ConfigMeta{Namespace: "default", Domain: "cluster.local"}, "foo.default.svc.cluster.local",
+			"foo", config.Meta{Namespace: "default", Domain: "cluster.local"}, "foo.default.svc.cluster.local",
 		},
 		{
-			"foo.bar", model.ConfigMeta{Namespace: "default", Domain: "cluster.local"}, "foo.bar",
+			"foo.bar", config.Meta{Namespace: "default", Domain: "cluster.local"}, "foo.bar",
 		},
 		{
-			"foo", model.ConfigMeta{Domain: "cluster.local"}, "foo.svc.cluster.local",
+			"foo", config.Meta{Domain: "cluster.local"}, "foo.svc.cluster.local",
 		},
 		{
-			"foo", model.ConfigMeta{Namespace: "default"}, "foo.default",
+			"foo", config.Meta{Namespace: "default"}, "foo.default",
+		},
+		{
+			"42.185.131.210", config.Meta{Namespace: "default"}, "42.185.131.210",
+		},
+		{
+			"42.185.131.210", config.Meta{Namespace: "cluster.local"}, "42.185.131.210",
+		},
+		{
+			"2a00:4000::614", config.Meta{Namespace: "default"}, "2a00:4000::614",
+		},
+		{
+			"2a00:4000::614", config.Meta{Namespace: "cluster.local"}, "2a00:4000::614",
 		},
 	}
 
@@ -376,449 +281,273 @@ func TestMostSpecificHostMatch(t *testing.T) {
 		{[]host.Name{"*.foo.com", "foo.com"}, "*.foo.com", "*.foo.com"},
 
 		// this passes because we sort alphabetically
-		{[]host.Name{"bar.com", "foo.com"}, "*.com", "bar.com"},
+		{[]host.Name{"bar.com", "foo.com"}, "*.com", ""},
 
-		{[]host.Name{"bar.com", "*.foo.com"}, "*foo.com", "*.foo.com"},
-		{[]host.Name{"foo.com", "*.foo.com"}, "*foo.com", "foo.com"},
+		{[]host.Name{"bar.com", "*.foo.com"}, "*foo.com", ""},
+		{[]host.Name{"foo.com", "*.foo.com"}, "*foo.com", ""},
+
+		// should prioritize closest match
+		{[]host.Name{"*.bar.com", "foo.bar.com"}, "foo.bar.com", "foo.bar.com"},
+		{[]host.Name{"*.foo.bar.com", "bar.foo.bar.com"}, "bar.foo.bar.com", "bar.foo.bar.com"},
+
+		// should not match non-wildcards for wildcard needle
+		{[]host.Name{"bar.foo.com", "foo.bar.com"}, "*.foo.com", ""},
+		{[]host.Name{"foo.bar.foo.com", "bar.foo.bar.com"}, "*.bar.foo.com", ""},
 	}
 
 	for idx, tt := range tests {
+		specific := sets.New[host.Name]()
+		wildcard := sets.New[host.Name]()
+		for _, h := range tt.in {
+			if h.IsWildCarded() {
+				wildcard.Insert(h)
+			} else {
+				specific.Insert(h)
+			}
+		}
+
 		t.Run(fmt.Sprintf("[%d] %s", idx, tt.needle), func(t *testing.T) {
-			actual, found := model.MostSpecificHostMatch(tt.needle, tt.in)
+			actual, value, found := model.MostSpecificHostMatch(tt.needle, specific, wildcard)
 			if tt.want != "" && !found {
-				t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %t; want: %v", tt.needle, tt.in, actual, found, tt.want)
+				t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %v, %t; want: %v", tt.needle, tt.in, actual, value, found, tt.want)
 			} else if actual != tt.want {
-				t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %t; want: %v", tt.needle, tt.in, actual, found, tt.want)
+				t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %v, %t; want: %v", tt.needle, tt.in, actual, value, found, tt.want)
+			}
+			if found {
+				if actual.IsWildCarded() && value != wildcard[actual] {
+					t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %v, %t; want: %v", tt.needle, tt.in, actual, value, found, tt.want)
+				}
+				if !actual.IsWildCarded() && value != specific[actual] {
+					t.Fatalf("model.MostSpecificHostMatch(%q, %v) = %v, %v, %t; want: %v", tt.needle, tt.in, actual, value, found, tt.want)
+				}
 			}
 		})
 	}
 }
 
-func TestServiceRoles(t *testing.T) {
-	store := model.MakeIstioStore(memory.Make(schemas.Istio))
-	addRbacConfigToStore(schemas.ServiceRole.Type, "role1", "istio-system", store, t)
-	addRbacConfigToStore(schemas.ServiceRole.Type, "role2", "default", store, t)
-	addRbacConfigToStore(schemas.ServiceRole.Type, "role3", "istio-system", store, t)
-	tests := []struct {
-		namespace  string
-		expectName map[string]bool
+func BenchmarkMostSpecificHostMatch(b *testing.B) {
+	benchmarks := []struct {
+		name             string
+		needle           host.Name
+		baseHost         string
+		hosts            []host.Name
+		specificHostsMap sets.Set[host.Name]
+		wildcardHostsMap sets.Set[host.Name]
+		time             int
+		matches          bool
 	}{
-		{namespace: "wrong", expectName: nil},
-		{namespace: "default", expectName: map[string]bool{"role2": true}},
-		{namespace: "istio-system", expectName: map[string]bool{"role1": true, "role3": true}},
+		{"10ExactNoMatch", host.Name("foo.bar.com.10"), "bar.com", []host.Name{}, nil, nil, 10, false},
+		{"50ExactNoMatch", host.Name("foo.bar.com.50"), "bar.com", []host.Name{}, nil, nil, 50, false},
+		{"100ExactNoMatch", host.Name("foo.bar.com.100"), "bar.com", []host.Name{}, nil, nil, 100, false},
+		{"1000ExactNoMatch", host.Name("foo.bar.com.1000"), "bar.com", []host.Name{}, nil, nil, 1000, false},
+		{"5000ExactNoMatch", host.Name("foo.bar.com.5000"), "bar.com", []host.Name{}, nil, nil, 5000, false},
+
+		{"10ExactMatch", host.Name("foo.bar.com.10"), "foo.bar.com", []host.Name{}, nil, nil, 10, true},
+		{"50ExactMatch", host.Name("foo.bar.com.50"), "foo.bar.com", []host.Name{}, nil, nil, 50, true},
+		{"100ExactMatch", host.Name("foo.bar.com.100"), "foo.bar.com", []host.Name{}, nil, nil, 100, true},
+		{"1000ExactMatch", host.Name("foo.bar.com.1000"), "foo.bar.com", []host.Name{}, nil, nil, 1000, true},
+		{"5000ExactMatch", host.Name("foo.bar.com.5000"), "foo.bar.com", []host.Name{}, nil, nil, 5000, true},
+
+		{"10DestRuleWildcardNoMatch", host.Name("foo.bar.com.10"), "*.foo.bar.com", []host.Name{}, nil, nil, 10, false},
+		{"50DestRuleWildcardNoMatch", host.Name("foo.bar.com.50"), "*.foo.bar.com", []host.Name{}, nil, nil, 50, false},
+		{"100DestRuleWildcardNoMatch", host.Name("foo.bar.com.100"), "*.foo.bar.com", []host.Name{}, nil, nil, 100, false},
+		{"1000DestRuleWildcardNoMatch", host.Name("foo.bar.com.1000"), "*.foo.bar.com", []host.Name{}, nil, nil, 1000, false},
+		{"5000DestRuleWildcardNoMatch", host.Name("foo.bar.com.5000"), "*.foo.bar.com", []host.Name{}, nil, nil, 5000, false},
+
+		{"10DestRuleWildcardMatch", host.Name("foo.bar.baz.com.10"), "*.bar.baz.com", []host.Name{}, nil, nil, 10, true},
+		{"50DestRuleWildcardMatch", host.Name("foo.bar.baz.com.50"), "*.bar.baz.com", []host.Name{}, nil, nil, 50, true},
+		{"100DestRuleWildcardMatch", host.Name("foo.bar.baz.com.100"), "*.bar.baz.com", []host.Name{}, nil, nil, 100, true},
+		{"1000DestRuleWildcardMatch", host.Name("foo.bar.baz.com.1000"), "*.bar.baz.com", []host.Name{}, nil, nil, 1000, true},
+		{"5000DestRuleWildcardMatch", host.Name("foo.bar.baz.com.5000"), "*.bar.baz.com", []host.Name{}, nil, nil, 5000, true},
+
+		{"10NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "*.foo.bar.com", []host.Name{}, nil, nil, 10, false},
+		{"50NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "*.foo.bar.com", []host.Name{}, nil, nil, 50, false},
+		{"100NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "*.foo.bar.com", []host.Name{}, nil, nil, 100, false},
+		{"1000NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "*.foo.bar.com", []host.Name{}, nil, nil, 1000, false},
+		{"5000NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "*.foo.bar.com", []host.Name{}, nil, nil, 5000, false},
+
+		{"10NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.10"), "*.foo.bar.com", []host.Name{}, nil, nil, 10, true},
+		{"50NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.50"), "*.foo.bar.com", []host.Name{}, nil, nil, 50, true},
+		{"100NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.100"), "*.foo.bar.com", []host.Name{}, nil, nil, 100, true},
+		{"1000NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.1000"), "*.foo.bar.com", []host.Name{}, nil, nil, 1000, true},
+		{"5000NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.5000"), "*.foo.bar.com", []host.Name{}, nil, nil, 5000, true},
 	}
 
-	for _, tt := range tests {
-		cfg := store.ServiceRoles(tt.namespace)
-		if tt.expectName != nil {
-			for _, cfg := range cfg {
-				if !tt.expectName[cfg.Name] {
-					t.Errorf("model.ServiceRoles: expecting %v, but got %v", tt.expectName, cfg)
-				}
+	for _, bm := range benchmarks {
+		bm.specificHostsMap = sets.NewWithLength[host.Name](bm.time)
+		bm.wildcardHostsMap = sets.NewWithLength[host.Name](bm.time)
+
+		for i := 1; i <= bm.time; i++ {
+			h := host.Name(bm.baseHost + "." + strconv.Itoa(i))
+			if h.IsWildCarded() {
+				bm.wildcardHostsMap.Insert(h)
+			} else {
+				bm.specificHostsMap.Insert(h)
 			}
-		} else if len(cfg) != 0 {
-			t.Errorf("model.ServiceRoles: expecting nil, but got %v", cfg)
 		}
-	}
-}
 
-func TestServiceRoleBindings(t *testing.T) {
-	store := model.MakeIstioStore(memory.Make(schemas.Istio))
-	addRbacConfigToStore(schemas.ServiceRoleBinding.Type, "binding1", "istio-system", store, t)
-	addRbacConfigToStore(schemas.ServiceRoleBinding.Type, "binding2", "default", store, t)
-	addRbacConfigToStore(schemas.ServiceRoleBinding.Type, "binding3", "istio-system", store, t)
-	tests := []struct {
-		namespace  string
-		expectName map[string]bool
-	}{
-		{namespace: "wrong", expectName: nil},
-		{namespace: "default", expectName: map[string]bool{"binding2": true}},
-		{namespace: "istio-system", expectName: map[string]bool{"binding1": true, "binding3": true}},
-	}
-
-	for _, tt := range tests {
-		cfg := store.ServiceRoleBindings(tt.namespace)
-		if tt.expectName != nil {
-			for _, cfg := range cfg {
-				if !tt.expectName[cfg.Name] {
-					t.Errorf("model.ServiceRoleBinding: expecting %v, but got %v", tt.expectName, cfg)
+		b.Run(bm.name, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				_, _, ok := model.MostSpecificHostMatch(bm.needle, bm.specificHostsMap, bm.wildcardHostsMap)
+				if bm.matches != ok {
+					b.Fatal("expected to find match")
 				}
-			}
-		} else if len(cfg) != 0 {
-			t.Errorf("model.ServiceRoleBinding: expecting nil, but got %v", cfg)
-		}
-	}
-}
-
-func TestRbacConfig(t *testing.T) {
-	store := model.MakeIstioStore(memory.Make(schemas.Istio))
-	addRbacConfigToStore(schemas.RbacConfig.Type, constants.DefaultRbacConfigName, "", store, t)
-	rbacConfig := store.RbacConfig()
-	if rbacConfig.Name != constants.DefaultRbacConfigName {
-		t.Errorf("model.RbacConfig: expecting %s, but got %s", constants.DefaultRbacConfigName, rbacConfig.Name)
-	}
-}
-
-func TestClusterRbacConfig(t *testing.T) {
-	store := model.MakeIstioStore(memory.Make(schemas.Istio))
-	addRbacConfigToStore(schemas.ClusterRbacConfig.Type, constants.DefaultRbacConfigName, "", store, t)
-	rbacConfig := store.ClusterRbacConfig()
-	if rbacConfig.Name != constants.DefaultRbacConfigName {
-		t.Errorf("model.ClusterRbacConfig: expecting %s, but got %s", constants.DefaultRbacConfigName, rbacConfig.Name)
-	}
-}
-
-func TestAuthorizationPolicies(t *testing.T) {
-	store := model.MakeIstioStore(memory.Make(schemas.Istio))
-	addRbacConfigToStore(schemas.AuthorizationPolicy.Type, "policy1", "istio-system", store, t)
-	addRbacConfigToStore(schemas.AuthorizationPolicy.Type, "policy2", "default", store, t)
-	addRbacConfigToStore(schemas.AuthorizationPolicy.Type, "policy3", "istio-system", store, t)
-	tests := []struct {
-		namespace  string
-		expectName map[string]bool
-	}{
-		{namespace: "wrong", expectName: nil},
-		{namespace: "default", expectName: map[string]bool{"policy2": true}},
-		{namespace: "istio-system", expectName: map[string]bool{"policy1": true, "policy3": true}},
-	}
-
-	for _, tt := range tests {
-		cfg := store.AuthorizationPolicies(tt.namespace)
-		if tt.expectName != nil {
-			for _, cfg := range cfg {
-				if !tt.expectName[cfg.Name] {
-					t.Errorf("model.AuthorizationPolicy: expecting %v, but got %v", tt.expectName, cfg)
-				}
-			}
-		} else if len(cfg) != 0 {
-			t.Errorf("model.AuthorizationPolicy: expecting nil, but got %v", cfg)
-		}
-	}
-}
-
-func addRbacConfigToStore(configType, name, namespace string, store model.IstioConfigStore, t *testing.T) {
-	var value proto.Message
-	switch configType {
-	case schemas.ServiceRole.Type:
-		value = &rbacproto.ServiceRole{Rules: []*rbacproto.AccessRule{
-			{Services: []string{"service0"}, Methods: []string{"GET"}}}}
-	case schemas.ServiceRoleBinding.Type:
-		value = &rbacproto.ServiceRoleBinding{
-			Subjects: []*rbacproto.Subject{{User: "User0"}},
-			RoleRef:  &rbacproto.RoleRef{Kind: "ServiceRole", Name: "ServiceRole001"}}
-	case schemas.AuthorizationPolicy.Type:
-		value = &authz.AuthorizationPolicy{
-			Selector: &api.WorkloadSelector{
-				MatchLabels: map[string]string{"app": "test"},
-			},
-		}
-	default:
-		value = &rbacproto.RbacConfig{Mode: rbacproto.RbacConfig_ON}
-	}
-	cfg := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Type:      configType,
-			Name:      name,
-			Namespace: namespace,
-		},
-		Spec: value, // Not used in test, added to pass validation.
-	}
-	if _, err := store.Create(cfg); err != nil {
-		t.Error(err)
-	}
-}
-
-type fakeStore struct {
-	model.ConfigStore
-	cfg map[string][]model.Config
-	err error
-}
-
-func (l *fakeStore) List(typ, namespace string) ([]model.Config, error) {
-	ret := l.cfg[typ]
-	return ret, l.err
-}
-
-func (l *fakeStore) ConfigDescriptor() schema.Set {
-	return schemas.Istio
-}
-
-func TestIstioConfigStore_QuotaSpecByDestination(t *testing.T) {
-	ns := "ns1"
-	l := &fakeStore{
-		cfg: map[string][]model.Config{
-			schemas.QuotaSpecBinding.Type: {
-				{
-					ConfigMeta: model.ConfigMeta{
-						Namespace: ns,
-						Domain:    "cluster.local",
-					},
-					Spec: &mccpb.QuotaSpecBinding{
-						Services: []*mccpb.IstioService{
-							{
-								Name:      "a",
-								Namespace: ns,
-							},
-						},
-						QuotaSpecs: []*mccpb.QuotaSpecBinding_QuotaSpecReference{
-							{
-								Name: "request-count",
-							},
-							{
-								Name: "does-not-exist",
-							},
-						},
-					},
-				},
-			},
-			schemas.QuotaSpec.Type: {
-				{
-					ConfigMeta: model.ConfigMeta{
-						Name:      "request-count",
-						Namespace: ns,
-					},
-					Spec: &mccpb.QuotaSpec{
-						Rules: []*mccpb.QuotaRule{
-							{
-								Quotas: []*mccpb.Quota{
-									{
-										Quota:  "requestcount",
-										Charge: 100,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	ii := model.MakeIstioStore(l)
-	cfgs := ii.QuotaSpecByDestination(&model.ServiceInstance{
-		Service: &model.Service{
-			Hostname: host.Name("a." + ns + ".svc.cluster.local"),
-		},
-	})
-
-	if len(cfgs) != 1 {
-		t.Fatalf("did not find 1 matched quota")
-	}
-}
-
-func TestMatchesDestHost(t *testing.T) {
-	for _, tst := range []struct {
-		destinationHost string
-		svc             string
-		ans             bool
-	}{
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "myhost.ns.cluster.local",
-			ans:             true,
-		},
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "*",
-			ans:             true,
-		},
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "*.ns.*",
-			ans:             true,
-		},
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "*.ns2.*",
-			ans:             false,
-		},
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "myhost.ns2.cluster.local",
-			ans:             false,
-		},
-		{
-			destinationHost: "myhost.ns.cluster.local",
-			svc:             "ns.*.svc.cluster",
-			ans:             false,
-		},
-	} {
-		t.Run(fmt.Sprintf("%s-%s", tst.destinationHost, tst.svc), func(t *testing.T) {
-			ans := model.MatchesDestHost(tst.destinationHost, model.ConfigMeta{}, &mccpb.IstioService{
-				Service: tst.svc,
-			})
-			if ans != tst.ans {
-				t.Fatalf("want: %v, got: %v", tst.ans, ans)
 			}
 		})
 	}
 }
 
-func TestIstioConfigStore_ServiceEntries(t *testing.T) {
-	ns := "ns1"
-	l := &fakeStore{
-		cfg: map[string][]model.Config{
-			schemas.ServiceEntry.Type: {
-				{
-					ConfigMeta: model.ConfigMeta{
-						Name:      "request-count-1",
-						Namespace: ns,
-					},
-					Spec: &networking.ServiceEntry{
-						Hosts: []string{"*.googleapis.com"},
-						Ports: []*networking.Port{
-							{
-								Name:     "https",
-								Number:   443,
-								Protocol: "HTTP",
-							},
-						},
-					},
-				},
-			},
-			schemas.QuotaSpec.Type: {
-				{
-					ConfigMeta: model.ConfigMeta{
-						Name:      "request-count-2",
-						Namespace: ns,
-					},
-					Spec: &mccpb.QuotaSpec{
-						Rules: []*mccpb.QuotaRule{
-							{
-								Quotas: []*mccpb.Quota{
-									{
-										Quota:  "requestcount",
-										Charge: 100,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	ii := model.MakeIstioStore(l)
-	cfgs := ii.ServiceEntries()
+func BenchmarkMostSpecificHostMatchMixed(b *testing.B) {
+	benchmarks := []struct {
+		name             string
+		needle           host.Name
+		baseHost         string
+		hosts            []host.Name
+		specificHostsMap sets.Set[host.Name]
+		wildcardHostsMap sets.Set[host.Name]
+		time             int
+		matches          bool
+	}{
+		{"10DestRuleWildcardNoMatch", host.Name("foo.bar.com.10"), "foo.bar.com", []host.Name{}, nil, nil, 10, false},
+		{"50DestRuleWildcardNoMatch", host.Name("foo.bar.com.50"), "foo.bar.com", []host.Name{}, nil, nil, 50, false},
+		{"100DestRuleWildcardNoMatch", host.Name("foo.bar.com.100"), "foo.bar.com", []host.Name{}, nil, nil, 100, false},
+		{"1000DestRuleWildcardNoMatch", host.Name("foo.bar.com.1000"), "foo.bar.com", []host.Name{}, nil, nil, 1000, false},
+		{"5000DestRuleWildcardNoMatch", host.Name("foo.bar.com.5000"), "foo.bar.com", []host.Name{}, nil, nil, 5000, false},
 
-	if len(cfgs) != 1 {
-		t.Fatalf("did not find 1 matched ServiceEntry, \n%v", cfgs)
+		{"10DestRuleWildcardMatch", host.Name("foo.bar.baz.com.10"), "bar.baz.com", []host.Name{}, nil, nil, 10, true},
+		{"50DestRuleWildcardMatch", host.Name("foo.bar.baz.com.50"), "bar.baz.com", []host.Name{}, nil, nil, 50, true},
+		{"100DestRuleWildcardMatch", host.Name("foo.bar.baz.com.100"), "bar.baz.com", []host.Name{}, nil, nil, 100, true},
+		{"1000DestRuleWildcardMatch", host.Name("foo.bar.baz.com.1000"), "bar.baz.com", []host.Name{}, nil, nil, 1000, true},
+		{"5000DestRuleWildcardMatch", host.Name("foo.bar.baz.com.5000"), "bar.baz.com", []host.Name{}, nil, nil, 5000, true},
+
+		{"10NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "foo.bar.com", []host.Name{}, nil, nil, 10, false},
+		{"50NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "foo.bar.com", []host.Name{}, nil, nil, 50, false},
+		{"100NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "foo.bar.com", []host.Name{}, nil, nil, 100, false},
+		{"1000NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "foo.bar.com", []host.Name{}, nil, nil, 1000, false},
+		{"5000NeedleWildcardNoMatch", host.Name("*.bar.foo.bar.com"), "foo.bar.com", []host.Name{}, nil, nil, 5000, false},
+
+		{"10NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.10"), "foo.bar.com", []host.Name{}, nil, nil, 10, true},
+		{"50NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.50"), "foo.bar.com", []host.Name{}, nil, nil, 50, true},
+		{"100NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.100"), "foo.bar.com", []host.Name{}, nil, nil, 100, true},
+		{"1000NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.1000"), "foo.bar.com", []host.Name{}, nil, nil, 1000, true},
+		{"5000NeedleWildcardMatch", host.Name("*.bar.foo.bar.com.5000"), "foo.bar.com", []host.Name{}, nil, nil, 5000, true},
+	}
+
+	for _, bm := range benchmarks {
+		bm.specificHostsMap = make(map[host.Name]struct{}, bm.time)
+		bm.wildcardHostsMap = make(map[host.Name]struct{}, bm.time)
+
+		for i := 1; i <= bm.time; i++ {
+			// these specific non-wildcard hosts are crafted this way to never match the needle,
+			// this should replicate real-world scenarios of mixed specific and wildcard hosts
+			specific := host.Name(strconv.Itoa(i) + "." + bm.baseHost)
+			// generate correct wildcard hosts, one of these will match
+			wildcard := host.Name("*." + bm.baseHost + "." + strconv.Itoa(i))
+
+			bm.specificHostsMap[specific] = struct{}{}
+			bm.wildcardHostsMap[wildcard] = struct{}{}
+		}
+
+		b.Run(bm.name, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				_, _, ok := model.MostSpecificHostMatch(bm.needle, bm.specificHostsMap, bm.wildcardHostsMap)
+				if bm.matches != ok {
+					b.Fatal("expected to find match")
+				}
+			}
+		})
 	}
 }
 
-func TestIstioConfigStore_Gateway(t *testing.T) {
-	workloadLabels := labels.Collection{}
-	now := time.Now()
-	gw1 := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Name:              "name1",
-			Namespace:         "zzz",
-			CreationTimestamp: now,
-		},
-		Spec: &networking.Gateway{},
-	}
-	gw2 := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Name:              "name1",
-			Namespace:         "aaa",
-			CreationTimestamp: now,
-		},
-		Spec: &networking.Gateway{},
-	}
-	gw3 := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Name:              "name1",
-			Namespace:         "ns2",
-			CreationTimestamp: now.Add(time.Second * -1),
-		},
-		Spec: &networking.Gateway{},
+func BenchmarkMostSpecificHostMatchMultiMatch(b *testing.B) {
+	benchmarks := []struct {
+		name             string
+		needle           host.Name
+		hosts            []host.Name
+		specificHostsMap map[host.Name]struct{}
+		wildcardHostsMap map[host.Name]struct{}
+	}{
+		{"DestRuleWildcard", host.Name("a.foo.bar.baz.com"), []host.Name{"*.foo.bar.baz.com", "*.bar.baz.com", "*.baz.com", "*.com"}, nil, nil},
+
+		{"NeedleWildcard", host.Name("*.a.foo.bar.baz.com"), []host.Name{"*.foo.bar.baz.com", "*.bar.baz.com", "*.baz.com", "*.com"}, nil, nil},
 	}
 
-	l := &fakeStore{
-		cfg: map[string][]model.Config{
-			schemas.Gateway.Type: {gw1, gw2, gw3},
-		},
-	}
-	ii := model.MakeIstioStore(l)
+	for _, bm := range benchmarks {
+		bm.specificHostsMap = sets.New[host.Name]()
+		bm.wildcardHostsMap = sets.NewWithLength[host.Name](len(bm.hosts))
 
-	// Gateways should be returned in a stable order
-	expectedConfig := []model.Config{
-		gw3, // first config by timestamp
-		gw2, // timestamp match with gw1, but name comes first
-		gw1, // timestamp match with gw2, but name comes last
-	}
-	cfgs := ii.Gateways(workloadLabels)
+		for _, h := range bm.hosts {
+			if h.IsWildCarded() {
+				bm.wildcardHostsMap[h] = struct{}{}
+			} else {
+				bm.specificHostsMap[h] = struct{}{}
+			}
+		}
 
-	if !reflect.DeepEqual(expectedConfig, cfgs) {
-		t.Errorf("Got different Config, Excepted:\n%v\n, Got: \n%v\n", expectedConfig, cfgs)
+		b.Run(bm.name, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				_, _, ok := model.MostSpecificHostMatch(bm.needle, bm.specificHostsMap, bm.wildcardHostsMap)
+				if !ok {
+					b.Fatal("expected to find match")
+				}
+			}
+		})
 	}
 }
 
-func TestIstioConfigStore_EnvoyFilter(t *testing.T) {
-	ns := "ns1"
-	workloadLabels := labels.Collection{}
-
-	l := &fakeStore{
-		cfg: map[string][]model.Config{
-			schemas.EnvoyFilter.Type: {
-				{
-					ConfigMeta: model.ConfigMeta{
-						Name:      "request-count",
-						Namespace: ns,
-					},
-					Spec: &networking.EnvoyFilter{
-						Filters: []*networking.EnvoyFilter_Filter{
-							{
-								InsertPosition: &networking.EnvoyFilter_InsertPosition{
-									Index: networking.EnvoyFilter_InsertPosition_FIRST,
-								},
-								FilterType:   networking.EnvoyFilter_Filter_NETWORK,
-								FilterName:   "envoy.foo",
-								FilterConfig: &types.Struct{},
-							},
-						},
-					},
-				},
+func BenchmarkHashCode(b *testing.B) {
+	benchmarks := []struct {
+		name   string
+		config model.ConfigKey
+	}{
+		{
+			name: "small string",
+			config: model.ConfigKey{
+				Kind:      kind.VirtualService,
+				Name:      "abc",
+				Namespace: "ns-foo",
+			},
+		},
+		{
+			name: "middle string",
+			config: model.ConfigKey{
+				Kind:      kind.VirtualService,
+				Name:      "foo.svc.cluster.local.middle.len",
+				Namespace: "ns-foo-a-middle-string-with-len",
+			},
+		},
+		{
+			name: "long string",
+			config: model.ConfigKey{
+				Kind:      kind.VirtualService,
+				Name:      "foo.svc.cluster.local.middle.len.foo.svc.cluster.local.middle.len",
+				Namespace: "ns-foo-a-middle-string-with-len.ns-foo-a-middle-string-with-len",
 			},
 		},
 	}
-	ii := model.MakeIstioStore(l)
-	mergedFilterConfig := &networking.EnvoyFilter{
-		Filters: []*networking.EnvoyFilter_Filter{
-			{
-				InsertPosition: &networking.EnvoyFilter_InsertPosition{
-					Index: networking.EnvoyFilter_InsertPosition_FIRST,
-				},
-				FilterType:   networking.EnvoyFilter_Filter_NETWORK,
-				FilterName:   "envoy.foo",
-				FilterConfig: &types.Struct{},
-			},
-		},
-	}
-	expectedConfig := &model.Config{Spec: mergedFilterConfig}
-	cfgs := ii.EnvoyFilter(workloadLabels)
-
-	if !reflect.DeepEqual(*expectedConfig, *cfgs) {
-		t.Errorf("Got different Config, Excepted:\n%v\n, Got: \n%v\n", expectedConfig, cfgs)
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			for n := 0; n < b.N; n++ {
+				bm.config.HashCode()
+			}
+		})
 	}
 }
 
-func TestDeepCopy(t *testing.T) {
-	cfg := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Name:              "name1",
-			Namespace:         "zzz",
-			CreationTimestamp: time.Now(),
-		},
-		Spec: &networking.Gateway{},
+func TestHashCodeCollision(t *testing.T) {
+	config1 := model.ConfigKey{
+		Kind:      kind.VirtualService,
+		Name:      "abc",
+		Namespace: "ns-foo",
 	}
 
-	copied := cfg.DeepCopy()
-
-	if !(cfg.Spec.String() == copied.Spec.String() &&
-		cfg.Namespace == copied.Namespace &&
-		cfg.Name == copied.Name &&
-		cfg.CreationTimestamp == copied.CreationTimestamp) {
-		t.Fatalf("cloned config is not identical")
+	config2 := model.ConfigKey{
+		Kind:      kind.VirtualService,
+		Name:      "ab",
+		Namespace: "cns-foo",
 	}
 
+	if config1.HashCode() == config2.HashCode() {
+		t.Fatalf("Hash code of config1 %s should not be equal to config2 %s", config1.String(), config2.String())
+	}
 }

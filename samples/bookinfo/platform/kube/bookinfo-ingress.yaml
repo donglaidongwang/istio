@@ -1,4 +1,4 @@
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 ###########################################################################
 # Ingress resource (gateway)
 ##########################################################################
-apiVersion: extensions/v1beta1
+apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: gateway
@@ -26,19 +26,38 @@ spec:
   - http:
       paths:
       - path: /productpage
+        pathType: Exact
         backend:
-          serviceName: productpage
-          servicePort: 9080
+          service:
+            name: productpage
+            port:
+              number: 9080
+      - path: /static/
+        pathType: Prefix
+        backend:
+          service:
+            name: productpage
+            port:
+              number: 9080
       - path: /login
+        pathType: Exact
         backend:
-          serviceName: productpage
-          servicePort: 9080
+          service:
+            name: productpage
+            port:
+              number: 9080
       - path: /logout
+        pathType: Exact
         backend:
-          serviceName: productpage
-          servicePort: 9080
-      - path: /api/v1/products.*
+          service:
+            name: productpage
+            port:
+              number: 9080
+      - path: /api/v1/products
+        pathType: Prefix
         backend:
-          serviceName: productpage
-          servicePort: 9080
+          service:
+            name: productpage
+            port:
+              number: 9080
 ---

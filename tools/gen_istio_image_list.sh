@@ -30,24 +30,31 @@ function get_istio_images() {
 
     while IFS= read -r line 
     do 
-       if [[ $line == DOCKER_TARGETS:=*\\ ]]
+       if [[ $line == DOCKER_TARGETS* ]]
        then
-           buff+=${line#DOCKER_TARGETS:=}
+           buff+=${line#DOCKER_TARGETS}
            continue_processing=1
        else
            if [ $continue_processing -eq 1 ]
            then
-              buff=${buff%\\}$line
-              break
+              if [[ $line == *\\ ]]
+              then
+                buff=${buff%\\}$line
+              else
+                buff=${buff%\\}$line
+                break
+              fi
            fi
        fi
     done < temp.file
 
     for repo in $buff; do
-       istio_component=${repo##docker.};
-       istio_repo=istio/$istio_component;
-       #istio_tag=$(get_latest_tag "$istio_repo")
-       echo docker.io/"$istio_repo":"${1}"
+       if [[ $repo == *docker.* ]]
+       then
+           istio_component=${repo##*docker.};
+           istio_repo=release/$istio_component;
+           echo registry.istio.io/"$istio_repo":"${1}"
+       fi
     done
 
     if [ -f temp.file ];
@@ -132,7 +139,7 @@ do
              echo "Please provide an Istio release."
              display_usage
           else
-             if [[ "$2" =~ [0-9].[0-9].[0-9] ]];
+             if [[ "$2" =~ [0-9]+\.[0-9]+\.[0-9]+ ]];
              then
                 CURRENT_RELEASE="$2"
              else

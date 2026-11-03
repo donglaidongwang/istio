@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,13 @@
 package memory_test
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/test/mock"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/test"
 )
 
 const (
@@ -27,20 +30,35 @@ const (
 )
 
 func TestControllerEvents(t *testing.T) {
-	store := memory.Make(mock.Types)
-	ctl := memory.NewController(store)
+	ctl := memory.NewController(collections.Mocks, false)
 	// Note that the operations must go through the controller since the store does not trigger back events
 	mock.CheckCacheEvents(ctl, ctl, TestNamespace, 5, t)
 }
 
 func TestControllerCacheFreshness(t *testing.T) {
-	store := memory.Make(mock.Types)
-	ctl := memory.NewController(store)
+	ctl := memory.NewController(collections.Mocks, false)
 	mock.CheckCacheFreshness(ctl, TestNamespace, t)
 }
 
 func TestControllerClientSync(t *testing.T) {
-	store := memory.Make(mock.Types)
-	ctl := memory.NewController(store)
-	mock.CheckCacheSync(store, ctl, TestNamespace, 5, t)
+	ctl := memory.NewController(collections.Mocks, false)
+	mock.CheckCacheSync(ctl, ctl, TestNamespace, 5, t)
+}
+
+func TestControllerHashSynced(t *testing.T) {
+	var v int32
+	ctl := memory.NewController(collections.Mocks, false)
+	go ctl.Run(test.NewStop(t))
+
+	ctl.RegisterHasSyncedHandler(func() bool {
+		return atomic.LoadInt32(&v) > 0
+	})
+
+	if ctl.HasSynced() {
+		t.Error("has synced but should not")
+	}
+	atomic.StoreInt32(&v, 1)
+	if !ctl.HasSynced() {
+		t.Error("has not synced but should")
+	}
 }

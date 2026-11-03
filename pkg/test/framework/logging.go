@@ -1,4 +1,4 @@
-//  Copyright 2019 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,15 +17,17 @@ package framework
 import (
 	"flag"
 
-	"istio.io/istio/pkg/test/scopes"
-	"istio.io/pkg/log"
+	controllruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"istio.io/istio/pkg/log"
 )
 
-var (
-	logOptionsFromCommandline = log.DefaultOptions()
-)
+var logOptionsFromCommandline = log.DefaultOptions()
 
 func init() {
+	scope := log.RegisterScope("controlleruntime", "scope for controller runtime")
+	controllruntimelog.SetLogger(log.NewLogrAdapter(scope))
+
 	logOptionsFromCommandline.AttachFlags(
 		func(p *[]string, name string, value []string, usage string) {
 			// TODO(ozben): Implement string array method for capturing the complete set of log settings.
@@ -35,14 +37,9 @@ func init() {
 		flag.BoolVar)
 }
 
-func configureLogging(ciMode bool) error {
+func configureLogging() error {
 	o := *logOptionsFromCommandline
-
-	if ciMode {
-		o.SetOutputLevel(scopes.CI.Name(), log.InfoLevel)
-	} else {
-		o.SetOutputLevel(scopes.CI.Name(), log.NoneLevel)
-	}
-
+	// This is spammy at info level, even for tests, so set to warn level
+	o.SetDefaultOutputLevel("installer", log.WarnLevel)
 	return log.Configure(&o)
 }

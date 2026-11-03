@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,29 +18,37 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/golang/protobuf/jsonpb"
 	"github.com/pmezard/go-difflib/difflib"
+
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
-// ClusterDiff prints a diff between Pilot and Envoy clusters to the passed writer
+// ClusterDiff prints a diff between Istiod and Envoy clusters to the passed writer
 func (c *Comparator) ClusterDiff() error {
-	jsonm := &jsonpb.Marshaler{Indent: "   "}
-	envoyBytes, pilotBytes := &bytes.Buffer{}, &bytes.Buffer{}
+	envoyBytes, istiodBytes := &bytes.Buffer{}, &bytes.Buffer{}
 	envoyClusterDump, err := c.envoy.GetDynamicClusterDump(true)
 	if err != nil {
 		envoyBytes.WriteString(err.Error())
-	} else if err := jsonm.Marshal(envoyBytes, envoyClusterDump); err != nil {
-		return err
+	} else {
+		envoy, err := protomarshal.ToJSONWithAnyResolver(envoyClusterDump, "    ", &envoyResolver)
+		if err != nil {
+			return err
+		}
+		envoyBytes.WriteString(envoy)
 	}
-	pilotClusterDump, err := c.pilot.GetDynamicClusterDump(true)
+	istiodClusterDump, err := c.istiod.GetDynamicClusterDump(true)
 	if err != nil {
-		pilotBytes.WriteString(err.Error())
-	} else if err := jsonm.Marshal(pilotBytes, pilotClusterDump); err != nil {
-		return err
+		istiodBytes.WriteString(err.Error())
+	} else {
+		istiod, err := protomarshal.ToJSONWithAnyResolver(istiodClusterDump, "    ", &envoyResolver)
+		if err != nil {
+			return err
+		}
+		istiodBytes.WriteString(istiod)
 	}
 	diff := difflib.UnifiedDiff{
-		FromFile: "Pilot Clusters",
-		A:        difflib.SplitLines(pilotBytes.String()),
+		FromFile: "Istiod Clusters",
+		A:        difflib.SplitLines(istiodBytes.String()),
 		ToFile:   "Envoy Clusters",
 		B:        difflib.SplitLines(envoyBytes.String()),
 		Context:  c.context,
@@ -50,6 +58,7 @@ func (c *Comparator) ClusterDiff() error {
 		return err
 	}
 	if text != "" {
+		fmt.Fprintln(c.w, "Clusters Don't Match")
 		fmt.Fprintln(c.w, text)
 	} else {
 		fmt.Fprintln(c.w, "Clusters Match")

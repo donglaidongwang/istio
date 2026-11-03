@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,87 +18,277 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
-	"istio.io/istio/pkg/test/echo/common"
-	"istio.io/istio/pkg/test/echo/common/response"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+
+	"istio.io/istio/pkg/hbone"
+	"istio.io/istio/pkg/test/echo"
+	"istio.io/istio/pkg/test/echo/common/scheme"
+	"istio.io/istio/pkg/test/echo/proto"
 )
 
 var _ protocol = &httpProtocol{}
 
 type httpProtocol struct {
-	client *http.Client
-	do     common.HTTPDoFunc
+	e *executor
 }
 
-func (c *httpProtocol) setHost(r *http.Request, host string) {
-	r.Host = host
-
-	if r.URL.Scheme == "https" {
-		// Set SNI value to be same as the request Host
-		// For use with SNI routing tests
-		httpTransport := c.client.Transport.(*http.Transport)
-		httpTransport.TLSClientConfig.ServerName = host
-	}
+func newHTTPProtocol(e *executor) *httpProtocol {
+	return &httpProtocol{e: e}
 }
 
-func (c *httpProtocol) makeRequest(ctx context.Context, req *request) (string, error) {
-	httpReq, err := http.NewRequest("GET", req.URL, nil)
-	if err != nil {
-		return "", err
+type httpTransportGetter func() (http.RoundTripper, func(), error)
+
+func (c *httpProtocol) ForwardEcho(ctx context.Context, cfg *Config) (*proto.ForwardEchoResponse, error) {
+	var getTransport httpTransportGetter
+	var closeSharedTransport func()
+
+	switch {
+	case cfg.Request.Http3:
+		getTransport, closeSharedTransport = newHTTP3TransportGetter(cfg)
+	case cfg.Request.Http2:
+		getTransport, closeSharedTransport = newHTTP2TransportGetter(cfg)
+	default:
+		getTransport, closeSharedTransport = newHTTPTransportGetter(cfg)
 	}
+
+	defer closeSharedTransport()
+
+	call := &httpCall{
+		httpProtocol: c,
+		getTransport: getTransport,
+	}
+
+	return doForward(ctx, cfg, c.e, call.makeRequest)
+}
+
+func newHTTP3TransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http3.Transport {
+		return &http3.Transport{
+			TLSClientConfig: cfg.tlsConfig,
+			QUICConfig:      &quic.Config{},
+		}
+	}
+	closeFn := func(conn *http3.Transport) func() {
+		return func() {
+			_ = conn.Close()
+		}
+	}
+	noCloseFn := func() {}
+
+	if cfg.newConnectionPerRequest {
+		// Create a new transport (i.e. connection) for each request.
+		return func() (http.RoundTripper, func(), error) {
+			conn := newConn()
+			return conn, closeFn(conn), nil
+		}, noCloseFn
+	}
+
+	// Re-use the same transport for all requests. For HTTP3, this should result
+	// in multiplexing all requests over the same connection.
+	conn := newConn()
+	return func() (http.RoundTripper, func(), error) {
+		return conn, noCloseFn, nil
+	}, closeFn(conn)
+}
+
+func newHTTP2TransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http.Transport {
+		transport := &http.Transport{Protocols: new(http.Protocols)}
+		if cfg.scheme == scheme.HTTPS {
+			transport.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return hbone.TLSDialWithDialer(newDialer(cfg), network, addr, hbone.H2ClientTLSConfig(cfg.tlsConfig, addr))
+			}
+			// net/http disables HTTP/2 by default when a custom TLS config or dialer is set.
+			transport.Protocols.SetHTTP2(true)
+			return transport
+		}
+
+		// Must be DialContext, not DialTLSContext: net/http only consults the latter for
+		// https:// URLs, so the h2c transport would silently bypass the configured dialer
+		// (HBONE, socks5, ...).
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return newDialer(cfg).DialContext(ctx, network, addr)
+		}
+		transport.Protocols.SetUnencryptedHTTP2(true)
+
+		return transport
+	}
+
+	closeFn := func(conn *http.Transport) func() {
+		return conn.CloseIdleConnections
+	}
+	noCloseFn := func() {}
+
+	if cfg.newConnectionPerRequest {
+		// Create a new transport (i.e. connection) for each request.
+		return func() (http.RoundTripper, func(), error) {
+			conn := newConn()
+			return conn, closeFn(conn), nil
+		}, noCloseFn
+	}
+
+	// Re-use the same transport for all requests. For HTTP2, this should result
+	// in multiplexing all requests over the same connection.
+	conn := newConn()
+	return func() (http.RoundTripper, func(), error) {
+		return conn, noCloseFn, nil
+	}, closeFn(conn)
+}
+
+func newHTTPTransportGetter(cfg *Config) (httpTransportGetter, func()) {
+	newConn := func() *http.Transport {
+		dialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return newDialer(cfg).DialContext(ctx, network, addr)
+		}
+		if len(cfg.UDS) > 0 {
+			dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return newDialer(cfg).DialContext(ctx, "unix", cfg.UDS)
+			}
+		}
+		out := &http.Transport{
+			// No connection pooling.
+			DisableKeepAlives: true,
+			TLSClientConfig:   cfg.tlsConfig,
+			DialContext:       dialContext,
+		}
+
+		// Set the proxy in the transport, if specified.
+		// for socks5 proxy is setup is done in the newDialer function.
+		if !strings.HasPrefix(cfg.Proxy, "socks5://") {
+			out.Proxy = cfg.proxyURL
+		}
+		return out
+	}
+	noCloseFn := func() {}
+
+	// Always create a new HTTP transport for each request, since HTTP can't multiplex over
+	// a single connection.
+	return func() (http.RoundTripper, func(), error) {
+		conn := newConn()
+		return conn, noCloseFn, nil
+	}, noCloseFn
+}
+
+type httpCall struct {
+	*httpProtocol
+	getTransport httpTransportGetter
+}
+
+func (c *httpCall) makeRequest(ctx context.Context, cfg *Config, requestID int) (string, error) {
+	start := time.Now()
+
+	r := cfg.Request
+	var outBuffer bytes.Buffer
+	echo.ForwarderURLField.WriteForRequest(&outBuffer, requestID, r.Url)
 
 	// Set the per-request timeout.
-	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
+	ctx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
-	httpReq = httpReq.WithContext(ctx)
 
-	var outBuffer bytes.Buffer
-	outBuffer.WriteString(fmt.Sprintf("[%d] Url=%s\n", req.RequestID, req.URL))
-	host := ""
-	writeHeaders(req.RequestID, req.Header, outBuffer, func(key string, value string) {
-		if key == hostHeader {
-			host = value
-		} else {
-			httpReq.Header.Add(key, value)
-		}
-	})
-
-	c.setHost(httpReq, host)
-
-	httpResp, err := c.do(c.client, httpReq)
+	httpReq, err := http.NewRequestWithContext(ctx, cfg.method, cfg.urlHost, nil)
 	if err != nil {
 		return outBuffer.String(), err
 	}
 
-	outBuffer.WriteString(fmt.Sprintf("[%d] %s=%d\n", req.RequestID, response.StatusCodeField, httpResp.StatusCode))
+	// Use raw path, we don't want golang normalizing anything since we use this for testing purposes
+	httpReq.URL.Opaque = cfg.urlPath
 
-	for key, values := range httpResp.Header {
-		for _, value := range values {
-			outBuffer.WriteString(fmt.Sprintf("[%d] ResponseHeader=%s:%s\n", req.RequestID, key, value))
-		}
+	// Use the host header as the host.
+	httpReq.Host = cfg.hostHeader
+
+	// Copy the headers.
+	httpReq.Header = cfg.headers.Clone()
+	writeForwardedHeaders(&outBuffer, requestID, cfg.headers)
+
+	// Propagate previous response cookies if any
+	if cfg.PropagateResponse != nil {
+		cfg.PropagateResponse(httpReq, cfg.previousResponse)
+	}
+	// Get the transport.
+	transport, closeTransport, err := c.getTransport()
+	if err != nil {
+		return outBuffer.String(), err
+	}
+	defer closeTransport()
+
+	// Create a new HTTP client.
+	client := &http.Client{
+		CheckRedirect: cfg.checkRedirect,
+		Timeout:       cfg.timeout,
+		Transport:     transport,
 	}
 
-	data, err := ioutil.ReadAll(httpResp.Body)
+	var localAddr string
+	httpReq = httpReq.WithContext(httptrace.WithClientTrace(httpReq.Context(), &httptrace.ClientTrace{
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			localAddr, _, _ = net.SplitHostPort(connInfo.Conn.LocalAddr().String())
+		},
+	}))
+
+	// Make the request.
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return outBuffer.String(), err
+	}
+	cfg.previousResponse = httpResp
+
+	echo.SourceIPField.WriteForRequest(&outBuffer, requestID, localAddr)
+	echo.LatencyField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%v", time.Since(start)))
+	echo.ActiveRequestsField.WriteForRequest(&outBuffer, requestID, fmt.Sprintf("%d", c.e.ActiveRequests()))
+
+	// Process the response.
+	err = processHTTPResponse(requestID, httpResp, &outBuffer)
+
+	// Extract the output string.
+	return outBuffer.String(), err
+}
+
+func processHTTPResponse(requestID int, httpResp *http.Response, outBuffer *bytes.Buffer) error {
+	// Make sure we close the body before exiting.
 	defer func() {
-		if err = httpResp.Body.Close(); err != nil {
-			outBuffer.WriteString(fmt.Sprintf("[%d error] %s\n", req.RequestID, err))
+		if err := httpResp.Body.Close(); err != nil {
+			echo.WriteError(outBuffer, requestID, err)
 		}
 	}()
 
+	echo.StatusCodeField.WriteForRequest(outBuffer, requestID, strconv.Itoa(httpResp.StatusCode))
+
+	// Read the entire body.
+	data, err := io.ReadAll(httpResp.Body)
 	if err != nil {
-		return outBuffer.String(), err
+		return err
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
-		if line != "" {
-			outBuffer.WriteString(fmt.Sprintf("[%d body] %s\n", req.RequestID, line))
+	// Write the response headers to the output buffer.
+	var keys []string
+	for k := range httpResp.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		values := httpResp.Header[key]
+		for _, value := range values {
+			echo.ResponseHeaderField.WriteKeyValueForRequest(outBuffer, requestID, key, value)
 		}
 	}
 
-	return outBuffer.String(), nil
+	// Write the lines of the body to the output buffer.
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			echo.WriteBodyLine(outBuffer, requestID, line)
+		}
+	}
+	return nil
 }
 
 func (c *httpProtocol) Close() error {

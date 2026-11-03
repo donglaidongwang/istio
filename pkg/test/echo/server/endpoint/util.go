@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,20 +15,55 @@
 package endpoint
 
 import (
-	"bytes"
-	"fmt"
+	"crypto/tls"
 	"net"
 	"os"
+	"strconv"
+	"time"
 
-	"istio.io/istio/pkg/test/echo/common/response"
+	"istio.io/istio/pkg/log"
 )
 
-func listenOnPort(port int) (net.Listener, int, error) {
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+var epLog = log.RegisterScope("endpoint", "echo serverside")
+
+const (
+	requestTimeout = 15 * time.Second
+	idleTimeout    = 5 * time.Second
+)
+
+func listenOnAddress(ip string, port int) (net.Listener, int, error) {
+	parsedIP := net.ParseIP(ip)
+	ipBind := "tcp"
+	if parsedIP != nil {
+		if parsedIP.To4() == nil && parsedIP.To16() != nil {
+			ipBind = "tcp6"
+		} else if parsedIP.To4() != nil {
+			ipBind = "tcp4"
+		}
+	}
+	ln, err := net.Listen(ipBind, net.JoinHostPort(ip, strconv.Itoa(port)))
 	if err != nil {
 		return nil, 0, err
 	}
 
+	port = ln.Addr().(*net.TCPAddr).Port
+	return ln, port, nil
+}
+
+func listenOnAddressTLS(ip string, port int, cfg *tls.Config) (net.Listener, int, error) {
+	ipBind := "tcp"
+	parsedIP := net.ParseIP(ip)
+	if parsedIP != nil {
+		if parsedIP.To4() == nil && parsedIP.To16() != nil {
+			ipBind = "tcp6"
+		} else if parsedIP.To4() != nil {
+			ipBind = "tcp4"
+		}
+	}
+	ln, err := tls.Listen(ipBind, net.JoinHostPort(ip, strconv.Itoa(port)), cfg)
+	if err != nil {
+		return nil, 0, err
+	}
 	port = ln.Addr().(*net.TCPAddr).Port
 	return ln, port, nil
 }
@@ -43,7 +78,33 @@ func listenOnUDS(uds string) (net.Listener, error) {
 	return ln, nil
 }
 
-// nolint: interfacer
-func writeField(out *bytes.Buffer, field response.Field, value string) {
-	_, _ = out.WriteString(string(field) + "=" + value + "\n")
+func listenUDPAddress(ip string, port int) (net.PacketConn, int, error) {
+	parsedIP := net.ParseIP(ip)
+	ipBind := "udp"
+	if parsedIP != nil {
+		if parsedIP.To4() == nil && parsedIP.To16() != nil {
+			ipBind = "udp6"
+		} else if parsedIP.To4() != nil {
+			ipBind = "udp4"
+		}
+	}
+	ln, err := net.ListenPacket(ipBind, net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	port = ln.LocalAddr().(*net.UDPAddr).Port
+	return ln, port, nil
+}
+
+// forceClose the given socket.
+func forceClose(conn net.Conn) error {
+	// Close may be called more than once.
+	defer func() { _ = conn.Close() }()
+
+	// Force the connection closed (should result in sending RST)
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		return tcp.SetLinger(0)
+	}
+	return nil
 }

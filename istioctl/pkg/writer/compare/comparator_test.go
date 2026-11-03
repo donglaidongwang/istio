@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,76 +16,60 @@ package compare
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"testing"
 )
 
-func loadPilotDump() []byte {
-	bytes, _ := ioutil.ReadFile("testdata/pilotconfigdump.json")
-	return bytes
-}
-func loadEnvoyDump() []byte {
-	bytes, _ := ioutil.ReadFile("testdata/envoyconfigdump.json")
-	return bytes
-}
-func loadDiffEnvoyDump() []byte {
-	bytes, _ := ioutil.ReadFile("testdata/diffenvoyconfigdump.json")
-	return bytes
+// TestComparatorMatchingConfigs tests the scenario where Istiod and Envoy configurations match
+func TestComparatorMatchingSameConfigs(t *testing.T) {
+	cfg, err := os.ReadFile("testdata/configdump.json")
+	if err != nil {
+		t.Fatalf("Failed to read test data: %v", err)
+	}
+
+	var outputBuffer bytes.Buffer
+	comparator, err := NewComparator(&outputBuffer, map[string][]byte{"default": cfg}, cfg)
+	if err != nil {
+		t.Fatalf("Failed to create Comparator: %v", err)
+	}
+	err = comparator.Diff()
+	if err != nil {
+		t.Errorf("Unexpected error during diff: %v", err)
+	}
+
+	expected := []string{"Clusters Match", "Listeners Match", "Routes Match"}
+	for _, exp := range expected {
+		if !bytes.Contains(outputBuffer.Bytes(), []byte(exp)) {
+			t.Errorf("Expected %s, but it was not found", exp)
+		}
+	}
 }
 
-func TestNewComparator(t *testing.T) {
-	tests := []struct {
-		name                 string
-		pilotResponses       map[string][]byte
-		envoyResponse        []byte
-		wantEnvoy, wantPilot bool
-		wantErr              bool
-	}{
-		{
-			name: "populates envoy and pilot wrappers",
-			pilotResponses: map[string][]byte{
-				"pilot1": []byte("nope"),
-				"pilot2": loadPilotDump(),
-			},
-			envoyResponse: loadEnvoyDump(),
-			wantEnvoy:     true,
-			wantPilot:     true,
-		},
-		{
-			name: "errors if pilot can't be populated",
-			pilotResponses: map[string][]byte{
-				"pilot1": []byte("nope"),
-				"pilot2": []byte("nope"),
-			},
-			envoyResponse: loadEnvoyDump(),
-			wantErr:       true,
-		},
-		{
-			name: "errors if pilot can't be populated",
-			pilotResponses: map[string][]byte{
-				"pilot1": []byte("nope"),
-				"pilot2": loadPilotDump(),
-			},
-			envoyResponse: []byte("nope"),
-			wantErr:       true,
-		},
+// TestComparatorMismatchedConfigs tests the scenario where Istiod and Envoy configurations do not match
+func TestComparatorMismatchedConfigs(t *testing.T) {
+	cfg, err := os.ReadFile("testdata/configdump.json")
+	if err != nil {
+		t.Fatalf("Failed to read test data: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w := &bytes.Buffer{}
-			got, err := NewComparator(w, tt.pilotResponses, tt.envoyResponse)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NewComparator() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if err != nil {
-				return
-			}
-			if tt.wantEnvoy != (got.envoy != nil) {
-				t.Errorf("NewComparator() envoy = %v, wantEnvoy %v", got.envoy, tt.wantEnvoy)
-			}
-			if tt.wantPilot != (got.pilot != nil) {
-				t.Errorf("NewComparator() envoy = %v, wantEnvoy %v", got.pilot, tt.wantPilot)
-			}
-		})
+	diffCfg, err := os.ReadFile("testdata/configdump_diff.json")
+	if err != nil {
+		t.Fatalf("Failed to read test data: %v", err)
+	}
+
+	var outputBuffer bytes.Buffer
+	comparator, err := NewComparator(&outputBuffer, map[string][]byte{"default": cfg}, diffCfg)
+	if err != nil {
+		t.Fatalf("Failed to create Comparator: %v", err)
+	}
+	err = comparator.Diff()
+	if err != nil {
+		t.Errorf("Unexpected error during diff: %v", err)
+	}
+
+	expectedNotMatch := []string{"Clusters Don't Match", "Listeners Don't Match", "Routes Don't Match"}
+	for _, exp := range expectedNotMatch {
+		if !bytes.Contains(outputBuffer.Bytes(), []byte(exp)) {
+			t.Errorf("Expected %s, but it was not found", exp)
+		}
 	}
 }

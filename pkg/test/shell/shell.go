@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -19,16 +19,19 @@ import (
 	"os/exec"
 	"strings"
 
-	"istio.io/pkg/log"
+	"github.com/google/shlex"
+
+	"istio.io/istio/pkg/log"
 )
 
-var scope = log.RegisterScope("shell", "Shell execution scope", 0)
+var scope = log.RegisterScope("shell", "Shell execution scope")
 
 // Execute the given command.
-func Execute(combinedOutput bool, format string, args ...interface{}) (string, error) {
-	s := fmt.Sprintf(format, args...)
-	// TODO: escape handling
-	parts := strings.Split(s, " ")
+func Execute(combinedOutput bool, args string) (string, error) {
+	parts, err := shlex.Split(args)
+	if err != nil {
+		return "", fmt.Errorf("fail to parse cmd: %q, err: %v", args, err)
+	}
 
 	var p []string
 	for i := 0; i < len(parts); i++ {

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,18 +15,19 @@
 package labels
 
 import (
-	"bytes"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+
+	"istio.io/istio/pkg/maps"
+	"istio.io/istio/pkg/slices"
 )
 
 const (
 	DNS1123LabelMaxLength = 63 // Public for testing only.
-	dns1123LabelFmt       = "[a-zA-Z0-9](?:[-a-z-A-Z0-9]*[a-zA-Z0-9])?"
+	dns1123LabelFmt       = "[a-zA-Z0-9](?:[-a-zA-Z0-9]*[a-zA-Z0-9])?"
 	// a wild-card prefix is an '*', a normal DNS1123 label with a leading '*' or '*-', or a normal DNS1123 label
 	wildcardPrefix = `(\*|(\*|\*-)?` + dns1123LabelFmt + `)`
 
@@ -55,29 +56,44 @@ var (
 // have labels name=kittyCat,region=us-east.
 type Instance map[string]string
 
-// SubsetOf is true if the label has identical values for the keys
+// SubsetOf is true if the label has same values for the keys
 func (i Instance) SubsetOf(that Instance) bool {
-	for k, v := range i {
-		if that[k] != v {
+	if len(i) == 0 {
+		return true
+	}
+
+	if len(that) == 0 || len(that) < len(i) {
+		return false
+	}
+
+	for k, v1 := range i {
+		if v2, ok := that[k]; !ok || v1 != v2 {
 			return false
 		}
 	}
 	return true
 }
 
-// Equals returns true if the labels are identical
+// Match is true if the label has same values for the keys.
+// if len(i) == 0, will return false. It is mainly used for service -> workload
+func (i Instance) Match(that Instance) bool {
+	if len(i) == 0 {
+		return false
+	}
+
+	return i.SubsetOf(that)
+}
+
+// Equals returns true if the labels are equal.
 func (i Instance) Equals(that Instance) bool {
-	if i == nil {
-		return that == nil
-	}
-	if that == nil {
-		return i == nil
-	}
-	return i.SubsetOf(that) && that.SubsetOf(i)
+	return maps.Equal(i, that)
 }
 
 // Validate ensures tag is well-formed
 func (i Instance) Validate() error {
+	if i == nil {
+		return nil
+	}
 	var errs error
 	for k, v := range i {
 		if err := validateTagKey(k); err != nil {
@@ -97,7 +113,7 @@ func IsDNS1123Label(value string) bool {
 }
 
 // IsWildcardDNS1123Label tests for a string that conforms to the definition of a label in DNS (RFC 1123), but allows
-// the wildcard label (`*`), and typical labels with a leading astrisk instead of alphabetic character (e.g. "*-foo")
+// the wildcard label (`*`), and typical labels with a leading asterisk instead of alphabetic character (e.g. "*-foo")
 func IsWildcardDNS1123Label(value string) bool {
 	return len(value) <= DNS1123LabelMaxLength && wildcardPrefixRegexp.MatchString(value)
 }
@@ -124,41 +140,25 @@ func validateTagKey(k string) error {
 }
 
 func (i Instance) String() string {
-	labels := make([]string, 0, len(i))
-	for k, v := range i {
-		if len(v) > 0 {
-			labels = append(labels, fmt.Sprintf("%s=%s", k, v))
-		} else {
-			labels = append(labels, k)
-		}
-	}
-	sort.Strings(labels)
+	// Ensure stable ordering
+	keys := slices.Sort(maps.Keys(i))
 
-	var buffer bytes.Buffer
-	var first = true
-	for _, label := range labels {
+	var buffer strings.Builder
+	// Assume each kv pair is roughly 25 characters. We could be under or over, this is just a guess to optimize
+	buffer.Grow(len(keys) * 25)
+	first := true
+	for _, k := range keys {
+		v := i[k]
 		if !first {
 			buffer.WriteString(",")
 		} else {
 			first = false
 		}
-		buffer.WriteString(label)
-	}
-	return buffer.String()
-}
-
-// Parse labels from a comma-separated string of the form k1=v1,k2=v2,...,kn=vn.
-func Parse(s string) Instance {
-	pairs := strings.Split(s, ",")
-	tag := make(Instance, len(pairs))
-
-	for _, pair := range pairs {
-		kv := strings.Split(pair, "=")
-		if len(kv) > 1 {
-			tag[kv[0]] = kv[1]
+		if len(v) > 0 {
+			buffer.WriteString(k + "=" + v)
 		} else {
-			tag[kv[0]] = ""
+			buffer.WriteString(k)
 		}
 	}
-	return tag
+	return buffer.String()
 }

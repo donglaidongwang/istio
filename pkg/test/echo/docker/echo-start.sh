@@ -16,10 +16,13 @@
 #
 ################################################################################
 
-set -e
+set -ex
 
-# Before we begin, run the post installation script to finish setting up the system.
-"/usr/local/bin/postinst.sh"
+# To support image builders which cannot do RUN, do the run commands at startup.
+# This exploits the fact the images remove the installer once its installed.
+# This is a horrible idea for production images, but these are just for tests.
+[[ -f /tmp/istio-sidecar.rpm ]] && rpm -vi /tmp/istio-sidecar.rpm && rm /tmp/istio-sidecar.rpm
+[[ -f /tmp/istio-sidecar.deb ]] && dpkg -i /tmp/istio-sidecar.deb && rm /tmp/istio-sidecar.deb
 
 # IF ECHO_ARGS is unset, make it an empty string.
 ECHO_ARGS=${ECHO_ARGS:-}
@@ -28,17 +31,8 @@ IFS=' ' read -r -a ECHO_ARGS_ARRAY <<< "$ECHO_ARGS"
 
 ISTIO_LOG_DIR=${ISTIO_LOG_DIR:-/var/log/istio}
 
-# Run the ip-tables script.
-/usr/local/bin/istio-iptables
-
-# Indicate that istio-start should not run the iptables script.
-export ISTIO_CUSTOM_IP_TABLES="true"
-
 # Run the pilot agent and Envoy
 /usr/local/bin/istio-start.sh&
-
-# Run the node agent.
-# /usr/local/bin/istio-node-agent-start.sh&
 
 # Start the echo server.
 "/usr/local/bin/server" "${ECHO_ARGS_ARRAY[@]}"

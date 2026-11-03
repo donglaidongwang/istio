@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,15 +16,15 @@ package util
 
 import (
 	"crypto/x509"
-	"io/ioutil"
 	"log"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
 
 func loadPEMFile(path string) string {
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		log.Fatalf("failed to load the pem file = %v, err = %v", path, err)
 	}
@@ -131,7 +131,7 @@ func TestVerifyCert(t *testing.T) {
 			certChainPem:   []byte(certChain),
 			rootCertPem:    []byte(rootCert),
 			expectedFields: verifyField2,
-			expectedErr:    "the generated private key and cert doesn't match",
+			expectedErr:    "the generated private RSA key and cert doesn't match",
 		},
 		"Wrong SAN": {
 			privPem:        []byte(key),
@@ -202,5 +202,32 @@ func TestVerifyCert(t *testing.T) {
 		} else if len(tc.expectedErr) != 0 {
 			t.Errorf("%s: Expected error %s but succeeded", id, tc.expectedErr)
 		}
+	}
+}
+
+func TestCertExpired(t *testing.T) {
+	testCases := map[string]struct {
+		filepath string
+		expected bool
+	}{
+		"Expired Cert": {
+			filepath: "../testdata/expired-cert.pem",
+			expected: true,
+		},
+		"Not Expired Cert": {
+			filepath: "../testdata/notexpired-cert.pem",
+			expected: false,
+		},
+	}
+	for id, tc := range testCases {
+		t.Run(id, func(t *testing.T) {
+			certExpired, err := IsCertExpired(tc.filepath)
+			if err != nil {
+				t.Fatalf("failed to check the cert, err is: %v", err)
+			}
+			if certExpired != tc.expected {
+				t.Errorf("isCertExpired: get %v, want %v", certExpired, tc.expected)
+			}
+		})
 	}
 }

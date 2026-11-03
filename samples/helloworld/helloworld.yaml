@@ -4,6 +4,7 @@ metadata:
   name: helloworld
   labels:
     app: helloworld
+    service: helloworld
 spec:
   ports:
   - port: 5000
@@ -16,6 +17,7 @@ kind: Deployment
 metadata:
   name: helloworld-v1
   labels:
+    app: helloworld
     version: v1
 spec:
   replicas: 1
@@ -31,7 +33,7 @@ spec:
     spec:
       containers:
       - name: helloworld
-        image: docker.io/istio/examples-helloworld-v1
+        image: registry.istio.io/release/examples-helloworld-v1:1.0
         resources:
           requests:
             cpu: "100m"
@@ -44,6 +46,7 @@ kind: Deployment
 metadata:
   name: helloworld-v2
   labels:
+    app: helloworld
     version: v2
 spec:
   replicas: 1
@@ -59,7 +62,7 @@ spec:
     spec:
       containers:
       - name: helloworld
-        image: docker.io/istio/examples-helloworld-v2
+        image: registry.istio.io/release/examples-helloworld-v2:1.0
         resources:
           requests:
             cpu: "100m"

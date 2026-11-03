@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"istio.io/istio/pkg/log"
 )
 
 // Selector is a Set of label filter expressions that get applied together to decide whether tests should be selected
@@ -59,13 +61,14 @@ func ParseSelector(s string) (Selector, error) {
 			p = p[1:]
 		}
 
-		if !userLabelRegex.Match([]byte(p)) {
+		if !userLabelRegex.MatchString(p) {
 			return Selector{}, fmt.Errorf("invalid label name: %q", p)
 		}
 
 		l := Instance(p)
 		if !all.contains(l) {
-			return Selector{}, fmt.Errorf("unknown label name: %q", p)
+			log.Warnf("unknown label name: %q", p)
+			continue
 		}
 
 		if negative {

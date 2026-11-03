@@ -18,7 +18,8 @@ WD=$(dirname "$0")
 WD=$(cd "$WD"; pwd)
 ROOT=$(dirname "$WD")
 
-set -eux
+set -eu
+set +x
 
 # shellcheck source=prow/lib.sh
 source "${ROOT}/prow/lib.sh"
@@ -28,17 +29,23 @@ setup_gcloud_credentials
 # Old prow image does not set this, so needed explicitly here as this is not called through make
 export GO111MODULE=on
 
-DOCKER_HUB=${DOCKER_HUB:-gcr.io/istio-testing}
-GCS_BUCKET=${GCS_BUCKET:-istio-build/dev}
+DOCKER_PUSH_HUB=${DOCKER_PUSH_HUB:-ghcr.io/istio/testing}
+DOCKER_HUB=${DOCKER_HUB:-registry.istio.io/testing}
+HELM_HUB=${HELM_HUB:-ghcr.io/istio/testing/charts}
+R2_BUCKET=${R2_BUCKET:-istio-build/dev}
+
+# Enable emulation required for cross compiling a few images (VMs)
+docker run --rm --privileged "${DOCKER_HUB}/qemu-user-static" --reset -p yes
+export ISTIO_DOCKER_QEMU=true
 
 # Use a pinned version in case breaking changes are needed
-BUILDER_SHA=b6ce79ae8b17bd46287401166aa0add43b3b2c53
+BUILDER_SHA=d0378bff6f8b55ce11407ce7ec3e2ac8fbf76e57
 
 # Reference to the next minor version of Istio
-# This will create a version like 1.4-alpha.sha
-NEXT_VERSION=1.5
+# This will create a version like 1.30.0-alpha.<sha>
+NEXT_VERSION=$(cat "${ROOT}/VERSION")
 TAG=$(git rev-parse HEAD)
-VERSION="${NEXT_VERSION}-alpha.${TAG}"
+VERSION="${NEXT_VERSION}.0-alpha.${TAG}"
 
 # In CI we want to store the outputs to artifacts, which will preserve the build
 # If not specified, we can just create a temporary directory
@@ -49,52 +56,63 @@ MANIFEST=$(cat <<EOF
 version: ${VERSION}
 docker: ${DOCKER_HUB}
 directory: ${WORK_DIR}
+ignoreVulnerability: true
 dependencies:
+${DEPENDENCIES:-$(cat <<EOD
   istio:
     localpath: ${ROOT}
-  cni:
-    git: https://github.com/istio/cni
-    auto: deps
-  operator:
-    git: https://github.com/istio/operator
-    auto: modules
-
   api:
     git: https://github.com/istio/api
     auto: modules
   proxy:
     git: https://github.com/istio/proxy
     auto: deps
-  pkg:
-    git: https://github.com/istio/pkg
-    auto: modules
   client-go:
     git: https://github.com/istio/client-go
-    branch: master
-  gogo-genproto:
-    git: https://github.com/istio/gogo-genproto
-    branch: master
+    auto: modules
   test-infra:
     git: https://github.com/istio/test-infra
     branch: master
   tools:
     git: https://github.com/istio/tools
     branch: master
+  release-builder:
+    git: https://github.com/istio/release-builder
+    sha: ${BUILDER_SHA}
+  ztunnel:
+    git: https://github.com/istio/ztunnel
+    auto: deps
+architectures: [linux/amd64, linux/arm64]
+EOD
+)}
+dashboards:
+  istio-mesh-dashboard: 7639
+  istio-performance-dashboard: 11829
+  istio-service-dashboard: 7636
+  istio-workload-dashboard: 7630
+  pilot-dashboard: 7645
+  istio-extension-dashboard: 13277
+  ztunnel-dashboard: 21306
+${PROXY_OVERRIDE:-}
 EOF
 )
 
 # "Temporary" hacks
 export PATH=${GOPATH}/bin:${PATH}
 
-# cd to not impact go.mod
-(cd /tmp; go get "istio.io/release-builder@${BUILDER_SHA}")
+go install "istio.io/release-builder@${BUILDER_SHA}"
 
 release-builder build --manifest <(echo "${MANIFEST}")
 
 release-builder validate --release "${WORK_DIR}/out"
 
 if [[ -z "${DRY_RUN:-}" ]]; then
-  release-builder publish --release "${WORK_DIR}/out" \
-    --gcsbucket "${GCS_BUCKET}" --gcsaliases "${NEXT_VERSION}-dev,latest" \
-    --dockerhub "${DOCKER_HUB}" --dockertags "${VERSION},${NEXT_VERSION}-dev,latest"
+  ENDPOINT="$(echo "${CF_CREDENTIALS}" | jq -r '.endpoint' | tr -d '\n')"
+  AWS_ACCESS_KEY_ID="$(echo "${CF_CREDENTIALS}" | jq -r '.access_key' | tr -d '\n')" \
+    AWS_SECRET_ACCESS_KEY="$(echo "${CF_CREDENTIALS}" | jq -r '.secret_key' | tr -d '\n')" \
+    AWS_REGION="$(echo "${CF_CREDENTIALS}" | jq -r '.region' | tr -d '\n')" \
+    AWS_SESSION_TOKEN="$(echo "${CF_CREDENTIALS}" | jq -r '.session_token' | tr -d '\n')" \
+    release-builder publish --release "${WORK_DIR}/out" \
+      --s3bucket "${R2_BUCKET}" --s3aliases "${TAG},${NEXT_VERSION}-dev,latest" --s3-base-endpoint "${ENDPOINT}" \
+      --dockerhub "${DOCKER_PUSH_HUB}" --helmhub "${HELM_HUB}" --dockertags "${TAG},${VERSION},${NEXT_VERSION}-dev,latest"
 fi

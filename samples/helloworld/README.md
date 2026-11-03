@@ -5,7 +5,7 @@ and instance (hostname) when called.
 It can be used as a test service when experimenting with version routing.
 
 This service is also used to demonstrate canary deployments working in conjunction with autoscaling.
-See [Canary deployments using Istio](https://istio.io/blog/2017/0.1-canary.html).
+See [Canary deployments using Istio](https://istio.io/blog/2017/0.1-canary).
 
 ## Start the helloworld service
 
@@ -24,7 +24,7 @@ kubectl apply -f helloworld.yaml
 Alternatively, you can run just one version at a time by first defining the service:
 
 ```bash
-kubectl apply -f helloworld.yaml -l app=helloworld
+kubectl apply -f helloworld.yaml -l service=helloworld
 ```
 
 and then deploying version v1, v2, or both:
@@ -34,7 +34,27 @@ kubectl apply -f helloworld.yaml -l version=v1
 kubectl apply -f helloworld.yaml -l version=v2
 ```
 
+For even more flexibility, there is also a script, `gen-helloworld.sh`, that will
+generate YAML for the helloworld service. This script takes the following
+arguments:
+
+| Argument              | Default | Description                                                            |
+|-----------------------|---------|------------------------------------------------------------------------|
+| `-h`,`--help`         |         | Prints usage information.                                              |
+| `--version`           | `v1`    | Specifies the version that will be returned by the helloworld service. |
+| `--includeService`    | `true`  | If `true` the service will be included in the YAML.                    |
+| `--includeDeployment` | `true`  | If `true` the deployment will be included in the YAML.                 |
+
+You can use this script to deploy a custom version:
+
+```bash
+./gen-helloworld.sh --version customversion | \
+    kubectl apply -f -
+```
+
 ## Configure the helloworld gateway
+
+*___Note:___ Istio intends to make the Kubernetes [Gateway API](https://gateway-api.sigs.k8s.io/) the default API for traffic management [in the future](https://istio.io/latest/blog/2022/gateway-api-beta/). You can use the Gateway API to configure the helloworld service, instead of the classic Istio configuration model, by following the instructions in [./gateway-api/README.md](./gateway-api/README.md), instead of the instructions below.*
 
 Apply the helloworld gateway configuration:
 

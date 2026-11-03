@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -17,63 +17,100 @@ package istio
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/mitchellh/go-homedir"
-
-	yaml2 "gopkg.in/yaml.v2"
+	corev1 "k8s.io/api/core/v1"
 
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/env"
-	"istio.io/istio/pkg/test/framework/core/image"
+	"istio.io/istio/pkg/test/framework/components/namespace"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/util/file"
-
-	kubeCore "k8s.io/api/core/v1"
+	"istio.io/istio/pkg/test/scopes"
 )
 
 const (
 	// DefaultSystemNamespace default value for SystemNamespace
 	DefaultSystemNamespace = "istio-system"
 
-	// ValuesMcpFile for Istio Helm deployment.
-	E2EValuesFile = "test-values/values-e2e.yaml"
+	// IntegrationTestDefaultsIOP is the path of the default IstioOperator spec to use
+	// for integration tests
+	IntegrationTestDefaultsIOP = "tests/integration/iop-integration-test-defaults.yaml"
 
-	// DefaultDeployTimeout for Istio
-	DefaultDeployTimeout = time.Second * 300
+	// IntegrationTestDefaultsIOPWithQUIC is the path of the default IstioOperator spec to
+	// use for integration tests involving QUIC
+	IntegrationTestDefaultsIOPWithQUIC = "tests/integration/iop-integration-test-defaults-with-quic.yaml"
 
-	// TODO(https://github.com/istio/istio/issues/12606): This timeout is insanely large, but Prow seems to take a lot of time
-	//  pulling images.
-	// DefaultCIDeployTimeout for Istio
-	DefaultCIDeployTimeout = time.Minute * 20
+	// IntegrationTestRemoteDefaultsIOP is the path of the default IstioOperator spec to use
+	// on remote clusters for integration tests
+	IntegrationTestRemoteDefaultsIOP = "tests/integration/iop-remote-integration-test-defaults.yaml"
 
-	// DefaultUndeployTimeout for Istio.
-	DefaultUndeployTimeout = time.Second * 300
+	// BaseIOP is the path of the base IstioOperator spec
+	BaseIOP = "tests/integration/base.yaml"
 
-	// DefaultCIUndeployTimeout for Istio.
-	DefaultCIUndeployTimeout = time.Second * 900
+	// IntegrationTestRemoteGatewaysIOP is the path of the default IstioOperator spec to use
+	// to install gateways on remote clusters for integration tests
+	IntegrationTestRemoteGatewaysIOP = "tests/integration/iop-remote-integration-test-gateways.yaml"
+
+	// IntegrationTestExternalIstiodPrimaryDefaultsIOP is the path of the default IstioOperator spec to use
+	// on external istiod primary clusters for integration tests
+	IntegrationTestExternalIstiodPrimaryDefaultsIOP = "tests/integration/iop-externalistiod-primary-integration-test-defaults.yaml"
+
+	// IntegrationTestExternalIstiodConfigDefaultsIOP is the path of the default IstioOperator spec to use
+	// on external istiod config clusters for integration tests
+	IntegrationTestExternalIstiodConfigDefaultsIOP = "tests/integration/iop-externalistiod-config-integration-test-defaults.yaml"
+
+	// IntegrationTestAmbientDefaultsIOP is the path of the default IstioOperator for ambient
+	IntegrationTestAmbientDefaultsIOP = "tests/integration/iop-ambient-test-defaults.yaml"
+
+	// IntegrationTestPeerMetadataDiscoveryDefaultsIOP is the path of the default IstioOperator to force WDS usage
+	IntegrationTestPeerMetadataDiscoveryDefaultsIOP = "tests/integration/iop-wds.yaml"
+
+	// hubValuesKey values key for the Docker image hub.
+	hubValuesKey = "global.hub"
+
+	// tagValuesKey values key for the Docker image tag.
+	tagValuesKey = "global.tag"
+
+	// variantValuesKey values key for the Docker image variant.
+	variantValuesKey = "global.variant"
+
+	// imagePullPolicyValuesKey values key for the Docker image pull policy.
+	imagePullPolicyValuesKey = "global.imagePullPolicy"
+
+	// DefaultEgressGatewayLabel is the default Istio label for the egress gateway.
+	DefaultEgressGatewayIstioLabel = "egressgateway"
+
+	// DefaultEgressGatewayServiceName is the default service name for the egress gateway.
+	DefaultEgressGatewayServiceName = "istio-egressgateway"
+
+	// DefaultGatewayClassName is the default name of the GatewayClass for created by istio.
+	DefaultGatewayClassName = "istio"
 )
 
 var (
-	helmValues string
+	helmValues      string
+	operatorOptions string
 
 	settingsFromCommandline = &Config{
-		SystemNamespace:                DefaultSystemNamespace,
-		IstioNamespace:                 DefaultSystemNamespace,
-		ConfigNamespace:                DefaultSystemNamespace,
-		TelemetryNamespace:             DefaultSystemNamespace,
-		PolicyNamespace:                DefaultSystemNamespace,
-		IngressNamespace:               DefaultSystemNamespace,
-		EgressNamespace:                DefaultSystemNamespace,
-		DeployIstio:                    true,
-		DeployTimeout:                  0,
-		UndeployTimeout:                0,
-		ChartDir:                       env.IstioChartDir,
-		CrdsFilesDir:                   env.CrdsFilesDir,
-		ValuesFile:                     E2EValuesFile,
-		CustomSidecarInjectorNamespace: "",
+		SystemNamespace:               DefaultSystemNamespace,
+		TelemetryNamespace:            DefaultSystemNamespace,
+		ZtunnelNamespace:              DefaultSystemNamespace,
+		DeployIstio:                   true,
+		PrimaryClusterIOPFile:         IntegrationTestDefaultsIOP,
+		ConfigClusterIOPFile:          IntegrationTestDefaultsIOP,
+		RemoteClusterIOPFile:          IntegrationTestRemoteDefaultsIOP,
+		BaseIOPFile:                   BaseIOP,
+		DeployEastWestGW:              true,
+		DumpKubernetesManifests:       false,
+		IstiodlessRemotes:             true,
+		EnableCNI:                     false,
+		EgressGatewayServiceNamespace: DefaultSystemNamespace,
+		EgressGatewayServiceName:      DefaultEgressGatewayServiceName,
+		EgressGatewayIstioLabel:       DefaultEgressGatewayIstioLabel,
+		DeployGatewayAPI:              true,
+		GatewayClassName:              DefaultGatewayClassName,
 	}
 )
 
@@ -82,38 +119,40 @@ type Config struct {
 	// The namespace where the Istio components (<=1.1) reside in a typical deployment (default: "istio-system").
 	SystemNamespace string
 
-	// The namespace in which istio ca and cert provisioning components are deployed.
-	IstioNamespace string
-
-	// The namespace in which config, discovery and auto-injector are deployed.
-	ConfigNamespace string
-
-	// The namespace in which mixer, kiali, tracing providers, graphana, prometheus are deployed.
+	// The namespace in which kiali, tracing providers, graphana, prometheus are deployed.
 	TelemetryNamespace string
 
-	// The namespace in which istio policy checker is deployed.
-	PolicyNamespace string
+	// The namespace where the ztunnel daemonset resides (default: "istio-system").
+	ZtunnelNamespace string
 
-	// The namespace in which istio ingressgateway is deployed
-	IngressNamespace string
+	// The IstioOperator spec file to be used for Control plane cluster by default
+	PrimaryClusterIOPFile string
 
-	// The namespace in which istio egressgateway is deployed
-	EgressNamespace string
+	// The IstioOperator spec file to be used for Config cluster by default
+	ConfigClusterIOPFile string
 
-	// DeployTimeout the timeout for deploying Istio.
-	DeployTimeout time.Duration
+	// The IstioOperator spec file to be used for Remote cluster by default
+	RemoteClusterIOPFile string
 
-	// UndeployTimeout the timeout for undeploying Istio.
-	UndeployTimeout time.Duration
+	// The IstioOperator spec file used as the base for all installs
+	BaseIOPFile string
 
-	// The top-level Helm chart dir.
-	ChartDir string
+	// Override values specifically for the ICP crd
+	// This is mostly required for cases where --set cannot be used
+	// These values are applied to non-remote clusters
+	ControlPlaneValues string
 
-	// The top-level Helm Crds files dir.
-	CrdsFilesDir string
+	// Override values specifically for the ICP crd
+	// This is mostly required for cases where --set cannot be used
+	// These values are only applied to remote clusters
+	// Default value will be ControlPlaneValues if no remote values provided
+	RemoteClusterValues string
 
-	// The Helm values file to be used.
-	ValuesFile string
+	// Override values specifically for the ICP crd
+	// This is mostly required for cases where --set cannot be used
+	// These values are only applied to remote config clusters
+	// Default value will be ControlPlaneValues if no remote values provided
+	ConfigClusterValues string
 
 	// Overrides for the Helm values file.
 	Values map[string]string
@@ -125,37 +164,124 @@ type Config struct {
 	// doing deployments without Galley.
 	SkipWaitForValidationWebhook bool
 
-	// CustomSidecarInjectorNamespace allows injecting the sidecar from the specified namespace.
-	// if the value is "", use the default sidecar injection instead.
-	CustomSidecarInjectorNamespace string
+	// Indicates that the test should deploy Istio's east west gateway into the target Kubernetes cluster
+	// before running tests.
+	DeployEastWestGW bool
+
+	// SkipDeployCrossClusterSecrets, if enabled, will skip creation of multi-cluster secrets for cross-cluster discovery.
+	SkipDeployCrossClusterSecrets bool
+
+	// DumpKubernetesManifests will cause Kubernetes YAML generated by istioctl install/generate to be dumped to artifacts.
+	DumpKubernetesManifests bool
+
+	// IstiodlessRemotes makes remote clusters run without istiod, using webhooks/ca from the primary cluster.
+	// TODO we could set this per-cluster if istiod was smarter about patching remotes.
+	IstiodlessRemotes bool
+
+	// OperatorOptions overrides default operator configuration.
+	OperatorOptions map[string]string
+
+	// EnableCNI indicates the test should have CNI enabled.
+	EnableCNI bool
+
+	// custom deployment for ingress and egress gateway on remote clusters.
+	GatewayValues string
+
+	// Custom deployment for east-west gateway
+	EastWestGatewayValues string
+
+	// IngressGatewayServiceName is the service name to use to reference the ingressgateway
+	// This field should only be set when DeployIstio is false
+	IngressGatewayServiceName string
+
+	// IngressGatewayServiceNamespace allows overriding the namespace of the ingressgateway service (defaults to SystemNamespace)
+	// This field should only be set when DeployIstio is false
+	IngressGatewayServiceNamespace string
+
+	// IngressGatewayIstioLabel allows overriding the selector of the ingressgateway service (defaults to istio=ingressgateway)
+	// This field should only be set when DeployIstio is false
+	IngressGatewayIstioLabel string
+
+	// EgressGatewayServiceName is the service name to use to reference the egressgateway
+	// This field should only be set when DeployIstio is false
+	EgressGatewayServiceName string
+
+	// EgressGatewayServiceNamespace allows overriding the namespace of the egressgateway service (defaults to SystemNamespace)
+	// This field should only be set when DeployIstio is false
+	EgressGatewayServiceNamespace string
+
+	// EgressGatewayIstioLabel allows overriding the selector of the egressgateway service (defaults to istio=egressgateway)
+	// This field should only be set when DeployIstio is false
+	EgressGatewayIstioLabel string
+
+	// SharedMeshConfigName is the name of the user's local ConfigMap to be patched, which the user sets as the SHARED_MESH_CONFIG pilot env variable
+	// upon installing Istio.
+	// This field should only be set when DeployIstio is false.
+	SharedMeshConfigName string
+
+	// ControlPlaneInstaller allows installation of custom control planes on istio deployments via an external script
+	// This field should only be set when DeployIstio is false
+	ControlPlaneInstaller string
+
+	// DeployGatewayAPI indicates that the test should deploy Gateway API during tests execution
+	DeployGatewayAPI bool
+
+	// GatewayClassName is the name of the GatewayClass to use for Gateway API tests.
+	// This sets the PILOT_GATEWAY_API_DEFAULT_GATEWAYCLASS_NAME environment variable for istiod.
+	GatewayClassName string
 }
 
-// Is mtls enabled. Check in Values flag and Values file.
-func (c *Config) IsMtlsEnabled() bool {
-	if c.Values["global.mtls.enabled"] == "true" {
-		return true
+func (c *Config) OverridesYAML(s *resource.Settings) string {
+	return fmt.Sprintf(`
+global:
+  hub: %s
+  tag: %s
+`, s.Image.Hub, s.Image.Tag)
+}
+
+func (c *Config) IstioOperatorConfigYAML(iopYaml string) string {
+	data := ""
+	if iopYaml != "" {
+		data = Indent(iopYaml, "  ")
 	}
 
-	data, err := file.AsString(filepath.Join(c.ChartDir, c.ValuesFile))
-	if err != nil {
-		return false
-	}
-	m := make(map[interface{}]interface{})
-	err = yaml2.Unmarshal([]byte(data), &m)
-	if err != nil {
-		return false
-	}
-	if m["global"] != nil {
-		switch globalVal := m["global"].(type) {
-		case map[interface{}]interface{}:
-			switch mtlsVal := globalVal["mtls"].(type) {
-			case map[interface{}]interface{}:
-				return mtlsVal["enabled"].(bool)
-			}
+	return fmt.Sprintf(`
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+%s
+`, data)
+}
+
+func (c *Config) fillDefaults(ctx resource.Context) {
+	if ctx.AllClusters().IsExternalControlPlane() {
+		c.PrimaryClusterIOPFile = IntegrationTestExternalIstiodPrimaryDefaultsIOP
+		c.ConfigClusterIOPFile = IntegrationTestExternalIstiodConfigDefaultsIOP
+		if c.ConfigClusterValues == "" {
+			c.ConfigClusterValues = c.RemoteClusterValues
+		}
+	} else if !c.IstiodlessRemotes {
+		c.RemoteClusterIOPFile = IntegrationTestDefaultsIOP
+		if c.RemoteClusterValues == "" {
+			c.RemoteClusterValues = c.ControlPlaneValues
 		}
 	}
+}
 
-	return false
+// Indent indents a block of text with an indent string
+func Indent(text, indent string) string {
+	if text[len(text)-1:] == "\n" {
+		result := ""
+		for _, j := range strings.Split(text[:len(text)-1], "\n") {
+			result += indent + j + "\n"
+		}
+		return result
+	}
+	result := ""
+	for _, j := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		result += indent + j + "\n"
+	}
+	return result[:len(result)-1]
 }
 
 // DefaultConfig creates a new Config from defaults, environments variables, and command-line parameters.
@@ -163,33 +289,22 @@ func DefaultConfig(ctx resource.Context) (Config, error) {
 	// Make a local copy.
 	s := *settingsFromCommandline
 
-	if err := normalizeFile(&s.ChartDir); err != nil {
+	iopFile := s.PrimaryClusterIOPFile
+	if iopFile != "" && !path.IsAbs(s.PrimaryClusterIOPFile) {
+		iopFile = filepath.Join(env.IstioSrc, s.PrimaryClusterIOPFile)
+	}
+
+	if err := checkFileExists(iopFile); err != nil {
+		scopes.Framework.Warnf("Default IOPFile missing: %v", err)
+	}
+
+	var err error
+	if s.Values, err = newHelmValues(ctx); err != nil {
 		return Config{}, err
 	}
 
-	if err := checkFileExists(filepath.Join(s.ChartDir, s.ValuesFile)); err != nil {
+	if s.OperatorOptions, err = parseConfigOptions(operatorOptions); err != nil {
 		return Config{}, err
-	}
-
-	if err := normalizeFile(&s.CrdsFilesDir); err != nil {
-		return Config{}, err
-	}
-
-	deps, err := image.SettingsFromCommandLine()
-	if err != nil {
-		return Config{}, err
-	}
-
-	if s.Values, err = newHelmValues(ctx, deps); err != nil {
-		return Config{}, err
-	}
-
-	if ctx.Settings().CIMode {
-		s.DeployTimeout = DefaultCIDeployTimeout
-		s.UndeployTimeout = DefaultCIUndeployTimeout
-	} else {
-		s.DeployTimeout = DefaultDeployTimeout
-		s.UndeployTimeout = DefaultUndeployTimeout
 	}
 
 	return s, nil
@@ -204,17 +319,6 @@ func DefaultConfigOrFail(t test.Failer, ctx resource.Context) Config {
 	return cfg
 }
 
-func normalizeFile(path *string) error {
-	// If the path uses the homedir ~, expand the path.
-	var err error
-	*path, err = homedir.Expand(*path)
-	if err != nil {
-		return err
-	}
-
-	return checkFileExists(*path)
-}
-
 func checkFileExists(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return err
@@ -222,8 +326,8 @@ func checkFileExists(path string) error {
 	return nil
 }
 
-func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, error) {
-	userValues, err := parseHelmValues()
+func newHelmValues(ctx resource.Context) (map[string]string, error) {
+	userValues, err := parseConfigOptions(helmValues)
 	if err != nil {
 		return nil, err
 	}
@@ -232,9 +336,15 @@ func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, 
 	values := make(map[string]string)
 
 	// Common values
-	values[image.HubValuesKey] = s.Hub
-	values[image.TagValuesKey] = s.Tag
-	values[image.ImagePullPolicyValuesKey] = s.PullPolicy
+	s := ctx.Settings()
+	values[hubValuesKey] = s.Image.Hub
+	values[tagValuesKey] = s.Image.Tag
+	values[variantValuesKey] = s.Image.Variant
+	values[imagePullPolicyValuesKey] = s.Image.PullPolicy
+
+	if s.NativeNftables {
+		values["global.nativeNftables"] = "true"
+	}
 
 	// Copy the user values.
 	for k, v := range userValues {
@@ -242,8 +352,8 @@ func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, 
 	}
 
 	// Always pull Docker images if using the "latest".
-	if values[image.TagValuesKey] == image.LatestTag {
-		values[image.ImagePullPolicyValuesKey] = string(kubeCore.PullAlways)
+	if values[tagValuesKey] == "latest" {
+		values[imagePullPolicyValuesKey] = string(corev1.PullAlways)
 	}
 
 	// We need more information on Envoy logs to detect usage of any deprecated feature
@@ -255,17 +365,17 @@ func newHelmValues(ctx resource.Context, s *image.Settings) (map[string]string, 
 	return values, nil
 }
 
-func parseHelmValues() (map[string]string, error) {
+func parseConfigOptions(options string) (map[string]string, error) {
 	out := make(map[string]string)
-	if helmValues == "" {
+	if options == "" {
 		return out, nil
 	}
 
-	values := strings.Split(helmValues, ",")
+	values := strings.Split(options, ",")
 	for _, v := range values {
 		parts := strings.Split(v, "=")
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("failed parsing helm values: %s", helmValues)
+			return nil, fmt.Errorf("failed parsing config options: %s", options)
 		}
 		out[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 	}
@@ -277,21 +387,53 @@ func (c *Config) String() string {
 	result := ""
 
 	result += fmt.Sprintf("SystemNamespace:                %s\n", c.SystemNamespace)
-	result += fmt.Sprintf("IstioNamespace:                 %s\n", c.IstioNamespace)
-	result += fmt.Sprintf("ConfigNamespace:                %s\n", c.ConfigNamespace)
 	result += fmt.Sprintf("TelemetryNamespace:             %s\n", c.TelemetryNamespace)
-	result += fmt.Sprintf("PolicyNamespace:                %s\n", c.PolicyNamespace)
-	result += fmt.Sprintf("IngressNamespace:               %s\n", c.IngressNamespace)
-	result += fmt.Sprintf("EgressNamespace:                %s\n", c.EgressNamespace)
 	result += fmt.Sprintf("DeployIstio:                    %v\n", c.DeployIstio)
-	result += fmt.Sprintf("DeployTimeout:                  %s\n", c.DeployTimeout.String())
-	result += fmt.Sprintf("UndeployTimeout:                %s\n", c.UndeployTimeout.String())
+	result += fmt.Sprintf("DeployEastWestGW:               %v\n", c.DeployEastWestGW)
 	result += fmt.Sprintf("Values:                         %v\n", c.Values)
-	result += fmt.Sprintf("ChartDir:                       %s\n", c.ChartDir)
-	result += fmt.Sprintf("CrdsFilesDir:                   %s\n", c.CrdsFilesDir)
-	result += fmt.Sprintf("ValuesFile:                     %s\n", c.ValuesFile)
+	result += fmt.Sprintf("PrimaryClusterIOPFile:          %s\n", c.PrimaryClusterIOPFile)
+	result += fmt.Sprintf("ConfigClusterIOPFile:           %s\n", c.ConfigClusterIOPFile)
+	result += fmt.Sprintf("RemoteClusterIOPFile:           %s\n", c.RemoteClusterIOPFile)
+	result += fmt.Sprintf("BaseIOPFile:                    %s\n", c.BaseIOPFile)
 	result += fmt.Sprintf("SkipWaitForValidationWebhook:   %v\n", c.SkipWaitForValidationWebhook)
-	result += fmt.Sprintf("CustomSidecarInjectorNamespace: %s\n", c.CustomSidecarInjectorNamespace)
+	result += fmt.Sprintf("DumpKubernetesManifests:        %v\n", c.DumpKubernetesManifests)
+	result += fmt.Sprintf("IstiodlessRemotes:              %v\n", c.IstiodlessRemotes)
+	result += fmt.Sprintf("OperatorOptions:                %v\n", c.OperatorOptions)
+	result += fmt.Sprintf("EnableCNI:                      %v\n", c.EnableCNI)
+	result += fmt.Sprintf("IngressGatewayServiceName:      %v\n", c.IngressGatewayServiceName)
+	result += fmt.Sprintf("IngressGatewayServiceNamespace: %v\n", c.IngressGatewayServiceNamespace)
+	result += fmt.Sprintf("IngressGatewayIstioLabel:       %v\n", c.IngressGatewayIstioLabel)
+	result += fmt.Sprintf("EgressGatewayServiceName:       %v\n", c.EgressGatewayServiceName)
+	result += fmt.Sprintf("EgressGatewayServiceNamespace:  %v\n", c.EgressGatewayServiceNamespace)
+	result += fmt.Sprintf("EgressGatewayIstioLabel:        %v\n", c.EgressGatewayIstioLabel)
+	result += fmt.Sprintf("SharedMeshConfigName:           %v\n", c.SharedMeshConfigName)
+	result += fmt.Sprintf("ControlPlaneInstaller:          %v\n", c.ControlPlaneInstaller)
 
 	return result
+}
+
+// ClaimSystemNamespace retrieves the namespace for the Istio system components from the environment.
+func ClaimSystemNamespace(ctx resource.Context) (namespace.Instance, error) {
+	istioCfg, err := DefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	nsCfg := namespace.Config{
+		Prefix: istioCfg.SystemNamespace,
+		Inject: false,
+		// Already handled directly
+		SkipDump:    true,
+		SkipCleanup: true,
+	}
+	return namespace.Claim(ctx, nsCfg)
+}
+
+// ClaimSystemNamespaceOrFail calls ClaimSystemNamespace, failing the test if an error occurs.
+func ClaimSystemNamespaceOrFail(t test.Failer, ctx resource.Context) namespace.Instance {
+	t.Helper()
+	i, err := ClaimSystemNamespace(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return i
 }

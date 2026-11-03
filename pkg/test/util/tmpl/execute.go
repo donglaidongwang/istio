@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 )
 
 // Execute the template with the given parameters.
-func Execute(t *template.Template, data interface{}) (string, error) {
+func Execute(t *template.Template, data any) (string, error) {
 	var b bytes.Buffer
 	if err := t.Execute(&b, data); err != nil {
 		return "", err
@@ -32,7 +32,7 @@ func Execute(t *template.Template, data interface{}) (string, error) {
 }
 
 // ExecuteOrFail calls Execute and fails the test if it returns an error.
-func ExecuteOrFail(t test.Failer, t2 *template.Template, data interface{}) string {
+func ExecuteOrFail(t test.Failer, t2 *template.Template, data any) string {
 	t.Helper()
 	s, err := Execute(t2, data)
 	if err != nil {

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,26 @@ package gateway
 
 import (
 	"istio.io/api/networking/v1alpha3"
-
+	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/protocol"
 )
 
-// IsTLSServer returns true if this server is non HTTP, with some TLS settings for termination/passthrough
+// IsTLSServer returns true if this server is non HTTP, but with some TLS settings for termination/passthrough
 func IsTLSServer(server *v1alpha3.Server) bool {
+	// to filter out https redirect
 	if server.Tls != nil && !protocol.Parse(server.Port.Protocol).IsHTTP() {
 		return true
+	}
+	return false
+}
+
+// IsHTTPSServerWithTLSTermination returns true if the server is HTTPS with TLS termination
+func IsHTTPSServerWithTLSTermination(server *v1alpha3.Server) bool {
+	if server.Tls != nil {
+		p := protocol.Parse(server.Port.Protocol)
+		if p == protocol.HTTPS && !IsPassThroughServer(server) {
+			return true
+		}
 	}
 	return false
 }
@@ -35,11 +47,22 @@ func IsHTTPServer(server *v1alpha3.Server) bool {
 		return true
 	}
 
-	if p == protocol.HTTPS && server.Tls != nil && !IsPassThroughServer(server) {
+	if p == protocol.HTTPS && !IsPassThroughServer(server) {
 		return true
 	}
 
 	return false
+}
+
+// IsEligibleForHTTP3Upgrade returns true if we can create an HTTP/3 server
+// listening of QUIC for the given server. It must be a TLS non-passthrough
+// as TLS is mandatory for QUIC
+func IsEligibleForHTTP3Upgrade(server *v1alpha3.Server) bool {
+	if !features.EnableQUICListeners {
+		return false
+	}
+	p := protocol.Parse(server.Port.Protocol)
+	return p == protocol.HTTPS && !IsPassThroughServer(server)
 }
 
 // IsPassThroughServer returns true if this server does TLS passthrough (auto or manual)
@@ -48,10 +71,21 @@ func IsPassThroughServer(server *v1alpha3.Server) bool {
 		return false
 	}
 
-	if server.Tls.Mode == v1alpha3.Server_TLSOptions_PASSTHROUGH ||
-		server.Tls.Mode == v1alpha3.Server_TLSOptions_AUTO_PASSTHROUGH {
+	if server.Tls.Mode == v1alpha3.ServerTLSSettings_PASSTHROUGH ||
+		server.Tls.Mode == v1alpha3.ServerTLSSettings_AUTO_PASSTHROUGH {
 		return true
 	}
 
+	return false
+}
+
+// IsTCPServerWithTLSTermination returns true if this server is TCP(non-HTTP) server with some TLS settings for termination
+func IsTCPServerWithTLSTermination(server *v1alpha3.Server) bool {
+	if !IsPassThroughServer(server) {
+		p := protocol.Parse(server.Port.Protocol)
+		if !p.IsHTTP() && !p.IsHTTPS() {
+			return true
+		}
+	}
 	return false
 }

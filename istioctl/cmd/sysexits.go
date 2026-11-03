@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,12 @@
 
 package cmd
 
-import "strings"
+import (
+	"strings"
+
+	"istio.io/istio/istioctl/pkg/analyze"
+	"istio.io/istio/istioctl/pkg/util"
+)
 
 // Values should try to use sendmail-style values as in <sysexits.h>
 // See e.g. https://man.openbsd.org/sysexits.3
@@ -30,6 +35,7 @@ import "strings"
 const (
 	ExitUnknownError   = 1 // for compatibility with existing exit code
 	ExitIncorrectUsage = 64
+	ExitDataError      = 65 // some format error with input data
 
 	// below here are non-zero exit codes that don't indicate an error with istioctl itself
 	ExitAnalyzerFoundIssues = 79 // istioctl analyze found issues, for CI/CD
@@ -37,13 +43,15 @@ const (
 
 func GetExitCode(e error) int {
 	if strings.Contains(e.Error(), "unknown command") {
-		e = CommandParseError{e}
+		e = util.CommandParseError{Err: e}
 	}
 
 	switch e.(type) {
-	case CommandParseError:
+	case util.CommandParseError:
 		return ExitIncorrectUsage
-	case AnalyzerFoundIssuesError:
+	case analyze.FileParseError:
+		return ExitDataError
+	case analyze.AnalyzerFoundIssuesError:
 		return ExitAnalyzerFoundIssues
 	default:
 		return ExitUnknownError

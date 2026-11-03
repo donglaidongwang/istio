@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,30 +17,46 @@ package configdump
 import (
 	"fmt"
 
-	"github.com/golang/protobuf/ptypes/any"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 )
 
 type configTypeURL string
 
-// See https://www.envoyproxy.io/docs/envoy/latest/api-v2/admin/v2alpha/config_dump.proto
+// See https://www.envoyproxy.io/docs/envoy/latest/api-v3/admin/v3/config_dump.proto
 const (
-	bootstrap configTypeURL = "type.googleapis.com/envoy.admin.v2alpha.BootstrapConfigDump"
-	listeners configTypeURL = "type.googleapis.com/envoy.admin.v2alpha.ListenersConfigDump"
-	clusters  configTypeURL = "type.googleapis.com/envoy.admin.v2alpha.ClustersConfigDump"
-	routes    configTypeURL = "type.googleapis.com/envoy.admin.v2alpha.RoutesConfigDump"
-	secrets   configTypeURL = "type.googleapis.com/envoy.admin.v2alpha.SecretsConfigDump"
+	bootstrap configTypeURL = "type.googleapis.com/envoy.admin.v3.BootstrapConfigDump"
+	listeners configTypeURL = "type.googleapis.com/envoy.admin.v3.ListenersConfigDump"
+	endpoints configTypeURL = "type.googleapis.com/envoy.admin.v3.EndpointsConfigDump"
+	clusters  configTypeURL = "type.googleapis.com/envoy.admin.v3.ClustersConfigDump"
+	routes    configTypeURL = "type.googleapis.com/envoy.admin.v3.RoutesConfigDump"
+	secrets   configTypeURL = "type.googleapis.com/envoy.admin.v3.SecretsConfigDump"
+	ecds      configTypeURL = "type.googleapis.com/envoy.admin.v3.EcdsConfigDump"
 )
 
 // getSection takes a TypeURL and returns the types.Any from the config dump corresponding to that URL
-func (w *Wrapper) getSection(sectionTypeURL configTypeURL) (any.Any, error) {
-	var dumpAny any.Any
+func (w *Wrapper) getSection(sectionTypeURL configTypeURL) (*anypb.Any, error) {
+	var dumpAny *anypb.Any
 	for _, conf := range w.Configs {
 		if conf.TypeUrl == string(sectionTypeURL) {
-			dumpAny = *conf
+			dumpAny = conf
 		}
 	}
-	if dumpAny.TypeUrl == "" {
-		return any.Any{}, fmt.Errorf("config dump has no route %s", sectionTypeURL)
+	if dumpAny == nil {
+		return nil, fmt.Errorf("config dump has no configuration type %s", sectionTypeURL)
+	}
+
+	return dumpAny, nil
+}
+
+func (w *Wrapper) getSections(sectionTypeURL configTypeURL) ([]*anypb.Any, error) {
+	var dumpAny []*anypb.Any
+	for _, conf := range w.Configs {
+		if conf.TypeUrl == string(sectionTypeURL) {
+			dumpAny = append(dumpAny, conf)
+		}
+	}
+	if dumpAny == nil {
+		return nil, fmt.Errorf("config dump has no configuration type %s", sectionTypeURL)
 	}
 
 	return dumpAny, nil

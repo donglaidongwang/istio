@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,240 +12,262 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package aggregate_test
+package aggregate
 
 import (
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/onsi/gomega"
+	"github.com/google/go-cmp/cmp"
+	. "github.com/onsi/gomega"
+	"go.uber.org/atomic"
 
-	"istio.io/istio/pilot/pkg/config/aggregate"
-	"istio.io/istio/pilot/pkg/config/aggregate/fakes"
+	"istio.io/istio/pilot/pkg/config/memory"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pkg/config/schema"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collection"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/util/retry"
 )
 
 func TestAggregateStoreBasicMake(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	schema1 := collections.HTTPRoute
+	schema2 := collections.GatewayClass
+	store1 := memory.NewController(collection.SchemasFor(schema1), false)
+	store2 := memory.NewController(collection.SchemasFor(schema2), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
 
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
+	stores := []model.ConfigStoreController{store1, store2}
 
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
 
-	stores := []model.ConfigStore{storeOne, storeTwo}
-
-	store, err := aggregate.Make(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-
-	descriptors := store.ConfigDescriptor()
-	g.Expect(descriptors).To(gomega.HaveLen(2))
-	g.Expect(descriptors).To(gomega.ConsistOf([]schema.Instance{
-		{
-			Type:        "some-config",
-			Plural:      "some-configs",
-			MessageName: "istio.networking.v1alpha3.DestinationRule",
-		},
-		{
-			Type:        "other-config",
-			Plural:      "other-configs",
-			MessageName: "istio.networking.v1alpha3.Gateway",
-		},
-	}))
+	schemas := store.Schemas()
+	g.Expect(cmp.Diff(schemas, collection.SchemasFor(schema1, schema2))).To(BeEmpty())
 }
 
 func TestAggregateStoreMakeValidationFailure(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "broken message name",
-	}})
+	store1 := memory.NewController(collection.SchemasFor(schemaFor("SomeConfig", "broken message name")), false)
+	go store1.Run(test.NewStop(t))
 
-	stores := []model.ConfigStore{storeOne}
+	stores := []model.ConfigStoreController{store1}
 
-	store, err := aggregate.Make(stores)
-	g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("cannot discover proto message type")))
-	g.Expect(store).To(gomega.BeNil())
+	store, err := makeStore(stores, nil)
+	g.Expect(err).To(MatchError(ContainSubstring("not found: broken message name")))
+	g.Expect(store).To(BeNil())
 }
 
 func TestAggregateStoreGet(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	store1 := memory.NewController(collection.SchemasFor(collections.GatewayClass), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.GatewayClass), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
 
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
-
-	configReturn := &model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Type: "some-config",
-			Name: "other",
+	configReturn := &config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.GatewayClass,
+			Name:             "other",
 		},
 	}
 
-	storeOne.GetReturns(configReturn)
+	_, err := store1.Create(*configReturn)
+	g.Expect(err).NotTo(HaveOccurred())
 
-	stores := []model.ConfigStore{storeOne, storeTwo}
+	stores := []model.ConfigStoreController{store1, store2}
 
-	store, err := aggregate.Make(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
 
-	c := store.Get("some-config", "other", "")
-	g.Expect(c).To(gomega.Equal(configReturn))
+	c := store.Get(gvk.GatewayClass, "other", "")
+	g.Expect(c.Name).To(Equal(configReturn.Name))
 }
 
 func TestAggregateStoreList(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
 
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
-
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
-
-	storeOne.ListReturns([]model.Config{
-		{
-			ConfigMeta: model.ConfigMeta{
-				Type: "some-config",
-				Name: "other",
-			},
+	if _, err := store1.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
 		},
-	}, nil)
-	storeTwo.ListReturns([]model.Config{
-		{
-			ConfigMeta: model.ConfigMeta{
-				Type: "some-config",
-				Name: "another",
-			},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store2.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "another",
 		},
-	}, nil)
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	stores := []model.ConfigStore{storeOne, storeTwo}
+	stores := []model.ConfigStoreController{store1, store2}
 
-	store, err := aggregate.Make(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
 
-	l, err := store.List("some-config", "")
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-	g.Expect(l).To(gomega.HaveLen(2))
+	l := store.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(2))
+}
+
+func TestAggregateStoreWrite(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, store1)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	la := store.List(gvk.HTTPRoute, "")
+	g.Expect(la).To(HaveLen(1))
+	g.Expect(la[0].Name).To(Equal("other"))
+
+	l := store1.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(1))
+	g.Expect(l[0].Name).To(Equal("other"))
+
+	// Check the aggregated and individual store return identical response
+	g.Expect(la).To(BeEquivalentTo(l))
+
+	l = store2.List(gvk.HTTPRoute, "")
+	g.Expect(l).To(HaveLen(0))
+}
+
+func TestAggregateStoreWriteWithoutWriter(t *testing.T) {
+	g := NewWithT(t)
+
+	store1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	store2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	stop := test.NewStop(t)
+	go store1.Run(stop)
+	go store2.Run(stop)
+
+	stores := []model.ConfigStoreController{store1, store2}
+
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	if _, err := store.Create(config.Config{
+		Meta: config.Meta{
+			GroupVersionKind: gvk.HTTPRoute,
+			Name:             "other",
+		},
+	}); err != errorUnsupported {
+		t.Fatalf("unexpected error, want %v got %v", errorUnsupported, err)
+	}
 }
 
 func TestAggregateStoreFails(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	g := NewWithT(t)
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
+	store1 := memory.NewController(collection.SchemasFor(schemaFor("OtherConfig", "istio.networking.v1alpha3.Gateway")), false)
+	go store1.Run(test.NewStop(t))
 
-	stores := []model.ConfigStore{storeOne}
+	stores := []model.ConfigStoreController{store1}
 
-	store, err := aggregate.Make(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
+	store, err := makeStore(stores, nil)
+	g.Expect(err).NotTo(HaveOccurred())
 
 	t.Run("Fails to Delete", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
+		g := NewWithT(t)
 
-		err = store.Delete("not", "gonna", "work")
-		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
+		err = store.Delete(config.GroupVersionKind{Kind: "not"}, "gonna", "work", nil)
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
 	})
 
 	t.Run("Fails to Create", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
+		g := NewWithT(t)
 
-		c, err := store.Create(model.Config{})
-		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
-		g.Expect(c).To(gomega.BeEmpty())
+		c, err := store.Create(config.Config{})
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
+		g.Expect(c).To(BeEmpty())
 	})
 
 	t.Run("Fails to Update", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
+		g := NewWithT(t)
 
-		c, err := store.Update(model.Config{})
-		g.Expect(err).To(gomega.MatchError(gomega.ContainSubstring("unsupported operation")))
-		g.Expect(c).To(gomega.BeEmpty())
+		c, err := store.Update(config.Config{})
+		g.Expect(err).To(MatchError(ContainSubstring("unsupported operation")))
+		g.Expect(c).To(BeEmpty())
 	})
 }
 
 func TestAggregateStoreCache(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
+	stop := make(chan struct{})
+	defer func() { close(stop) }()
 
-	storeOne := &fakes.ConfigStoreCache{}
-	storeTwo := &fakes.ConfigStoreCache{}
+	controller1 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	go controller1.Run(stop)
 
-	storeOne.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "some-config",
-		Plural:      "some-configs",
-		MessageName: "istio.networking.v1alpha3.DestinationRule",
-	}})
+	controller2 := memory.NewController(collection.SchemasFor(collections.HTTPRoute), false)
+	go controller2.Run(stop)
 
-	storeTwo.ConfigDescriptorReturns([]schema.Instance{{
-		Type:        "other-config",
-		Plural:      "other-configs",
-		MessageName: "istio.networking.v1alpha3.Gateway",
-	}})
+	stores := []model.ConfigStoreController{controller1, controller2}
 
-	stores := []model.ConfigStoreCache{storeOne, storeTwo}
-
-	cacheStore, err := aggregate.MakeCache(stores)
-	g.Expect(err).NotTo(gomega.HaveOccurred())
-
-	t.Run("it checks sync status", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
-
-		syncStatusCases := []struct {
-			storeOne bool
-			storeTwo bool
-			expect   bool
-		}{
-			{true, true, true},
-			{false, true, false},
-			{true, false, false},
-			{false, false, false},
-		}
-		for _, syncStatus := range syncStatusCases {
-			storeOne.HasSyncedReturns(syncStatus.storeOne)
-			storeTwo.HasSyncedReturns(syncStatus.storeTwo)
-			ss := cacheStore.HasSynced()
-			g.Expect(ss).To(gomega.Equal(syncStatus.expect))
-		}
-	})
+	cacheStore, err := MakeCache(stores)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("it registers an event handler", func(t *testing.T) {
-		g := gomega.NewGomegaWithT(t)
+		handled := atomic.NewBool(false)
+		cacheStore.RegisterEventHandler(gvk.HTTPRoute, func(config.Config, config.Config, model.Event) {
+			handled.Store(true)
+		})
 
-		cacheStore.RegisterEventHandler("some-config", func(model.Config, model.Event) {})
+		_, err := controller1.Create(config.Config{
+			Meta: config.Meta{
+				GroupVersionKind: gvk.HTTPRoute,
+				Name:             "another",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
-		typ, h := storeOne.RegisterEventHandlerArgsForCall(0)
-		g.Expect(typ).To(gomega.Equal("some-config"))
-		g.Expect(h).ToNot(gomega.BeNil())
+		retry.UntilOrFail(t, handled.Load, retry.Timeout(time.Second))
 	})
+}
+
+func schemaFor(kind, proto string) resource.Schema {
+	return resource.Builder{
+		Kind:   kind,
+		Plural: strings.ToLower(kind) + "s",
+		Proto:  proto,
+	}.BuildNoValidate()
 }

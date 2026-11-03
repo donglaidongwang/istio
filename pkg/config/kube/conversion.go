@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,10 @@ package kube
 import (
 	"strings"
 
-	"istio.io/istio/pkg/config/labels"
-	"istio.io/istio/pkg/config/protocol"
+	corev1 "k8s.io/api/core/v1"
 
-	coreV1 "k8s.io/api/core/v1"
-	metaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/util/sets"
 )
 
 const (
@@ -31,32 +30,45 @@ const (
 	MongoDB = 27017
 )
 
-var (
-	// Ports be skipped for protocol sniffing. Applications bound to these ports will be broken if
-	// protocol sniffing is enabled.
-	wellKnownPorts = map[int32]struct{}{
-		SMTP:    {},
-		DNS:     {},
-		MySQL:   {},
-		MongoDB: {},
-	}
+// Ports be skipped for protocol sniffing. Applications bound to these ports will be broken if
+// protocol sniffing is enabled.
+var wellKnownPorts = sets.New[int32](
+	SMTP,
+	DNS,
+	MySQL,
+	MongoDB,
 )
 
-func ConvertLabels(obj metaV1.ObjectMeta) labels.Instance {
-	out := make(labels.Instance, len(obj.Labels))
-	for k, v := range obj.Labels {
-		out[k] = v
-	}
-	return out
-}
-
-var grpcWeb = string(protocol.GRPCWeb)
-var grpcWebLen = len(grpcWeb)
+var (
+	grpcWeb    = string(protocol.GRPCWeb)
+	grpcWebLen = len(grpcWeb)
+)
 
 // ConvertProtocol from k8s protocol and port name
-func ConvertProtocol(port int32, name string, proto coreV1.Protocol) protocol.Instance {
-	if proto == coreV1.ProtocolUDP {
+func ConvertProtocol(port int32, portName string, proto corev1.Protocol, appProto *string) protocol.Instance {
+	if proto == corev1.ProtocolUDP {
 		return protocol.UDP
+	}
+
+	// If application protocol is set, we will use that
+	// If not, use the port name
+	name := portName
+	if appProto != nil {
+		name = *appProto
+		// Kubernetes has a few AppProtocol specific standard names defined in the Service spec
+		// Handle these only for AppProtocol (name cannot have these values, anyways).
+		// https://github.com/kubernetes/kubernetes/blob/b4140391cf39ea54cd0227e294283bfb5718c22d/staging/src/k8s.io/api/core/v1/generated.proto#L1245-L1248
+		switch name {
+		// "http2 over cleartext", which is also what our HTTP2 port is
+		case "kubernetes.io/h2c":
+			return protocol.HTTP2
+		// WebSocket over cleartext
+		case "kubernetes.io/ws":
+			return protocol.HTTP
+		// WebSocket over TLS
+		case "kubernetes.io/wss":
+			return protocol.HTTPS
+		}
 	}
 
 	// Check if the port name prefix is "grpc-web". Need to do this before the general
@@ -74,7 +86,7 @@ func ConvertProtocol(port int32, name string, proto coreV1.Protocol) protocol.In
 	p := protocol.Parse(name)
 	if p == protocol.Unsupported {
 		// Make TCP as default protocol for well know ports if protocol is not specified.
-		if _, has := wellKnownPorts[port]; has {
+		if wellKnownPorts.Contains(port) {
 			return protocol.TCP
 		}
 	}

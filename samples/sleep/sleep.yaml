@@ -1,4 +1,4 @@
-# Copyright 2017 Istio Authors
+# Copyright Istio Authors
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ metadata:
   name: sleep
   labels:
     app: sleep
+    service: sleep
 spec:
   ports:
   - port: 80
@@ -47,11 +48,12 @@ spec:
       labels:
         app: sleep
     spec:
+      terminationGracePeriodSeconds: 0
       serviceAccountName: sleep
       containers:
       - name: sleep
-        image: governmentpaas/curl-ssl
-        command: ["/bin/sleep", "3650d"]
+        image: docker.io/curlimages/curl:8.16.0
+        command: ["/bin/sleep", "infinity"]
         imagePullPolicy: IfNotPresent
         volumeMounts:
         - mountPath: /etc/sleep/tls

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,67 +15,108 @@
 package crd
 
 import (
-	"reflect"
+	"encoding/json"
 	"testing"
 
-	"istio.io/istio/pilot/pkg/model"
+	gateway "sigs.k8s.io/gateway-api/apis/v1"
+
+	"istio.io/api/meta/v1alpha1"
 	"istio.io/istio/pilot/test/mock"
-	"istio.io/istio/pkg/config/schemas"
+	"istio.io/istio/pkg/config"
+	"istio.io/istio/pkg/config/schema/collections"
+	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
-var (
-	camelKebabs = []struct{ in, out string }{
-		{"ExampleNameX", "example-name-x"},
-		{"Example1", "example1"},
-		{"ExampleXY", "example-x-y"},
-	}
-)
-
-func TestCamelKebab(t *testing.T) {
-	for _, tt := range camelKebabs {
-		s := CamelCaseToKebabCase(tt.in)
-		if s != tt.out {
-			t.Errorf("CamelCaseToKebabCase(%q) => %q, want %q", tt.in, s, tt.out)
-		}
-		u := KebabCaseToCamelCase(tt.out)
-		if u != tt.in {
-			t.Errorf("kebabToCamel(%q) => %q, want %q", tt.out, u, tt.in)
-		}
+func TestConvertIstioKind(t *testing.T) {
+	if _, err := ConvertObject(collections.VirtualService, &IstioKind{Spec: json.RawMessage(`{"x":1}`)}, "local"); err != nil {
+		t.Errorf("error for converting object: %s", err)
 	}
 }
 
 func TestConvert(t *testing.T) {
-	if _, err := ConvertConfig(schemas.VirtualService, model.Config{}); err == nil {
-		t.Errorf("expected error for converting empty config")
-	}
-	if _, err := ConvertObject(schemas.VirtualService, &IstioKind{Spec: map[string]interface{}{"x": 1}}, "local"); err != nil {
-		t.Errorf("error for converting object: %s", err)
-	}
-	config := model.Config{
-		ConfigMeta: model.ConfigMeta{
-			Type:            schemas.VirtualService.Type,
-			Group:           "networking.istio.io",
-			Version:         "v1alpha3",
-			Name:            "test",
-			Namespace:       "default",
-			Domain:          "cluster",
-			ResourceVersion: "1234",
-			Labels:          map[string]string{"label": "value"},
-			Annotations:     map[string]string{"annotation": "value"},
+	cases := []struct {
+		name string
+		cfg  config.Config
+	}{
+		{
+			name: "istio",
+			cfg: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test",
+					Namespace:        "default",
+					Domain:           "cluster",
+					ResourceVersion:  "1234",
+					Labels:           map[string]string{"label": "value"},
+					Annotations:      map[string]string{"annotation": "value"},
+				},
+				Spec: mock.ExampleVirtualService,
+			},
 		},
-		Spec: mock.ExampleVirtualService,
+		{
+			name: "istio status",
+			cfg: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.VirtualService,
+					Name:             "test",
+					Namespace:        "default",
+					Domain:           "cluster",
+					ResourceVersion:  "1234",
+					Labels:           map[string]string{"label": "value"},
+					Annotations:      map[string]string{"annotation": "value"},
+				},
+				Spec: mock.ExampleVirtualService,
+				Status: &v1alpha1.IstioStatus{
+					Conditions: []*v1alpha1.IstioCondition{
+						{Type: "Health"},
+					},
+				},
+			},
+		},
+		{
+			name: "gateway",
+			cfg: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.HTTPRoute,
+					Name:             "test",
+					Namespace:        "default",
+					Domain:           "cluster",
+				},
+				Spec: &gateway.HTTPRouteSpec{
+					Hostnames: []gateway.Hostname{"example.com"},
+				},
+			},
+		},
+		{
+			name: "gateway status",
+			cfg: config.Config{
+				Meta: config.Meta{
+					GroupVersionKind: gvk.HTTPRoute,
+					Name:             "test",
+					Namespace:        "default",
+					Domain:           "cluster",
+				},
+				Spec: &gateway.HTTPRouteSpec{
+					Hostnames: []gateway.Hostname{"example.com"},
+				},
+				Status: &gateway.HTTPRouteStatus{},
+			},
+		},
 	}
-
-	obj, err := ConvertConfig(schemas.VirtualService, config)
-	if err != nil {
-		t.Errorf("ConvertConfig() => unexpected error %v", err)
-	}
-	got, err := ConvertObject(schemas.VirtualService, obj, "cluster")
-	if err != nil {
-		t.Errorf("ConvertObject() => unexpected error %v", err)
-	}
-	if !reflect.DeepEqual(&config, got) {
-		t.Errorf("ConvertObject(ConvertConfig(%#v)) => got %#v", config, got)
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			obj, err := ConvertConfig(tt.cfg)
+			if err != nil {
+				t.Errorf("ConvertConfig() => unexpected error %v", err)
+			}
+			col, _ := collections.All.FindByGroupVersionAliasesKind(tt.cfg.GroupVersionKind)
+			got, err := ConvertObject(col, obj, "cluster")
+			if err != nil {
+				t.Errorf("ConvertObject() => unexpected error %v", err)
+			}
+			assert.Equal(t, &tt.cfg, got)
+		})
 	}
 }
 
@@ -86,20 +127,21 @@ func TestParseInputs(t *testing.T) {
 	if _, _, err := ParseInputs("a"); err == nil {
 		t.Error(`ParseInput("a") => got no error`)
 	}
-	if _, others, err := ParseInputs("kind: Pod"); err != nil || len(others) != 1 {
+	if _, others, err := ParseInputs("apiVersion: v1\nkind: Pod"); err != nil || len(others) != 1 {
 		t.Errorf(`ParseInput("kind: Pod") => got %v, %v`, others, err)
 	}
 	if varr, others, err := ParseInputs("---\n"); err != nil || len(varr) != 0 || len(others) != 0 {
 		t.Errorf(`ParseInput("---") => got %v, %v, %v`, varr, others, err)
 	}
-	if _, _, err := ParseInputs("kind: VirtualService\nspec:\n  destination: x"); err == nil {
+	if _, _, err := ParseInputs("apiVersion: networking.istio.io/v1alpha3\nkind: VirtualService\nspec:\n  destination: x"); err == nil {
 		t.Error("ParseInput(bad spec) => got no error")
 	}
-	if _, _, err := ParseInputs("kind: VirtualService\nspec:\n  destination:\n    service:"); err == nil {
+	if _, _, err := ParseInputs("apiVersion: networking.istio.io/v1alpha3\nkind: VirtualService\nspec:\n  destination:\n    service:"); err == nil {
 		t.Error("ParseInput(invalid spec) => got no error")
 	}
 
-	validInput := `{"kind":"VirtualService", "spec":{"hosts":["foo"],"http":[{"route":[{"destination":{"host":"bar"},"weight":100}]}]}}`
+	// nolint: lll
+	validInput := `{"apiVersion": "networking.istio.io/v1alpha3", "kind":"VirtualService", "spec":{"hosts":["foo"],"http":[{"route":[{"destination":{"host":"bar"},"weight":100}]}]}}`
 	varr, _, err := ParseInputs(validInput)
 	if err != nil || len(varr) == 0 {
 		t.Errorf("ParseInputs(correct input) => got %v, %v", varr, err)

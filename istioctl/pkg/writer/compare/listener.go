@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,29 +18,39 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/golang/protobuf/jsonpb"
 	"github.com/pmezard/go-difflib/difflib"
+
+	// Force import protos
+	_ "istio.io/istio/pilot/pkg/xds/filters"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
-// ListenerDiff prints a diff between Pilot and Envoy listeners to the passed writer
+// ListenerDiff prints a diff between Istiod and Envoy listeners to the passed writer
 func (c *Comparator) ListenerDiff() error {
-	jsonm := &jsonpb.Marshaler{Indent: "   "}
-	envoyBytes, pilotBytes := &bytes.Buffer{}, &bytes.Buffer{}
+	envoyBytes, istiodBytes := &bytes.Buffer{}, &bytes.Buffer{}
 	envoyListenerDump, err := c.envoy.GetDynamicListenerDump(true)
 	if err != nil {
 		envoyBytes.WriteString(err.Error())
-	} else if err := jsonm.Marshal(envoyBytes, envoyListenerDump); err != nil {
-		return err
+	} else {
+		envoy, err := protomarshal.ToJSONWithAnyResolver(envoyListenerDump, "    ", &envoyResolver)
+		if err != nil {
+			return err
+		}
+		envoyBytes.WriteString(envoy)
 	}
-	pilotListenerDump, err := c.pilot.GetDynamicListenerDump(true)
+	istiodListenerDump, err := c.istiod.GetDynamicListenerDump(true)
 	if err != nil {
-		pilotBytes.WriteString(err.Error())
-	} else if err := jsonm.Marshal(pilotBytes, pilotListenerDump); err != nil {
-		return err
+		istiodBytes.WriteString(err.Error())
+	} else {
+		istiod, err := protomarshal.ToJSONWithAnyResolver(istiodListenerDump, "    ", &envoyResolver)
+		if err != nil {
+			return err
+		}
+		istiodBytes.WriteString(istiod)
 	}
 	diff := difflib.UnifiedDiff{
-		FromFile: "Pilot Listeners",
-		A:        difflib.SplitLines(pilotBytes.String()),
+		FromFile: "Istiod Listeners",
+		A:        difflib.SplitLines(istiodBytes.String()),
 		ToFile:   "Envoy Listeners",
 		B:        difflib.SplitLines(envoyBytes.String()),
 		Context:  c.context,
@@ -50,6 +60,7 @@ func (c *Comparator) ListenerDiff() error {
 		return err
 	}
 	if text != "" {
+		fmt.Fprintln(c.w, "Listeners Don't Match")
 		fmt.Fprintln(c.w, text)
 	} else {
 		fmt.Fprintln(c.w, "Listeners Match")

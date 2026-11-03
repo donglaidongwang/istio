@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,179 +15,105 @@
 package model
 
 import (
-	"fmt"
-	"reflect"
 	"testing"
+	"time"
 
-	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	envoy_config_grpc_credential_v2alpha "github.com/envoyproxy/go-control-plane/envoy/config/grpc_credential/v2alpha"
+	"github.com/davecgh/go-spew/spew"
+	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	auth "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	"github.com/google/go-cmp/cmp"
+	"google.golang.org/protobuf/testing/protocmp"
+	"google.golang.org/protobuf/types/known/durationpb"
 
-	"istio.io/istio/pilot/pkg/features"
+	meshconfig "istio.io/api/mesh/v1alpha1"
+	networking "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/model/credentials"
+	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/config/protocol"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/pkg/spiffe"
 )
 
 func TestConstructSdsSecretConfig(t *testing.T) {
-	trustworthyMetaConfig := &envoy_config_grpc_credential_v2alpha.FileBasedMetadataConfig{
-		SecretData: &core.DataSource{
-			Specifier: &core.DataSource_Filename{
-				Filename: K8sSATrustworthyJwtFileName,
-			},
-		},
-		HeaderKey: K8sSAJwtTokenHeaderKey,
-	}
-
-	gRPCConfig := &core.GrpcService_GoogleGrpc{
-		TargetUri:  "/tmp/sdsuds.sock",
-		StatPrefix: SDSStatPrefix,
-		ChannelCredentials: &core.GrpcService_GoogleGrpc_ChannelCredentials{
-			CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
-				LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
-			},
-		},
-	}
-
-	gRPCConfig.CredentialsFactoryName = FileBasedMetadataPlugName
-	gRPCConfig.CallCredentials = ConstructgRPCCallCredentials(K8sSATrustworthyJwtFileName, K8sSAJwtTokenHeaderKey)
-
-	cases := []struct {
-		serviceAccount string
-		sdsUdsPath     string
-		expected       *auth.SdsSecretConfig
+	testCases := []struct {
+		name       string
+		secretName string
+		expected   *auth.SdsSecretConfig
 	}{
 		{
-			serviceAccount: "spiffe://cluster.local/ns/bar/sa/foo",
-			sdsUdsPath:     "/tmp/sdsuds.sock",
+			name:       "ConstructSdsSecretConfig",
+			secretName: "spiffe://cluster.local/ns/bar/sa/foo",
 			expected: &auth.SdsSecretConfig{
 				Name: "spiffe://cluster.local/ns/bar/sa/foo",
 				SdsConfig: &core.ConfigSource{
-					InitialFetchTimeout: features.InitialFetchTimeout,
+					ResourceApiVersion: core.ApiVersion_V3,
 					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
 						ApiConfigSource: &core.ApiConfigSource{
-							ApiType: core.ApiConfigSource_GRPC,
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
 							GrpcServices: []*core.GrpcService{
 								{
-									TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-										GoogleGrpc: gRPCConfig,
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
 									},
 								},
 							},
-							RefreshDelay: nil,
 						},
 					},
 				},
 			},
 		},
 		{
-			serviceAccount: "spiffe://cluster.local/ns/bar/sa/foo",
-			sdsUdsPath:     "/tmp/sdsuds.sock",
-			expected: &auth.SdsSecretConfig{
-				Name:      "spiffe://cluster.local/ns/bar/sa/foo",
-				SdsConfig: constructsdsconfighelper(K8sSATrustworthyJwtFileName, K8sSAJwtTokenHeaderKey, trustworthyMetaConfig),
-			},
-		},
-		{
-			serviceAccount: "",
-			sdsUdsPath:     "/tmp/sdsuds.sock",
-			expected:       nil,
-		},
-		{
-			serviceAccount: "",
-			sdsUdsPath:     "spiffe://cluster.local/ns/bar/sa/foo",
-			expected:       nil,
+			name:       "ConstructSdsSecretConfig without secretName",
+			secretName: "",
+			expected:   nil,
 		},
 	}
 
-	for _, c := range cases {
-		if got := ConstructSdsSecretConfig(c.serviceAccount, c.sdsUdsPath, &model.NodeMetadata{}); !reflect.DeepEqual(got, c.expected) {
-			t.Errorf("ConstructSdsSecretConfig: got(%#v) != want(%#v)\n", got, c.expected)
-			fmt.Println(got)
-			fmt.Println(c.expected)
-		}
+	for _, c := range testCases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ConstructSdsSecretConfig(c.secretName); !cmp.Equal(got, c.expected, protocmp.Transform()) {
+				t.Errorf("ConstructSdsSecretConfig: got(%#v), want(%#v)\n", got, c.expected)
+			}
+		})
 	}
 }
 
-func TestConstructSdsSecretConfigForGatewayListener(t *testing.T) {
-	cases := []struct {
-		serviceAccount string
-		sdsUdsPath     string
-		expected       *auth.SdsSecretConfig
+func TestApplyToCommonTLSContext(t *testing.T) {
+	testCases := []struct {
+		name               string
+		node               *model.Proxy
+		trustDomainAliases []string
+		crl                string
+		validateClient     bool
+		tlsCertificates    []*networking.ServerTLSSettings_TLSCertificate
+		expected           *auth.CommonTlsContext
 	}{
 		{
-			serviceAccount: "spiffe://cluster.local/ns/bar/sa/foo",
-			sdsUdsPath:     "/tmp/sdsuds.sock",
-			expected: &auth.SdsSecretConfig{
-				Name: "spiffe://cluster.local/ns/bar/sa/foo",
-				SdsConfig: &core.ConfigSource{
-					InitialFetchTimeout: features.InitialFetchTimeout,
-					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-						ApiConfigSource: &core.ApiConfigSource{
-							ApiType: core.ApiConfigSource_GRPC,
-							GrpcServices: []*core.GrpcService{
-								{
-									TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-										GoogleGrpc: &core.GrpcService_GoogleGrpc{
-											TargetUri:  "/tmp/sdsuds.sock",
-											StatPrefix: SDSStatPrefix,
-										},
-									},
-								},
-							},
-							RefreshDelay: nil,
-						},
-					},
-				},
+			name: "MTLSStrict using SDS",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
 			},
-		},
-		{
-			serviceAccount: "",
-			sdsUdsPath:     "/tmp/sdsuds.sock",
-			expected:       nil,
-		},
-		{
-			serviceAccount: "spiffe://cluster.local/ns/bar/sa/foo",
-			sdsUdsPath:     "",
-			expected:       nil,
-		},
-	}
-
-	for _, c := range cases {
-		if got := ConstructSdsSecretConfigForGatewayListener(c.serviceAccount, c.sdsUdsPath); !reflect.DeepEqual(got, c.expected) {
-			t.Errorf("ConstructSdsSecretConfig: got(%#v) != want(%#v)\n", got, c.expected)
-		}
-	}
-}
-
-func constructLocalChannelCredConfig() *core.GrpcService_GoogleGrpc_ChannelCredentials {
-	return &core.GrpcService_GoogleGrpc_ChannelCredentials{
-		CredentialSpecifier: &core.GrpcService_GoogleGrpc_ChannelCredentials_LocalCredentials{
-			LocalCredentials: &core.GrpcService_GoogleGrpc_GoogleLocalCredentials{},
-		},
-	}
-}
-
-func constructsdsconfighelper(tokenFileName, headerKey string, metaConfig *envoy_config_grpc_credential_v2alpha.FileBasedMetadataConfig) *core.ConfigSource {
-	any := findOrMarshalFileBasedMetadataConfig(tokenFileName, headerKey, metaConfig)
-	return &core.ConfigSource{
-		InitialFetchTimeout: features.InitialFetchTimeout,
-		ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-			ApiConfigSource: &core.ApiConfigSource{
-				ApiType: core.ApiConfigSource_GRPC,
-				GrpcServices: []*core.GrpcService{
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
 					{
-						TargetSpecifier: &core.GrpcService_GoogleGrpc_{
-							GoogleGrpc: &core.GrpcService_GoogleGrpc{
-								TargetUri:              "/tmp/sdsuds.sock",
-								StatPrefix:             SDSStatPrefix,
-								CredentialsFactoryName: "envoy.grpc_credentials.file_based_metadata",
-								ChannelCredentials:     constructLocalChannelCredConfig(),
-								CallCredentials: []*core.GrpcService_GoogleGrpc_CallCredentials{
-									{
-										CredentialSpecifier: &core.GrpcService_GoogleGrpc_CallCredentials_FromPlugin{
-											FromPlugin: &core.GrpcService_GoogleGrpc_CallCredentials_MetadataCredentialsFromPlugin{
-												Name: "envoy.grpc_credentials.file_based_metadata",
-												ConfigType: &core.GrpcService_GoogleGrpc_CallCredentials_MetadataCredentialsFromPlugin_TypedConfig{
-													TypedConfig: any},
+						Name: "default",
+						SdsConfig: &core.ConfigSource{
+							InitialFetchTimeout: durationpb.New(time.Second * 0),
+							ResourceApiVersion:  core.ApiVersion_V3,
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
 											},
 										},
 									},
@@ -196,8 +122,1011 @@ func constructsdsconfighelper(tokenFileName, headerKey string, metaConfig *envoy
 						},
 					},
 				},
-				RefreshDelay: nil,
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "ROOTCA",
+							SdsConfig: &core.ConfigSource{
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+								ResourceApiVersion:  core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
 			},
 		},
+		{
+			name: "MTLSStrict using SDS and SAN aliases",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			validateClient:     true,
+			trustDomainAliases: []string{"alias-1.domain", "some-other-alias-1.domain", "alias-2.domain"},
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "default",
+						SdsConfig: &core.ConfigSource{
+							InitialFetchTimeout: durationpb.New(time.Second * 0),
+							ResourceApiVersion:  core.ApiVersion_V3,
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{MatchSubjectAltNames: []*matcher.StringMatcher{
+							{MatchPattern: &matcher.StringMatcher_Prefix{Prefix: spiffe.URIPrefix + "alias-1.domain" + "/"}},
+							{MatchPattern: &matcher.StringMatcher_Prefix{Prefix: spiffe.URIPrefix + "some-other-alias-1.domain" + "/"}},
+							{MatchPattern: &matcher.StringMatcher_Prefix{Prefix: spiffe.URIPrefix + "alias-2.domain" + "/"}},
+						}},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "ROOTCA",
+							SdsConfig: &core.ConfigSource{
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+								ResourceApiVersion:  core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "MTLS using SDS with custom certs in metadata",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{
+					TLSServerCertChain: "serverCertChain",
+					TLSServerKey:       "serverKey",
+					TLSServerRootCert:  "servrRootCert",
+				},
+			},
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "file-cert:serverCertChain~serverKey",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion: core.ApiVersion_V3,
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "file-root:servrRootCert",
+							SdsConfig: &core.ConfigSource{
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+								ResourceApiVersion: core.ApiVersion_V3,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ISTIO_MUTUAL SDS without node meta",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "default",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion:  core.ApiVersion_V3,
+							InitialFetchTimeout: durationpb.New(time.Second * 0),
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "ROOTCA",
+							SdsConfig: &core.ConfigSource{
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+								ResourceApiVersion:  core.ApiVersion_V3,
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ISTIO_MUTUAL with custom cert paths from proxy node metadata",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{
+					TLSServerCertChain: "/custom/path/to/cert-chain.pem",
+					TLSServerKey:       "/custom-key.pem",
+					TLSServerRootCert:  "/custom/path/to/root.pem",
+				},
+			},
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "file-cert:/custom/path/to/cert-chain.pem~/custom-key.pem",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion: core.ApiVersion_V3,
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "file-root:/custom/path/to/root.pem",
+							SdsConfig: &core.ConfigSource{
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+								ResourceApiVersion: core.ApiVersion_V3,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "SIMPLE with custom cert paths from proxy node metadata without cacerts",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{
+					TLSServerCertChain: "/custom/path/to/cert-chain.pem",
+					TLSServerKey:       "/custom-key.pem",
+				},
+			},
+			validateClient: false,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "file-cert:/custom/path/to/cert-chain.pem~/custom-key.pem",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion: core.ApiVersion_V3,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "MTLSStrict using SDS with CRL",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			validateClient: true,
+			crl:            "/custom/path/to/crl.pem",
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "default",
+						SdsConfig: &core.ConfigSource{
+							InitialFetchTimeout: durationpb.New(time.Second * 0),
+							ResourceApiVersion:  core.ApiVersion_V3,
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{
+							Crl: &core.DataSource{
+								Specifier: &core.DataSource_Filename{
+									Filename: "/custom/path/to/crl.pem",
+								},
+							},
+						},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "ROOTCA",
+							SdsConfig: &core.ConfigSource{
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+								ResourceApiVersion:  core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Multiple TLSServerCertificates",
+			node: &model.Proxy{Metadata: &model.NodeMetadata{
+				TLSServerRootCert: "/path/to/root.pem",
+			}},
+			tlsCertificates: []*networking.ServerTLSSettings_TLSCertificate{
+				{
+					ServerCertificate: "/path/to/cert1.pem",
+					PrivateKey:        "/path/to/key1.pem",
+				},
+				{
+					ServerCertificate: "/path/to/cert2.pem",
+					PrivateKey:        "/path/to/key2.pem",
+				},
+			},
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "file-cert:/path/to/cert1.pem~/path/to/key1.pem",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion: core.ApiVersion_V3,
+						},
+					},
+					{
+						Name: "file-cert:/path/to/cert2.pem~/path/to/key2.pem",
+						SdsConfig: &core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+							ResourceApiVersion: core.ApiVersion_V3,
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "file-root:/path/to/root.pem",
+							SdsConfig: &core.ConfigSource{
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+								ResourceApiVersion: core.ApiVersion_V3,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Nil TLSServerCertificates",
+			node: &model.Proxy{
+				Metadata: &model.NodeMetadata{},
+			},
+			validateClient: true,
+			expected: &auth.CommonTlsContext{
+				TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+					{
+						Name: "default",
+						SdsConfig: &core.ConfigSource{
+							InitialFetchTimeout: durationpb.New(time.Second * 0),
+							ResourceApiVersion:  core.ApiVersion_V3,
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType:                   core.ApiConfigSource_GRPC,
+									SetNodeOnFirstMessageOnly: true,
+									TransportApiVersion:       core.ApiVersion_V3,
+									GrpcServices: []*core.GrpcService{
+										{
+											TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+												EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+					CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+						DefaultValidationContext: &auth.CertificateValidationContext{},
+						ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+							Name: "ROOTCA",
+							SdsConfig: &core.ConfigSource{
+								InitialFetchTimeout: durationpb.New(time.Second * 0),
+								ResourceApiVersion:  core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		t.Run(test.name, func(t *testing.T) {
+			tlsContext := &auth.CommonTlsContext{}
+			ApplyToCommonTLSContext(tlsContext, test.node, []string{}, test.crl, test.trustDomainAliases, test.validateClient, test.tlsCertificates, false)
+
+			if !cmp.Equal(tlsContext, test.expected, protocmp.Transform()) {
+				t.Errorf("got(%#v), want(%#v)\n", spew.Sdump(tlsContext), spew.Sdump(test.expected))
+			}
+		})
+	}
+}
+
+func TestConstructSdsSecretConfigForCredential(t *testing.T) {
+	cases := []struct {
+		name                   string
+		credentialSocketExists bool
+		push                   *model.PushContext
+		expected               *auth.SdsSecretConfig
+	}{
+		{
+			name:                   "",
+			credentialSocketExists: false,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected:               nil,
+		},
+		{
+			name:                   "builtin://",
+			credentialSocketExists: false,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected: &auth.SdsSecretConfig{
+				Name: SDSDefaultResourceName,
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
+							GrpcServices: []*core.GrpcService{
+								{
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+									},
+								},
+							},
+						},
+					},
+					ResourceApiVersion:  core.ApiVersion_V3,
+					InitialFetchTimeout: durationpb.New(time.Second * 0),
+				},
+			},
+		},
+		{
+			name:                   "builtin://-cacert",
+			credentialSocketExists: false,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected: &auth.SdsSecretConfig{
+				Name: SDSRootResourceName,
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
+							GrpcServices: []*core.GrpcService{
+								{
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: SDSClusterName},
+									},
+								},
+							},
+						},
+					},
+					ResourceApiVersion:  core.ApiVersion_V3,
+					InitialFetchTimeout: durationpb.New(time.Second * 0),
+				},
+			},
+		},
+		{
+			name:                   "sds://my-credential",
+			credentialSocketExists: true,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected: &auth.SdsSecretConfig{
+				Name: "sds://my-credential",
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
+							GrpcServices: []*core.GrpcService{
+								{
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: security.SDSExternalClusterName},
+									},
+								},
+							},
+						},
+					},
+					ResourceApiVersion: core.ApiVersion_V3,
+				},
+			},
+		},
+		{
+			name:                   "test-cert",
+			credentialSocketExists: false,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected: &auth.SdsSecretConfig{
+				Name:      "kubernetes://test-cert",
+				SdsConfig: SDSAdsConfig,
+			},
+		},
+		{
+			name:                   "sds://my-credential",
+			credentialSocketExists: false,
+			push: func() *model.PushContext {
+				pc := &model.PushContext{
+					Mesh: &meshconfig.MeshConfig{
+						ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+							{
+								Name: "my-sds-provider",
+								Provider: &meshconfig.MeshConfig_ExtensionProvider_Sds{
+									Sds: &meshconfig.MeshConfig_ExtensionProvider_SDSProvider{
+										Name:    "my-sds-provider",
+										Service: "sds-provider-service",
+										Port:    8080,
+									},
+								},
+							},
+						},
+					},
+				}
+				pc.ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*model.Service{
+					"sds-provider-service": {
+						"": &model.Service{
+							Hostname: "sds-provider-service",
+							Ports: []*model.Port{
+								{
+									Name:     "grpc",
+									Port:     8080,
+									Protocol: protocol.GRPC,
+								},
+							},
+						},
+					},
+				}
+				return pc
+			}(),
+			expected: &auth.SdsSecretConfig{
+				Name: "my-credential",
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType:                   core.ApiConfigSource_GRPC,
+							SetNodeOnFirstMessageOnly: true,
+							TransportApiVersion:       core.ApiVersion_V3,
+							GrpcServices: []*core.GrpcService{
+								{
+									TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+										EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+											ClusterName: "outbound|8080||sds-provider-service",
+											Authority:   "sds-provider-service",
+										},
+									},
+								},
+							},
+						},
+					},
+					ResourceApiVersion: core.ApiVersion_V3,
+				},
+			},
+		},
+		{
+			name:                   "sds://my-credential-missing-service",
+			credentialSocketExists: false,
+			push: func() *model.PushContext {
+				pc := &model.PushContext{
+					Mesh: &meshconfig.MeshConfig{
+						ExtensionProviders: []*meshconfig.MeshConfig_ExtensionProvider{
+							{
+								Name: "my-sds-provider",
+								Provider: &meshconfig.MeshConfig_ExtensionProvider_Sds{
+									Sds: &meshconfig.MeshConfig_ExtensionProvider_SDSProvider{
+										Name:    "my-sds-provider",
+										Service: "missing-service",
+										Port:    8080,
+									},
+								},
+							},
+						},
+					},
+				}
+				// ServiceIndex is empty, so LookupCluster will fail
+				pc.ServiceIndex.HostnameAndNamespace = map[host.Name]map[string]*model.Service{}
+				return pc
+			}(),
+			expected: nil,
+		},
+		{
+			name:                   "sds://no-provider-no-socket",
+			credentialSocketExists: false,
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+			expected: &auth.SdsSecretConfig{
+				Name:      "kubernetes://no-provider-no-socket",
+				SdsConfig: SDSAdsConfig,
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ConstructSdsSecretConfigForCredential(c.name, c.credentialSocketExists, c.push); !cmp.Equal(got, c.expected, protocmp.Transform()) {
+				t.Errorf("ConstructSdsSecretConfigForCredential() = %v, want %v", got, c.expected)
+			}
+		})
+	}
+}
+
+func TestApplyCustomSDSToClientCommonTLSContext(t *testing.T) {
+	tests := []struct {
+		name             string
+		tlsOpts          *networking.ClientTLSSettings
+		wantCertificate  string
+		wantValidationCA string
+	}{
+		{
+			name: "mutual TLS derives CA from client credential",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:           networking.ClientTLSSettings_MUTUAL,
+				CredentialName: "client-cert",
+			},
+			wantCertificate:  "kubernetes://client-cert",
+			wantValidationCA: "kubernetes://client-cert-cacert",
+		},
+		{
+			name: "mutual TLS uses independent CA credential",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_MUTUAL,
+				CredentialName:       "client-cert",
+				CaCertCredentialName: "configmap://backend/backend-ca",
+			},
+			wantCertificate:  "kubernetes://client-cert",
+			wantValidationCA: "configmap://backend/backend-ca",
+		},
+		{
+			name: "mutual TLS marks an independent Secret credential as CA-only",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_MUTUAL,
+				CredentialName:       "client-cert",
+				CaCertCredentialName: "kubernetes://backend/backend-ca",
+			},
+			wantCertificate:  "kubernetes://client-cert",
+			wantValidationCA: "kubernetes://backend/backend-ca-cacert",
+		},
+		{
+			name: "simple TLS with only a CA credential",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_SIMPLE,
+				CaCertCredentialName: "backend-ca",
+			},
+			wantCertificate:  "",
+			wantValidationCA: "kubernetes://backend-ca-cacert",
+		},
+		{
+			name: "simple TLS with only a CA ConfigMap credential",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_SIMPLE,
+				CaCertCredentialName: "configmap://backend/backend-ca",
+			},
+			wantCertificate:  "",
+			wantValidationCA: "configmap://backend/backend-ca",
+		},
+		{
+			// With no credential socket and no SDS extension provider we fall back to resolving
+			// the name as a Kubernetes Secret, which requires the "-cacert" suffix.
+			name: "simple TLS with an sds:// CA credential falling back to ADS",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_SIMPLE,
+				CaCertCredentialName: "sds://backend-ca",
+			},
+			wantCertificate:  "",
+			wantValidationCA: "kubernetes://backend-ca-cacert",
+		},
+		{
+			// The client certificate is served from the file paths by the caller, so no
+			// client certificate SDS config is expected here.
+			name: "mutual TLS with only a CA credential",
+			tlsOpts: &networking.ClientTLSSettings{
+				Mode:                 networking.ClientTLSSettings_MUTUAL,
+				CaCertCredentialName: "kubernetes://backend/backend-ca",
+				ClientCertificate:    "/etc/certs/cert-chain.pem",
+				PrivateKey:           "/etc/certs/key.pem",
+			},
+			wantCertificate:  "",
+			wantValidationCA: "kubernetes://backend/backend-ca-cacert",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlsContext := &auth.CommonTlsContext{}
+			ApplyCustomSDSToClientCommonTLSContext(tlsContext, tt.tlsOpts, false)
+
+			if tt.wantCertificate == "" {
+				if len(tlsContext.TlsCertificateSdsSecretConfigs) != 0 {
+					t.Fatalf("expected no client certificate SDS config, got %v", tlsContext.TlsCertificateSdsSecretConfigs)
+				}
+			} else {
+				if len(tlsContext.TlsCertificateSdsSecretConfigs) != 1 {
+					t.Fatalf("expected one client certificate SDS config, got %d", len(tlsContext.TlsCertificateSdsSecretConfigs))
+				}
+				if got := tlsContext.TlsCertificateSdsSecretConfigs[0].Name; got != tt.wantCertificate {
+					t.Errorf("client certificate SDS config = %q, want %q", got, tt.wantCertificate)
+				}
+			}
+
+			combined := tlsContext.GetCombinedValidationContext()
+			if combined == nil {
+				t.Fatal("expected combined validation context")
+			}
+			if got := combined.ValidationContextSdsSecretConfig.GetName(); got != tt.wantValidationCA {
+				t.Errorf("validation SDS config = %q, want %q", got, tt.wantValidationCA)
+			}
+		})
+	}
+}
+
+func TestNormalizeCaCertCredentialName(t *testing.T) {
+	tests := map[string]string{
+		"":                                "",
+		"backend-ca":                      "backend-ca-cacert",
+		"backend-ca-cacert":               "backend-ca-cacert",
+		"kubernetes://backend/backend-ca": "kubernetes://backend/backend-ca-cacert",
+		"kubernetes-gateway://backend/backend-ca":             "kubernetes-gateway://backend/backend-ca-cacert",
+		"configmap://backend/backend-ca":                      "configmap://backend/backend-ca",
+		"sds://backend-ca":                                    "sds://backend-ca",
+		credentials.InvalidSecretTypeURI:                      credentials.InvalidSecretTypeURI,
+		credentials.BuiltinGatewaySecretTypeURI:               credentials.BuiltinGatewaySecretTypeURI + SdsCaSuffix,
+		credentials.BuiltinGatewaySecretTypeURI + SdsCaSuffix: credentials.BuiltinGatewaySecretTypeURI + SdsCaSuffix,
+	}
+	for input, want := range tests {
+		t.Run(input, func(t *testing.T) {
+			if got := normalizeCaCertCredentialName(input); got != want {
+				t.Errorf("normalizeCaCertCredentialName(%q) = %q, want %q", input, got, want)
+			}
+		})
+	}
+}
+
+func TestApplyCredentialSDSToServerCommonTLSContext(t *testing.T) {
+	tests := []struct {
+		name                   string
+		tlsOpts                *networking.ServerTLSSettings
+		credentialSocketExist  bool
+		expectedCertCount      int
+		expectedValidation     bool
+		expectedValidationType string
+		expectedCaCert         string
+		push                   *model.PushContext
+	}{
+		{
+			name: "single certificate with credential name",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_SIMPLE,
+				CredentialName: "test-cert",
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      1,
+			expectedValidation:     false,
+			expectedValidationType: "",
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+		},
+		{
+			name: "multiple certificates with credential names",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_SIMPLE,
+				CredentialNames: []string{"rsa-cert", "ecdsa-cert"},
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      2,
+			expectedValidation:     false,
+			expectedValidationType: "",
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+		},
+		{
+			name: "credential name with validation context",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_SIMPLE,
+				CredentialName:  "test-cert",
+				SubjectAltNames: []string{"test.com"},
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      1,
+			expectedValidation:     true,
+			expectedValidationType: "ValidationContext",
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+		},
+		{
+			name: "CA certificates with credential name",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_MUTUAL,
+				CredentialName: "rsa-cert",
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      1,
+			expectedValidation:     true,
+			expectedValidationType: "CombinedValidationContext",
+			expectedCaCert:         "kubernetes://rsa-cert-cacert",
+		},
+		{
+			name: "CA certificates with credential names",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:            networking.ServerTLSSettings_MUTUAL,
+				CredentialName:  "ecdsa-cert",
+				CredentialNames: []string{"rsa-cert", "ecdsa-cert"},
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      2,
+			expectedValidation:     true,
+			expectedValidationType: "CombinedValidationContext",
+			expectedCaCert:         "kubernetes://rsa-cert-cacert",
+		},
+		{
+			name: "CA certificates with CA cert credential name",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:                 networking.ServerTLSSettings_MUTUAL,
+				CredentialName:       "ecdsa-cert",
+				CredentialNames:      []string{"rsa-cert", "ecdsa-cert"},
+				CaCertCredentialName: "cacert",
+			},
+			credentialSocketExist:  false,
+			expectedCertCount:      2,
+			expectedValidation:     true,
+			expectedValidationType: "CombinedValidationContext",
+			expectedCaCert:         "kubernetes://cacert",
+		},
+		{
+			name: "credential name with socket",
+			tlsOpts: &networking.ServerTLSSettings{
+				Mode:           networking.ServerTLSSettings_SIMPLE,
+				CredentialName: "sds://my-credential",
+			},
+			credentialSocketExist:  true,
+			expectedCertCount:      1,
+			expectedValidation:     false,
+			expectedValidationType: "",
+			push:                   &model.PushContext{Mesh: &meshconfig.MeshConfig{}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tlsContext := &auth.CommonTlsContext{}
+			ApplyCredentialSDSToServerCommonTLSContext(tlsContext, tt.tlsOpts, tt.credentialSocketExist, tt.push)
+
+			// Check certificate count
+			if len(tlsContext.TlsCertificateSdsSecretConfigs) != tt.expectedCertCount {
+				t.Errorf("expected %d certificates, got %d", tt.expectedCertCount, len(tlsContext.TlsCertificateSdsSecretConfigs))
+			}
+
+			// Check validation context
+			if tt.expectedValidation {
+				if tlsContext.ValidationContextType == nil {
+					t.Error("expected validation context to be set")
+				}
+				switch tt.expectedValidationType {
+				case "CombinedValidationContext":
+					combinedCtx, ok := tlsContext.ValidationContextType.(*auth.CommonTlsContext_CombinedValidationContext)
+					if !ok {
+						t.Error("expected CombinedValidationContext")
+					}
+					if combinedCtx.CombinedValidationContext == nil {
+						t.Error("expected CombinedValidationContext to be set")
+					}
+					caCert := combinedCtx.CombinedValidationContext.ValidationContextSdsSecretConfig.Name
+					if tt.expectedCaCert != "" && tt.expectedCaCert != caCert {
+						t.Errorf("expected CA cert %s, got %s", tt.expectedCaCert, caCert)
+					}
+				case "ValidationContext":
+					validationCtx, ok := tlsContext.ValidationContextType.(*auth.CommonTlsContext_ValidationContext)
+					if !ok {
+						t.Error("expected ValidationContext")
+					}
+					if validationCtx.ValidationContext == nil {
+						t.Error("expected ValidationContext to be set")
+					}
+				default:
+					t.Errorf("unexpected validation type: %s", tt.expectedValidationType)
+				}
+			} else if tlsContext.ValidationContextType != nil {
+				t.Error("unexpected validation context")
+			}
+		})
 	}
 }

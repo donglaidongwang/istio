@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,19 +15,19 @@
 package option
 
 import (
-	"net"
+	"strings"
 
-	"github.com/gogo/protobuf/types"
+	"google.golang.org/protobuf/types/known/durationpb"
 
-	meshAPI "istio.io/api/mesh/v1alpha1"
 	networkingAPI "istio.io/api/networking/v1alpha3"
-
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pkg/model"
 )
 
-type LocalhostValue string
-type WildcardValue string
-type DNSLookupFamilyValue string
+type (
+	LocalhostValue       string
+	WildcardValue        string
+	DNSLookupFamilyValue string
+)
 
 const (
 	LocalhostIPv4       LocalhostValue       = "127.0.0.1"
@@ -35,26 +35,19 @@ const (
 	WildcardIPv4        WildcardValue        = "0.0.0.0"
 	WildcardIPv6        WildcardValue        = "::"
 	DNSLookupFamilyIPv4 DNSLookupFamilyValue = "V4_ONLY"
-	DNSLookupFamilyIPv6 DNSLookupFamilyValue = "AUTO"
+	DNSLookupFamilyIPv6 DNSLookupFamilyValue = "V6_ONLY"
+	DNSLookupFamilyIPS  DNSLookupFamilyValue = "ALL"
 )
 
-func ProxyConfig(value *meshAPI.ProxyConfig) Instance {
+func ProxyConfig(value *model.NodeMetaProxyConfig) Instance {
 	return newOption("config", value)
 }
 
 func PilotSubjectAltName(value []string) Instance {
-	return newOption("pilot_SAN", value)
+	return newOption("pilot_SAN", value).withConvert(sanConverter(value))
 }
 
-func MixerSubjectAltName(value []string) Instance {
-	san := ""
-	if len(value) > 0 {
-		san = value[0]
-	}
-	return newOptionOrSkipIfZero("MixerSubjectAltName", san)
-}
-
-func ConnectTimeout(value *types.Duration) Instance {
+func ConnectTimeout(value *durationpb.Duration) Instance {
 	return newDurationOption("connect_timeout", value)
 }
 
@@ -64,6 +57,15 @@ func Cluster(value string) Instance {
 
 func NodeID(value string) Instance {
 	return newOption("nodeID", value)
+}
+
+func NodeType(value string) Instance {
+	ntype := strings.Split(value, "~")[0]
+	return newOption("nodeType", ntype)
+}
+
+func XdsType(value string) Instance {
+	return newOption("xds_type", value)
 }
 
 func Region(value string) Instance {
@@ -78,56 +80,56 @@ func SubZone(value string) Instance {
 	return newOptionOrSkipIfZero("sub_zone", value)
 }
 
-func NodeMetadata(meta *model.NodeMetadata, rawMeta map[string]interface{}) Instance {
+func NodeMetadata(meta *model.BootstrapNodeMetadata, rawMeta map[string]any) Instance {
 	return newOptionOrSkipIfZero("meta_json_str", meta).withConvert(nodeMetadataConverter(meta, rawMeta))
+}
+
+func RuntimeFlags(flags map[string]any) Instance {
+	return newOptionOrSkipIfZero("runtime_flags", flags).withConvert(jsonConverter(flags))
 }
 
 func DiscoveryAddress(value string) Instance {
 	return newOption("discovery_address", value)
 }
 
-func DNSRefreshRate(value string) Instance {
-	return newOption("dns_refresh_rate", value)
+func XDSRootCert(value string) Instance {
+	return newOption("xds_root_cert", value)
 }
 
 func Localhost(value LocalhostValue) Instance {
 	return newOption("localhost", value)
 }
 
+func AdditionalLocalhost(value LocalhostValue) Instance {
+	return newOption("additional_localhost", value)
+}
+
 func Wildcard(value WildcardValue) Instance {
 	return newOption("wildcard", value)
+}
+
+func AdditionalWildCard(value WildcardValue) Instance {
+	return newOption("additional_wildcard", value)
+}
+
+func DualStack(value bool) Instance {
+	return newOption("dual_stack", value)
 }
 
 func DNSLookupFamily(value DNSLookupFamilyValue) Instance {
 	return newOption("dns_lookup_family", value)
 }
 
-func PodName(value string) Instance {
-	return newOptionOrSkipIfZero("PodName", value)
+func OutlierLogPath(value string) Instance {
+	return newOptionOrSkipIfZero("outlier_log_path", value)
 }
 
-func PodNamespace(value string) Instance {
-	return newOptionOrSkipIfZero("PodNamespace", value)
+func CustomFileSDSPath(value string) Instance {
+	return newOptionOrSkipIfZero("custom_file_path", value)
 }
 
-func PodIP(value net.IP) Instance {
-	return newOption("PodIP", value).withConvert(podIPConverter(value))
-}
-
-func ControlPlaneAuth(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "enable"
-	}
-	return newOptionOrSkipIfZero("ControlPlaneAuth", strVal)
-}
-
-func DisableReportCalls(value bool) Instance {
-	strVal := ""
-	if value {
-		strVal = "true"
-	}
-	return newOptionOrSkipIfZero("DisableReportCalls", strVal)
+func ApplicationLogJSON(value bool) Instance {
+	return newOption("log_json", value)
 }
 
 func LightstepAddress(value string) Instance {
@@ -136,14 +138,6 @@ func LightstepAddress(value string) Instance {
 
 func LightstepToken(value string) Instance {
 	return newOption("lightstepToken", value)
-}
-
-func LightstepSecure(value bool) Instance {
-	return newOption("lightstepSecure", value)
-}
-
-func LightstepCACertPath(value string) Instance {
-	return newOption("lightstepCacertPath", value)
 }
 
 func StackDriverEnabled(value bool) Instance {
@@ -186,30 +180,43 @@ func StatsdAddress(value string) Instance {
 	return newOptionOrSkipIfZero("statsd", value).withConvert(addressConverter(value))
 }
 
+func TracingTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata, isH2 bool) Instance {
+	return newOptionOrSkipIfZero("tracing_tls", value).
+		withConvert(transportSocketConverter(value, "tracer", metadata, isH2))
+}
+
 func EnvoyMetricsServiceAddress(value string) Instance {
 	return newOptionOrSkipIfZero("envoy_metrics_service_address", value).withConvert(addressConverter(value))
 }
 
-func EnvoyMetricsServiceTLS(value *networkingAPI.TLSSettings, metadata *model.NodeMetadata) Instance {
+func EnvoyMetricsServiceTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata) Instance {
 	return newOptionOrSkipIfZero("envoy_metrics_service_tls", value).
-		withConvert(tlsConverter(value, "envoy_metrics_service", metadata))
+		withConvert(transportSocketConverter(value, "envoy_metrics_service", metadata, true))
 }
 
 func EnvoyMetricsServiceTCPKeepalive(value *networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive) Instance {
 	return newTCPKeepaliveOption("envoy_metrics_service_tcp_keepalive", value)
 }
 
+func EnvoyMetricsStatsCompression(value bool) Instance {
+	return newOption("envoy_metrics_stats_compression", value)
+}
+
 func EnvoyAccessLogServiceAddress(value string) Instance {
 	return newOptionOrSkipIfZero("envoy_accesslog_service_address", value).withConvert(addressConverter(value))
 }
 
-func EnvoyAccessLogServiceTLS(value *networkingAPI.TLSSettings, metadata *model.NodeMetadata) Instance {
+func EnvoyAccessLogServiceTLS(value *networkingAPI.ClientTLSSettings, metadata *model.BootstrapNodeMetadata) Instance {
 	return newOptionOrSkipIfZero("envoy_accesslog_service_tls", value).
-		withConvert(tlsConverter(value, "envoy_accesslog_service", metadata))
+		withConvert(transportSocketConverter(value, "envoy_accesslog_service", metadata, true))
 }
 
 func EnvoyAccessLogServiceTCPKeepalive(value *networkingAPI.ConnectionPoolSettings_TCPSettings_TcpKeepalive) Instance {
 	return newTCPKeepaliveOption("envoy_accesslog_service_tcp_keepalive", value)
+}
+
+func EnvoyExtraStatTags(value []string) Instance {
+	return newStringArrayOptionOrSkipIfEmpty("extraStatTags", value)
 }
 
 func EnvoyStatsMatcherInclusionPrefix(value []string) Instance {
@@ -224,10 +231,106 @@ func EnvoyStatsMatcherInclusionRegexp(value []string) Instance {
 	return newStringArrayOptionOrSkipIfEmpty("inclusionRegexps", value)
 }
 
-func SDSUDSPath(value string) Instance {
-	return newOption("sds_uds_path", value)
+func EnvoyStatusPort(value int) Instance {
+	return newOption("envoy_status_port", value)
 }
 
-func SDSTokenPath(value string) Instance {
-	return newOption("sds_token_path", value)
+func GlobalDownstreamMaxConnections(value int) Instance {
+	return newOption("global_downstream_max_connections", value)
+}
+
+func EnvoyStatusPortEnableProxyProtocol(value bool) Instance {
+	return newOption("envoy_status_port_enable_proxy_protocol", value)
+}
+
+func EnableSelfDiscovery(value bool) Instance {
+	return newOption("enable_self_discovery", value)
+}
+
+func EnvoyPrometheusPort(value int) Instance {
+	return newOption("envoy_prometheus_port", value)
+}
+
+// SecureMetricsPort adds an mTLS listener for Envoy-only stats. Zero disables it.
+func SecureMetricsPort(value int) Instance {
+	if value == 0 {
+		return skipOption("secure_metrics_port")
+	}
+	return newOption("secure_metrics_port", value)
+}
+
+// SecureMergedMetricsPort adds an mTLS listener for merged metrics (Envoy + app + agent). Zero disables it.
+func SecureMergedMetricsPort(value int) Instance {
+	if value == 0 {
+		return skipOption("secure_merged_metrics_port")
+	}
+	return newOption("secure_merged_metrics_port", value)
+}
+
+func STSPort(value int) Instance {
+	return newOption("sts_port", value)
+}
+
+func GCPProjectID(value string) Instance {
+	return newOption("gcp_project_id", value)
+}
+
+func GCPProjectNumber(value string) Instance {
+	return newOption("gcp_project_number", value)
+}
+
+func Metadata(meta *model.BootstrapNodeMetadata) Instance {
+	return newOption("metadata", meta)
+}
+
+func STSEnabled(value bool) Instance {
+	return newOption("sts", value)
+}
+
+func DiscoveryHost(value string) Instance {
+	return newOption("discovery_host", value)
+}
+
+func MetadataDiscovery(value bool) Instance {
+	return newOption("metadata_discovery", value)
+}
+
+func MetricsLocalhostAccessOnly(proxyMetadata map[string]string) Instance {
+	value, ok := proxyMetadata["METRICS_LOCALHOST_ACCESS_ONLY"]
+	if ok && value == "true" {
+		return newOption("metrics_localhost_access_only", true)
+	}
+	return newOption("metrics_localhost_access_only", false)
+}
+
+func LoadStatsConfigJSONStr(node *model.Node) Instance {
+	// JSON string for configuring Load Reporting Service.
+	if json, ok := node.RawMetadata["LOAD_STATS_CONFIG_JSON"].(string); ok {
+		return newOption("load_stats_config_json_str", json)
+	}
+	return skipOption("load_stats_config_json_str")
+}
+
+func WorkloadIdentitySocketFile(value string) Instance {
+	return newOption("workload_identity_socket_file", value)
+}
+
+type HistogramMatch struct {
+	Prefix string `json:"prefix"`
+}
+type HistogramBucket struct {
+	Match   HistogramMatch `json:"match"`
+	Buckets []float64      `json:"buckets"`
+}
+
+func EnvoyHistogramBuckets(value []HistogramBucket) Instance {
+	return newOption("histogram_buckets", value)
+}
+
+func EnvoyStatsFlushInterval(interval *durationpb.Duration) Instance {
+	return newEnvoyDurationOption("stats_flush_interval", interval)
+}
+
+func EnvoyStatsEvictionInterval(interval *durationpb.Duration) Instance {
+	return newEnvoyDurationOption("stats_eviction_interval", interval)
 }

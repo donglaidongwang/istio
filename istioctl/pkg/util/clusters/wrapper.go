@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,36 +15,26 @@
 package clusters
 
 import (
-	"bytes"
+	admin "github.com/envoyproxy/go-control-plane/envoy/admin/v3"
 
-	adminapi "github.com/envoyproxy/go-control-plane/envoy/admin/v2alpha"
-	"github.com/golang/protobuf/jsonpb"
+	"istio.io/istio/pkg/util/protomarshal"
 )
 
 // Wrapper is a wrapper around the Envoy Clusters
 // It has extra helper functions for handling any/struct/marshal protobuf pain
 type Wrapper struct {
-	*adminapi.Clusters
+	*admin.Clusters
 }
 
 // MarshalJSON is a custom marshaller to handle protobuf pain
 func (w *Wrapper) MarshalJSON() ([]byte, error) {
-	buffer := &bytes.Buffer{}
-	jsonm := &jsonpb.Marshaler{}
-	err := jsonm.Marshal(buffer, w)
-	if err != nil {
-		return nil, err
-	}
-	return buffer.Bytes(), nil
+	return protomarshal.Marshal(w)
 }
 
 // UnmarshalJSON is a custom unmarshaller to handle protobuf pain
 func (w *Wrapper) UnmarshalJSON(b []byte) error {
-	buf := bytes.NewBuffer(b)
-	jsonum := &jsonpb.Unmarshaler{}
-	cd := &adminapi.Clusters{}
-	err := jsonum.Unmarshal(buf, cd)
+	cd := &admin.Clusters{}
+	err := protomarshal.UnmarshalAllowUnknown(b, cd)
 	*w = Wrapper{cd}
 	return err
-
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,109 +12,163 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package caclient
+package citadel
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/structpb"
 
-	caClientInterface "istio.io/istio/security/pkg/nodeagent/caclient/interface"
-	pb "istio.io/istio/security/proto"
-	"istio.io/pkg/log"
+	pb "istio.io/api/security/v1alpha1"
+	istiogrpc "istio.io/istio/pilot/pkg/grpc"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/security"
+	"istio.io/istio/security/pkg/nodeagent/caclient"
 )
 
 const (
-	caServerName      = "istio-citadel"
 	bearerTokenPrefix = "Bearer "
 )
 
-var (
-	citadelClientLog = log.RegisterScope("citadelClientLog", "citadel client debugging", 0)
-)
+var citadelClientLog = log.RegisterScope("citadelclient", "citadel client debugging")
 
-type citadelClient struct {
-	caEndpoint    string
-	enableTLS     bool
-	caTLSRootCert []byte
-	client        pb.IstioCertificateServiceClient
+type CitadelClient struct {
+	// It means enable tls connection to Citadel if this is not nil.
+	tlsOpts  *TLSOptions
+	client   pb.IstioCertificateServiceClient
+	conn     *grpc.ClientConn
+	provider credentials.PerRPCCredentials
+	opts     *security.Options
+}
+
+type TLSOptions struct {
+	RootCert string
+	Key      string
+	Cert     string
 }
 
 // NewCitadelClient create a CA client for Citadel.
-func NewCitadelClient(endpoint string, tls bool, rootCert []byte) (caClientInterface.Client, error) {
-	c := &citadelClient{
-		caEndpoint:    endpoint,
-		enableTLS:     tls,
-		caTLSRootCert: rootCert,
+func NewCitadelClient(opts *security.Options, tlsOpts *TLSOptions) (*CitadelClient, error) {
+	c := &CitadelClient{
+		tlsOpts:  tlsOpts,
+		opts:     opts,
+		provider: caclient.NewDefaultTokenProvider(opts),
 	}
 
-	var opts grpc.DialOption
-	var err error
-	if tls {
-		opts, err = c.getTLSDialOption()
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		opts = grpc.WithInsecure()
-	}
-
-	// TODO(JimmyCYJ): This connection is create at construction time. If conn is broken at anytime,
-	//  need a way to reconnect.
-	conn, err := grpc.Dial(endpoint, opts)
+	conn, err := c.buildConnection()
 	if err != nil {
-		citadelClientLog.Errorf("Failed to connect to endpoint %s: %v", endpoint, err)
-		return nil, fmt.Errorf("failed to connect to endpoint %s", endpoint)
+		citadelClientLog.Errorf("Failed to connect to endpoint %s: %v", opts.CAEndpoint, err)
+		return nil, fmt.Errorf("failed to connect to endpoint %s", opts.CAEndpoint)
 	}
-
+	c.conn = conn
 	c.client = pb.NewIstioCertificateServiceClient(conn)
 	return c, nil
 }
 
-// CSR Sign calls Citadel to sign a CSR.
-func (c *citadelClient) CSRSign(ctx context.Context, csrPEM []byte, token string,
-	certValidTTLInSec int64) ([]string /*PEM-encoded certificate chain*/, error) {
+func (c *CitadelClient) Close() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+// CSRSign calls Citadel to sign a CSR.
+func (c *CitadelClient) CSRSign(csrPEM []byte, certValidTTLInSec int64) (res []string, err error) {
+	crMetaStruct := &structpb.Struct{
+		Fields: map[string]*structpb.Value{
+			security.CertSigner: {
+				Kind: &structpb.Value_StringValue{StringValue: c.opts.CertSigner},
+			},
+		},
+	}
 	req := &pb.IstioCertificateRequest{
 		Csr:              string(csrPEM),
 		ValidityDuration: certValidTTLInSec,
+		Metadata:         crMetaStruct,
+	}
+	// TODO(hzxuzhonghu): notify caclient rebuilding only when root cert is updated.
+	// It can happen when the istiod dns certs is resigned after root cert is updated,
+	// in this case, the ca grpc client can not automatically connect to istiod after the underlying network connection closed.
+	// Because that the grpc client still use the old tls configuration to reconnect to istiod.
+	// So here we need to rebuild the caClient in order to use the new root cert.
+	defer func() {
+		if err != nil {
+			citadelClientLog.Errorf("failed to sign CSR: %v", err)
+			if err := c.reconnect(); err != nil {
+				citadelClientLog.Errorf("failed reconnect: %v", err)
+			}
+		}
+	}()
+
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("ClusterID", c.opts.ClusterID))
+	for k, v := range c.opts.CAHeaders {
+		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
 	}
 
-	// add Bearer prefix, which is required by Citadel.
-	token = bearerTokenPrefix + token
-	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", token))
 	resp, err := c.client.CreateCertificate(ctx, req)
 	if err != nil {
-		citadelClientLog.Errorf("Failed to create certificate: %v", err)
-		return nil, err
+		return nil, fmt.Errorf("create certificate: %v", err)
 	}
 
 	if len(resp.CertChain) <= 1 {
-		citadelClientLog.Errorf("CertChain length is %d, expected more than 1", len(resp.CertChain))
-		return nil, errors.New("invalid response cert chain")
+		return nil, errors.New("invalid empty CertChain")
 	}
 
 	return resp.CertChain, nil
 }
 
-func (c *citadelClient) getTLSDialOption() (grpc.DialOption, error) {
-	// Load the TLS root certificate from the specified file.
-	// Create a certificate pool
-	certPool := x509.NewCertPool()
-	ok := certPool.AppendCertsFromPEM(c.caTLSRootCert)
-	if !ok {
-		return nil, fmt.Errorf("failed to append certificates")
+func (c *CitadelClient) getTLSOptions() *istiogrpc.TLSOptions {
+	if c.tlsOpts != nil {
+		return &istiogrpc.TLSOptions{
+			RootCert:      c.tlsOpts.RootCert,
+			Key:           c.tlsOpts.Key,
+			Cert:          c.tlsOpts.Cert,
+			ServerAddress: c.opts.CAEndpoint,
+			SAN:           c.opts.CAEndpointSAN,
+		}
+	}
+	return nil
+}
+
+func (c *CitadelClient) buildConnection() (*grpc.ClientConn, error) {
+	tlsOpts := c.getTLSOptions()
+	opts, err := istiogrpc.ClientOptions(nil, tlsOpts)
+	if err != nil {
+		return nil, err
+	}
+	opts = append(opts,
+		grpc.WithPerRPCCredentials(c.provider),
+		security.CARetryInterceptor(),
+	)
+	conn, err := grpc.Dial(c.opts.CAEndpoint, opts...)
+	if err != nil {
+		citadelClientLog.Errorf("Failed to connect to endpoint %s: %v", c.opts.CAEndpoint, err)
+		return nil, fmt.Errorf("failed to connect to endpoint %s", c.opts.CAEndpoint)
 	}
 
-	config := tls.Config{}
-	config.RootCAs = certPool
-	config.ServerName = caServerName
+	return conn, nil
+}
 
-	transportCreds := credentials.NewTLS(&config)
-	return grpc.WithTransportCredentials(transportCreds), nil
+func (c *CitadelClient) reconnect() error {
+	if err := c.conn.Close(); err != nil {
+		return fmt.Errorf("failed to close connection: %v", err)
+	}
+
+	conn, err := c.buildConnection()
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	c.client = pb.NewIstioCertificateServiceClient(conn)
+	citadelClientLog.Info("recreated connection")
+	return nil
+}
+
+// GetRootCertBundle: Citadel (Istiod) CA doesn't publish any endpoint to retrieve CA certs
+func (c *CitadelClient) GetRootCertBundle() ([]string, error) {
+	return []string{}, nil
 }

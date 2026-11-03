@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,18 +24,19 @@ type Name string
 // Matches returns true if this hostname overlaps with the other hostname. Names overlap if:
 // - they're fully resolved (i.e. not wildcarded) and match exactly (i.e. an exact string match)
 // - one or both are wildcarded (e.g. "*.foo.com"), in which case we use wildcard resolution rules
-// to determine if h is covered by o or o is covered by h.
+// to determine if n is covered by o or o is covered by n.
 // e.g.:
-//  Name("foo.com").Matches("foo.com")   = true
-//  Name("foo.com").Matches("bar.com")   = false
-//  Name("*.com").Matches("foo.com")     = true
-//  Name("bar.com").Matches("*.com")     = true
-//  Name("*.foo.com").Matches("foo.com") = false
-//  Name("*").Matches("foo.com")         = true
-//  Name("*").Matches("*.com")           = true
+//
+//	Name("foo.com").Matches("foo.com")   = true
+//	Name("foo.com").Matches("bar.com")   = false
+//	Name("*.com").Matches("foo.com")     = true
+//	Name("bar.com").Matches("*.com")     = true
+//	Name("*.foo.com").Matches("foo.com") = false
+//	Name("*").Matches("foo.com")         = true
+//	Name("*").Matches("*.com")           = true
 func (n Name) Matches(o Name) bool {
-	hWildcard := n.isWildCarded()
-	oWildcard := o.isWildCarded()
+	hWildcard := n.IsWildCarded()
+	oWildcard := o.IsWildCarded()
 
 	if hWildcard {
 		if oWildcard {
@@ -59,10 +60,10 @@ func (n Name) Matches(o Name) bool {
 }
 
 // SubsetOf returns true if this hostname is a valid subset of the other hostname. The semantics are
-// the same as "Matches", but only in one direction (i.e., h is covered by o).
+// the same as "Matches", but only in one direction (i.e., n is covered by o).
 func (n Name) SubsetOf(o Name) bool {
-	hWildcard := n.isWildCarded()
-	oWildcard := o.isWildCarded()
+	hWildcard := n.IsWildCarded()
+	oWildcard := o.IsWildCarded()
 
 	if hWildcard {
 		if oWildcard {
@@ -85,6 +86,10 @@ func (n Name) SubsetOf(o Name) bool {
 	return n == o
 }
 
-func (n Name) isWildCarded() bool {
-	return len(n) > 0 && string(n[0]) == "*"
+func (n Name) IsWildCarded() bool {
+	return len(n) > 0 && n[0] == '*'
+}
+
+func (n Name) String() string {
+	return string(n)
 }

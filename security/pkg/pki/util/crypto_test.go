@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,15 @@
 package util
 
 import (
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -146,6 +151,11 @@ BB6nORpwdv4LVt/BFgLwWQIdAKvHn7cxBJ+aAC25rIumRNKDzP7PkV0HDbxtX+M=
 -----END CERTIFICATE-----`
 )
 
+var (
+	certChainValid             = loadPEMFile("../testdata/cert-chain.pem")
+	certChainValidTrailingLine = loadPEMFile("../testdata/cert-chain-trailing-line.pem")
+)
+
 func TestParsePemEncodedCertificate(t *testing.T) {
 	testCases := map[string]struct {
 		errMsg        string
@@ -180,6 +190,43 @@ func TestParsePemEncodedCertificate(t *testing.T) {
 			}
 		} else if cert.PublicKeyAlgorithm != c.publicKeyAlgo {
 			t.Errorf("%s: Unexpected public key algorithm: want %d but got %d", id, c.publicKeyAlgo, cert.PublicKeyAlgorithm)
+		}
+	}
+}
+
+func TestParsePemEncodedCertificateChain(t *testing.T) {
+	testCases := map[string]struct {
+		errMsg string
+		pem    string
+	}{
+		"Parse Certificate Chain": {
+			pem: certChainValid,
+		},
+		"Parse Certificate Chain With Trailing Line": {
+			pem: certChainValidTrailingLine,
+		},
+		"Invalid PEM string": {
+			pem:    "Invalid PEM string",
+			errMsg: "invalid PEM encoded certificate",
+		},
+		"Invalid certificate string": {
+			pem:    keyRSA,
+			errMsg: "failed to parse X.509 certificate : x509: malformed tbs certificate",
+		},
+	}
+
+	for id, c := range testCases {
+		_, rootCertByte, err := ParsePemEncodedCertificateChain([]byte(c.pem))
+		if c.errMsg != "" {
+			if err == nil {
+				t.Errorf("%s: no error is returned", id)
+			} else if c.errMsg != err.Error() {
+				t.Errorf(`%s: Unexpected error message: expected "%s" but got "%s"`, id, c.errMsg, err.Error())
+			}
+		} else if err != nil {
+			t.Errorf(`%s: Unexpected error message: expected no error but got "%s"`, id, err.Error())
+		} else if len(rootCertByte) == 0 {
+			t.Errorf("%s: rootCertByte is nil", id)
 		}
 	}
 }
@@ -263,7 +310,7 @@ func TestParsePemEncodedKey(t *testing.T) {
 		if c.errMsg != "" {
 			if err == nil {
 				t.Errorf(`%s: no error is returned, expected "%s"`, id, c.errMsg)
-			} else if c.errMsg != err.Error() {
+			} else if !strings.HasPrefix(err.Error(), c.errMsg) {
 				t.Errorf(`%s: Unexpected error message: expected "%s" but got "%s"`, id, c.errMsg, err.Error())
 			}
 		} else if err != nil {
@@ -273,6 +320,7 @@ func TestParsePemEncodedKey(t *testing.T) {
 		}
 	}
 }
+
 func TestGetRSAKeySize(t *testing.T) {
 	testCases := map[string]struct {
 		pem    string
@@ -310,5 +358,82 @@ func TestGetRSAKeySize(t *testing.T) {
 		} else if size != c.size {
 			t.Errorf(`%s: Unmatched key size: expected %v but got "%v"`, id, c.size, size)
 		}
+	}
+}
+
+func TestIsSupportedECPrivateKey(t *testing.T) {
+	_, ed25519PrivKey, _ := ed25519.GenerateKey(nil)
+	ecdsaPrivKeyP224, _ := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
+	ecdsaPrivKeyP256, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	ecdsaPrivKeyP384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	ecdsaPrivKeyP521, _ := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+
+	cases := map[string]struct {
+		key           crypto.PrivateKey
+		isErr         bool
+		expectedCurve elliptic.Curve
+	}{
+		"ECDSA-P224": {
+			key:           ecdsaPrivKeyP224,
+			isErr:         false,
+			expectedCurve: elliptic.P256(),
+		},
+		"ECDSA-P256": {
+			key:           ecdsaPrivKeyP256,
+			isErr:         false,
+			expectedCurve: elliptic.P256(),
+		},
+		"ECDSA-P384": {
+			key:           ecdsaPrivKeyP384,
+			isErr:         false,
+			expectedCurve: elliptic.P384(),
+		},
+		"ECDSA-P512": {
+			key:           ecdsaPrivKeyP521,
+			isErr:         false,
+			expectedCurve: elliptic.P256(),
+		},
+		"ED25519": {
+			key:           ed25519PrivKey,
+			isErr:         true,
+			expectedCurve: nil,
+		},
+	}
+
+	for id, tc := range cases {
+		curve, err := GetEllipticCurve(&tc.key)
+		if tc.expectedCurve != curve {
+			t.Errorf("expected (%v) but received (%v)", tc.expectedCurve, curve)
+		}
+		if err != nil {
+			if !tc.isErr {
+				t.Errorf("%s: should be supported, but is failing", id)
+			}
+		}
+	}
+}
+
+func TestPemCertBytestoString(t *testing.T) {
+	// empty check
+	if len(PemCertBytestoString([]byte{})) != 0 {
+		t.Errorf("Empty call fails!")
+	}
+
+	certBytes := []byte(certECDSA)
+	certBytes = AppendCertByte(certBytes, []byte(certRSA))
+	result := PemCertBytestoString(certBytes)
+	cert1 := strings.TrimSuffix(strings.TrimPrefix(certECDSA, "\n"), "\n")
+	cert2 := strings.TrimSuffix(strings.TrimPrefix(certRSA, "\n"), "\n")
+	if !reflect.DeepEqual(result, []string{cert1, cert2}) {
+		t.Errorf("Basic comparison fails!")
+	}
+
+	// check only first string passed if second is bogus
+	certBytes = []byte(certRSA)
+	certBytes = AppendCertByte(certBytes, []byte("Bogus"))
+	result = PemCertBytestoString(certBytes)
+	cert1 = strings.TrimSuffix(strings.TrimPrefix(certRSA, "\n"), "\n")
+	if !reflect.DeepEqual(result, []string{cert1}) {
+		t.Errorf("Bogus comparison fails!")
 	}
 }

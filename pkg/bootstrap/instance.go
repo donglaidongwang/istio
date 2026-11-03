@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,35 +15,37 @@
 package bootstrap
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
+	"strings"
 	"text/template"
 
-	meshAPI "istio.io/api/mesh/v1alpha1"
-	"istio.io/pkg/env"
+	"github.com/Masterminds/sprig/v3"
+
+	"istio.io/istio/pkg/env"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/model"
 )
 
 const (
-	// EpochFileTemplate is a template for the root config JSON
-	EpochFileTemplate = "envoy-rev%d.json"
-	DefaultCfgDir     = "/var/lib/istio/envoy/envoy_bootstrap_tmpl.json"
+	// EnvoyFileTemplate is a template for the root config JSON
+	EnvoyFileTemplate = "envoy-rev.%s"
+	DefaultCfgDir     = "./var/lib/istio/envoy/envoy_bootstrap_tmpl.json"
 )
 
-var (
-	// TODO(nmittler): Move this to application code. This shouldn't be declared in a library.
-	overrideVar = env.RegisterStringVar("ISTIO_BOOTSTRAP", "", "")
-)
+// TODO(nmittler): Move this to application code. This shouldn't be declared in a library.
+var overrideVar = env.Register("ISTIO_BOOTSTRAP", "", "")
 
 // Instance of a configured Envoy bootstrap writer.
 type Instance interface {
 	// WriteTo writes the content of the Envoy bootstrap to the given writer.
-	WriteTo(w io.Writer) error
+	WriteTo(templateFile string, w io.Writer) error
 
-	// CreateFileForEpoch generates an Envoy bootstrap file for a particular epoch.
-	CreateFileForEpoch(epoch int) (string, error)
+	// CreateFile generates an Envoy bootstrap file.
+	CreateFile() (string, error)
 }
 
 // New creates a new Instance of an Envoy bootstrap writer.
@@ -57,9 +59,9 @@ type instance struct {
 	Config
 }
 
-func (i *instance) WriteTo(w io.Writer) error {
+func (i *instance) WriteTo(templateFile string, w io.Writer) error {
 	// Get the input bootstrap template.
-	t, err := newTemplate(i.Proxy)
+	t, err := newTemplate(templateFile)
 	if err != nil {
 		return err
 	}
@@ -74,12 +76,47 @@ func (i *instance) WriteTo(w io.Writer) error {
 	return t.Execute(w, templateParams)
 }
 
-func (i *instance) CreateFileForEpoch(epoch int) (string, error) {
+func toJSON(i any) string {
+	if i == nil {
+		return "{}"
+	}
+
+	ba, err := json.Marshal(i)
+	if err != nil {
+		log.Warnf("Unable to marshal %v: %v", i, err)
+		return "{}"
+	}
+
+	return string(ba)
+}
+
+// GetEffectiveTemplatePath gets the template file that should be used for bootstrap
+func GetEffectiveTemplatePath(pc *model.NodeMetaProxyConfig) string {
+	var templateFilePath string
+	switch {
+	case pc.CustomConfigFile != "":
+		templateFilePath = pc.CustomConfigFile
+	case pc.ProxyBootstrapTemplatePath != "":
+		templateFilePath = pc.ProxyBootstrapTemplatePath
+	default:
+		templateFilePath = DefaultCfgDir
+	}
+	override := overrideVar.Get()
+	if len(override) > 0 {
+		templateFilePath = override
+	}
+	return templateFilePath
+}
+
+func (i *instance) CreateFile() (string, error) {
 	// Create the output file.
-	if err := os.MkdirAll(i.Proxy.ConfigPath, 0700); err != nil {
+	if err := os.MkdirAll(i.Metadata.ProxyConfig.ConfigPath, 0o700); err != nil {
 		return "", err
 	}
-	outputFilePath := configFile(i.Proxy.ConfigPath, epoch)
+
+	templateFile := GetEffectiveTemplatePath(i.Metadata.ProxyConfig)
+
+	outputFilePath := configFile(i.Metadata.ProxyConfig.ConfigPath, templateFile)
 	outputFile, err := os.Create(outputFilePath)
 	if err != nil {
 		return "", err
@@ -87,37 +124,30 @@ func (i *instance) CreateFileForEpoch(epoch int) (string, error) {
 	defer func() { _ = outputFile.Close() }()
 
 	// Write the content of the file.
-	if err := i.WriteTo(outputFile); err != nil {
+	if err := i.WriteTo(templateFile, outputFile); err != nil {
 		return "", err
 	}
 
 	return outputFilePath, err
 }
 
-func configFile(config string, epoch int) string {
-	return path.Join(config, fmt.Sprintf(EpochFileTemplate, epoch))
+func configFile(config string, templateFile string) string {
+	suffix := "json"
+	// Envoy will interpret the file extension to determine the type. We should detect yaml inputs
+	if strings.HasSuffix(templateFile, ".yaml.tmpl") || strings.HasSuffix(templateFile, ".yaml") {
+		suffix = "yaml"
+	}
+	return path.Join(config, fmt.Sprintf(EnvoyFileTemplate, suffix))
 }
 
-func newTemplate(config *meshAPI.ProxyConfig) (*template.Template, error) {
-	var templateFilePath string
-	switch {
-	case config.CustomConfigFile != "":
-		templateFilePath = config.CustomConfigFile
-	case config.ProxyBootstrapTemplatePath != "":
-		templateFilePath = config.ProxyBootstrapTemplatePath
-	default:
-		templateFilePath = DefaultCfgDir
-	}
-
-	override := overrideVar.Get()
-	if len(override) > 0 {
-		templateFilePath = override
-	}
-
-	cfgTmpl, err := ioutil.ReadFile(templateFilePath)
+func newTemplate(templateFilePath string) (*template.Template, error) {
+	cfgTmpl, err := os.ReadFile(templateFilePath)
 	if err != nil {
 		return nil, err
 	}
 
-	return template.New("bootstrap").Parse(string(cfgTmpl))
+	funcMap := template.FuncMap{
+		"toJSON": toJSON,
+	}
+	return template.New("bootstrap").Funcs(funcMap).Funcs(sprig.GenericFuncMap()).Parse(string(cfgTmpl))
 }

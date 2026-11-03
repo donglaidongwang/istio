@@ -1,4 +1,4 @@
-apiVersion: networking.istio.io/v1alpha3
+apiVersion: networking.istio.io/v1
 kind: VirtualService
 metadata:
   name: {{.Name}}
@@ -17,6 +17,3 @@ spec:
         - destination:
             host: {{.Host2}}
           weight: {{.Weight2}}
-        - destination:
-            host: {{.Host3}}
-          weight: {{.Weight3}}

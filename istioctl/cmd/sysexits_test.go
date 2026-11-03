@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,14 +17,23 @@ package cmd
 import (
 	"errors"
 	"testing"
+
+	"istio.io/istio/istioctl/pkg/analyze"
+	"istio.io/istio/istioctl/pkg/util"
 )
 
-var KnownSubstrings = []string{"unknown command"}
+var KnownErrorCode = map[error]int{
+	errors.New("unknown command"):                                  ExitIncorrectUsage,
+	errors.New("unexpected error"):                                 ExitUnknownError,
+	util.CommandParseError{Err: errors.New("command parse error")}: ExitIncorrectUsage,
+	analyze.FileParseError{}:                                       ExitDataError,
+	analyze.AnalyzerFoundIssuesError{}:                             ExitAnalyzerFoundIssues,
+}
 
 func TestKnownExitStrings(t *testing.T) {
-	for _, s := range KnownSubstrings {
-		if GetExitCode(errors.New(s)) == ExitUnknownError {
-			t.Errorf("Expected %q to have a known exit code.", s)
+	for err, wantCode := range KnownErrorCode {
+		if code := GetExitCode(err); code != wantCode {
+			t.Errorf("For %v want %v, but is %v", err, wantCode, code)
 		}
 	}
 }

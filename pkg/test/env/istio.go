@@ -1,4 +1,4 @@
-//  Copyright 2018 Istio Authors
+//  Copyright Istio Authors
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -15,112 +15,98 @@
 package env
 
 import (
+	"encoding/json"
 	"fmt"
-	"go/build"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime"
 	"strings"
 
-	"runtime"
-
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
 )
 
 var (
-	// GOPATH environment variable
-	// nolint: golint, stylecheck
-	GOPATH Variable = "GOPATH"
+	// TARGET_OUT environment variable
+	// nolint: revive, stylecheck
+	TARGET_OUT Variable = "TARGET_OUT"
 
-	// TOP environment variable
-	// nolint: golint, stylecheck
-	TOP Variable = "TOP"
+	// LOCAL_OUT environment variable
+	// nolint: revive, stylecheck
+	LOCAL_OUT Variable = "LOCAL_OUT"
 
-	// ISTIO_GO environment variable
-	// nolint: golint, stylecheck
-	ISTIO_GO Variable = "ISTIO_GO"
-
-	// ISTIO_BIN environment variable
-	// nolint: golint, stylecheck
-	ISTIO_BIN Variable = "ISTIO_BIN"
-
-	// ISTIO_OUT environment variable
-	// nolint: golint, stylecheck
-	ISTIO_OUT Variable = "ISTIO_OUT"
+	// REPO_ROOT environment variable
+	// nolint: revive, stylecheck
+	REPO_ROOT Variable = "REPO_ROOT"
 
 	// HUB is the Docker hub to be used for images.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	HUB Variable = "HUB"
 
 	// TAG is the Docker tag to be used for images.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	TAG Variable = "TAG"
 
+	// VARIANT is the Docker variant to be used for images.
+	// nolint: revive, stylecheck
+	VARIANT Variable = "VARIANT"
+
 	// PULL_POLICY is the image pull policy to use when rendering templates.
-	// nolint: golint, stylecheck
+	// nolint: revive, stylecheck
 	PULL_POLICY Variable = "PULL_POLICY"
 
-	// ISTIO_TEST_KUBE_CONFIG is the Kubernetes configuration file to use for testing. If a configuration file
-	// is specified on the command-line, that takes precedence.
-	// nolint: golint, stylecheck
-	ISTIO_TEST_KUBE_CONFIG Variable = "ISTIO_TEST_KUBE_CONFIG"
+	// ECHO_IMAGE is the image to use when deploying echo services.
+	// nolint: golint, revive, stylecheck
+	ECHO_IMAGE Variable = "ECHO_IMAGE"
 
-	// IstioTop has the top of the istio tree, matches the env variable from make.
-	IstioTop = TOP.ValueOrDefaultFunc(getDefaultIstioTop)
+	// GRPC_ECHO_IMAGE is the image to use for a separate gRPC-only container in echo Pods.
+	// nolint: golint, revive, stylecheck
+	GRPC_ECHO_IMAGE Variable = "GRPC_ECHO_IMAGE"
 
-	// IstioSrc is the location if istio source ($TOP/src/istio.io/istio
-	IstioSrc = path.Join(IstioTop, "src/istio.io/istio")
+	// KUBECONFIG is the list of Kubernetes configuration files. If configuration files are specified on
+	// the command-line, that takes precedence.
+	// nolint: revive, stylecheck
+	KUBECONFIG Variable = "KUBECONFIG"
 
-	// IstioBin is the location of the binary output directory
-	IstioBin = verifyFile(ISTIO_BIN, ISTIO_BIN.ValueOrDefaultFunc(getDefaultIstioBin))
+	// IstioSrc is the location of istio source ($TOP/src/istio.io/istio
+	IstioSrc = REPO_ROOT.ValueOrDefaultFunc(getDefaultIstioSrc)
 
 	// IstioOut is the location of the output directory ($TOP/out)
-	IstioOut = verifyFile(ISTIO_OUT, ISTIO_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
+	IstioOut = verifyFile(TARGET_OUT, TARGET_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
 
-	// TODO: Some of these values are overlapping. We should re-align them.
+	// LocalOut is the location of the output directory for the OS we are running in,
+	// not necessarily the OS we are building for
+	LocalOut = verifyFile(LOCAL_OUT, LOCAL_OUT.ValueOrDefaultFunc(getDefaultIstioOut))
 
-	// IstioRoot is the root of the Istio source repository.
-	IstioRoot = path.Join(GOPATH.ValueOrDefault(build.Default.GOPATH), "/src/istio.io/istio")
+	// OtelCollectorInstallFilePath is the OpenTelemetry installation file.
+	OtelCollectorInstallFilePath = path.Join(IstioSrc, getSampleFile("open-telemetry/otel.yaml"))
 
-	// ChartsDir is the Kubernetes Helm chart directory in the repository
-	ChartsDir = path.Join(IstioRoot, "install/kubernetes/helm")
-
-	// IstioChartDir is the Kubernetes Helm chart directory in the repository
-	IstioChartDir = path.Join(ChartsDir, "istio")
-
-	CrdsFilesDir = path.Join(ChartsDir, "istio-init/files")
-
-	// BookInfoRoot is the root folder for the bookinfo samples
-	BookInfoRoot = path.Join(IstioRoot, "samples/bookinfo")
-
-	// BookInfoKube is the book info folder that contains Yaml deployment files.
-	BookInfoKube = path.Join(BookInfoRoot, "platform/kube")
-
-	// ServiceAccountFilePath is the helm service account file.
-	ServiceAccountFilePath = path.Join(ChartsDir, "helm-service-account.yaml")
-
-	// RedisInstallFilePath is the redis installation file.
-	RedisInstallFilePath = path.Join(IstioRoot, "pkg/test/framework/components/redis/redis.yaml")
+	// RegistryRedirectorServerInstallFilePath is the registry redirector installation file.
+	RegistryRedirectorServerInstallFilePath = path.Join(IstioSrc, getInstallationFile("registryredirector/registry_redirector_server.yaml"))
 )
 
-func getDefaultIstioTop() string {
-	// Assume it is run inside istio.io/istio
-	current, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-	idx := strings.Index(current, "/src/istio.io/istio")
-	if idx > 0 {
-		return current[0:idx]
-	}
-	return current // launching from GOTOP (for example in goland)
+var (
+	_, b, _, _ = runtime.Caller(0)
+
+	// Root folder of this project
+	// This relies on the fact this file is 3 levels up from the root; if this changes, adjust the path below
+	Root = filepath.Join(filepath.Dir(b), "../../..")
+)
+
+func getDefaultIstioSrc() string {
+	return Root
 }
 
-func getDefaultIstioBin() string {
-	return fmt.Sprintf("%s/bin", build.Default.GOPATH)
+func getSampleFile(p string) string {
+	return fmt.Sprintf("samples/%s", p)
+}
+
+func getInstallationFile(p string) string {
+	return fmt.Sprintf("pkg/test/framework/components/%s", p)
 }
 
 func getDefaultIstioOut() string {
-	return fmt.Sprintf("%s/out/%s_%s", build.Default.GOPATH, runtime.GOOS, runtime.GOARCH)
+	return fmt.Sprintf("%s/out/%s_%s", IstioSrc, runtime.GOOS, runtime.GOARCH)
 }
 
 func verifyFile(v Variable, f string) string {
@@ -140,4 +126,37 @@ func CheckFileExists(path string) error {
 		return err
 	}
 	return nil
+}
+
+func ReadDepsSHA(name string) (string, error) {
+	type DepsFile struct {
+		Name          string `json:"name"`
+		LastStableSHA string `json:"lastStableSHA"`
+	}
+	f := filepath.Join(IstioSrc, "istio.deps")
+	depJSON, err := os.ReadFile(f)
+	if err != nil {
+		return "", err
+	}
+	var deps []DepsFile
+	if err := json.Unmarshal(depJSON, &deps); err != nil {
+		return "", err
+	}
+	for _, d := range deps {
+		if d.Name == name {
+			return d.LastStableSHA, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found", name)
+}
+
+// ReadVersion returns the contents of the $ROOTDIR/VERSION file
+func ReadVersion() (string, error) {
+	f := filepath.Join(IstioSrc, "VERSION")
+	v, err := os.ReadFile(f)
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSuffix(string(v), "\n"), nil
 }

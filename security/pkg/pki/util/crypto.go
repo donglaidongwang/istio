@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,21 @@
 package util
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"reflect"
+	"strings"
 )
 
 const (
 	blockTypeECPrivateKey    = "EC PRIVATE KEY"
-	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#5 private key
+	blockTypeRSAPrivateKey   = "RSA PRIVATE KEY" // PKCS#1 private key
 	blockTypePKCS8PrivateKey = "PRIVATE KEY"     // PKCS#8 plain private key
 )
 
@@ -43,6 +47,68 @@ func ParsePemEncodedCertificate(certBytes []byte) (*x509.Certificate, error) {
 	}
 
 	return cert, nil
+}
+
+// ParsePemEncodedCertificateChain constructs a slice of `x509.Certificate` and `rootCertBytes`
+// objects using the given a PEM-encoded certificate chain.
+func ParsePemEncodedCertificateChain(certBytes []byte) ([]*x509.Certificate, []byte, error) {
+	var (
+		certs         []*x509.Certificate
+		cb            *pem.Block
+		rootCertBytes []byte
+	)
+	certBytes = bytes.TrimSpace(certBytes)
+	for {
+		rootCertBytes = certBytes
+		cb, certBytes = pem.Decode(certBytes)
+		if cb == nil {
+			return nil, nil, fmt.Errorf("invalid PEM encoded certificate")
+		}
+		cert, err := x509.ParseCertificate(cb.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse X.509 certificate : %v", err)
+		}
+		certs = append(certs, cert)
+		if len(certBytes) == 0 {
+			break
+		}
+	}
+	if len(certs) == 0 {
+		return nil, nil, fmt.Errorf("no PEM encoded X.509 certificates parsed")
+	}
+	return certs, rootCertBytes, nil
+}
+
+// ParseRootCerts We want to filter out certs that are invalid for whatever reason (e.g. negative serial number).
+// First return is the bytes of valid certs,
+// and the second return is a slice of errors from parsing the certs.
+func ParseRootCerts(certBytes []byte) ([]byte, []error) {
+	var (
+		cb                 *pem.Block
+		validRootCertBytes []byte
+		errs               []error
+	)
+	certBytes = bytes.TrimSpace(certBytes)
+	validRootCertBytes = make([]byte, 0, len(certBytes))
+
+	for {
+		if len(certBytes) == 0 {
+			break
+		}
+		cb, certBytes = pem.Decode(certBytes)
+		if cb == nil {
+			// give up if we have an encoding error
+			errs = append(errs, fmt.Errorf("invalid PEM encoded certificate"))
+			return validRootCertBytes, errs
+		}
+		_, err := x509.ParseCertificate(cb.Bytes)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		validRootCertBytes = append(validRootCertBytes, pem.EncodeToMemory(cb)...)
+	}
+	return validRootCertBytes, errs
 }
 
 // ParsePemEncodedCSR constructs a `x509.CertificateRequest` object using the
@@ -70,19 +136,19 @@ func ParsePemEncodedKey(keyBytes []byte) (crypto.PrivateKey, error) {
 	case blockTypeECPrivateKey:
 		key, err := x509.ParseECPrivateKey(kb.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse the ECDSA private key")
+			return nil, fmt.Errorf("failed to parse the ECDSA private key: %v", err)
 		}
 		return key, nil
 	case blockTypeRSAPrivateKey:
 		key, err := x509.ParsePKCS1PrivateKey(kb.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse the RSA private key")
+			return nil, fmt.Errorf("failed to parse the RSA private key: %v", err)
 		}
 		return key, nil
 	case blockTypePKCS8PrivateKey:
 		key, err := x509.ParsePKCS8PrivateKey(kb.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse the PKCS8 private key")
+			return nil, fmt.Errorf("failed to parse the PKCS8 private key: %v", err)
 		}
 		return key, nil
 	default:
@@ -97,4 +163,40 @@ func GetRSAKeySize(privKey crypto.PrivateKey) (int, error) {
 	}
 	pkey := privKey.(*rsa.PrivateKey)
 	return pkey.N.BitLen(), nil
+}
+
+// GetEllipticCurve returns the type of curve associated with the private key;
+// if ECDSA is used, then only 384 and 256 (default) are returned; if non-ECDSA
+// is used then an error is returned
+func GetEllipticCurve(privKey *crypto.PrivateKey) (elliptic.Curve, error) {
+	switch key := (*privKey).(type) {
+	// this should agree with var SupportedECSignatureAlgorithms
+	case *ecdsa.PrivateKey:
+		if key.Curve == elliptic.P384() {
+			return key.Curve, nil
+		}
+		return elliptic.P256(), nil
+	default:
+		return nil, fmt.Errorf("private key is not ECDSA based")
+	}
+}
+
+// PemCertBytestoString: takes an array of PEM certs in bytes and returns a string array in the same order with
+// trailing newline characters removed
+func PemCertBytestoString(caCerts []byte) []string {
+	certs := []string{}
+	var cert string
+	pemBlock := caCerts
+	for block, rest := pem.Decode(pemBlock); block != nil && len(block.Bytes) != 0; block, rest = pem.Decode(pemBlock) {
+		if len(rest) == 0 {
+			cert = strings.TrimPrefix(strings.TrimSuffix(string(pemBlock), "\n"), "\n")
+			certs = append(certs, cert)
+			break
+		}
+		cert = string(pemBlock[0 : len(pemBlock)-len(rest)])
+		cert = strings.TrimPrefix(strings.TrimSuffix(cert, "\n"), "\n")
+		certs = append(certs, cert)
+		pemBlock = rest
+	}
+	return certs
 }

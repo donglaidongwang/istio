@@ -1,4 +1,6 @@
-// Copyright 2019 Istio Authors
+//go:build integ
+
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,17 +20,18 @@ import (
 	"testing"
 
 	"istio.io/istio/pkg/test/framework"
-	"istio.io/istio/pkg/test/framework/components/environment"
-	"istio.io/istio/pkg/test/framework/components/galley"
+	"istio.io/istio/pkg/test/framework/components/echo/common/deployment"
 	"istio.io/istio/pkg/test/framework/components/istio"
-	"istio.io/istio/pkg/test/framework/components/pilot"
 	"istio.io/istio/pkg/test/framework/resource"
 )
 
 var (
 	i istio.Instance
-	g galley.Instance
-	p pilot.Instance
+
+	// Below are various preconfigured echo deployments. Whenever possible, tests should utilize these
+	// to avoid excessive creation/tear down of deployments. In general, a test should only deploy echo if
+	// its doing something unique to that specific test.
+	apps = deployment.SingleNamespaceView{}
 )
 
 // TestMain defines the entrypoint for pilot tests using a standard Istio installation.
@@ -36,17 +39,13 @@ var (
 // here to reuse a single install across tests.
 func TestMain(m *testing.M) {
 	framework.
-		NewSuite("pilot_test", m).
-		SetupOnEnv(environment.Kube, istio.Setup(&i, nil)).
-		Setup(func(ctx resource.Context) (err error) {
-			if g, err = galley.New(ctx, galley.Config{}); err != nil {
-				return err
-			}
-			if p, err = pilot.New(ctx, pilot.Config{
-				Galley: g,
-			}); err != nil {
-				return err
-			}
+		NewSuite(m).
+		Setup(istio.Setup(&i, nil)).
+		Setup(deployment.SetupSingleNamespace(&apps, deployment.Config{})).
+		Setup(func(t resource.Context) error {
+			gatewayConformanceInputs.Client = t.Clusters().Default()
+			gatewayConformanceInputs.Cleanup = !t.Settings().NoCleanup
+
 			return nil
 		}).
 		Run()

@@ -1,4 +1,4 @@
-// Copyright 2017 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,10 @@ import "strings"
 // Instance defines network protocols for ports
 type Instance string
 
+func (i Instance) String() string {
+	return string(i)
+}
+
 const (
 	// GRPC declares that the port carries gRPC traffic.
 	GRPC Instance = "GRPC"
@@ -27,11 +31,15 @@ const (
 	// HTTP declares that the port carries HTTP/1.1 traffic.
 	// Note that HTTP/1.0 or earlier may not be supported by the proxy.
 	HTTP Instance = "HTTP"
+	// HTTP_PROXY declares that the port is a generic outbound proxy port.
+	// Note that this is currently applicable only for defining sidecar egress listeners.
+	// nolint
+	HTTP_PROXY Instance = "HTTP_PROXY"
 	// HTTP2 declares that the port carries HTTP/2 traffic.
 	HTTP2 Instance = "HTTP2"
 	// HTTPS declares that the port carries HTTPS traffic.
 	HTTPS Instance = "HTTPS"
-	// TCP declares the the port uses TCP.
+	// TCP declares the port uses TCP.
 	// This is the default protocol for a service port.
 	TCP Instance = "TCP"
 	// TLS declares that the port carries TLS traffic.
@@ -46,6 +54,12 @@ const (
 	Redis Instance = "Redis"
 	// MySQL declares that the port carries MySQL traffic.
 	MySQL Instance = "MySQL"
+	// HBONE declares that the port carries HBONE traffic.
+	// This cannot be declared by Services, but is used for some internal code that uses Protocol
+	HBONE Instance = "HBONE"
+	// DoubleHBONE declares that the port carries Double HBONE traffic.
+	// This is only used to send or simulate multi-network traffic
+	DoubleHBONE Instance = "DoubleHBONE"
 	// Unsupported - value to signify that the protocol is unsupported.
 	Unsupported Instance = "UnsupportedProtocol"
 )
@@ -63,6 +77,8 @@ func Parse(s string) Instance {
 		return GRPCWeb
 	case "http":
 		return HTTP
+	case "http_proxy":
+		return HTTP_PROXY
 	case "http2":
 		return HTTP2
 	case "https":
@@ -75,6 +91,8 @@ func Parse(s string) Instance {
 		return Redis
 	case "mysql":
 		return MySQL
+	case "DoubleHBONE":
+		return DoubleHBONE
 	}
 
 	return Unsupported
@@ -90,10 +108,15 @@ func (i Instance) IsHTTP2() bool {
 	}
 }
 
+// IsHTTPOrSniffed is true for protocols that use HTTP as transport protocol, or *can* use it if sniffed to be HTTP
+func (i Instance) IsHTTPOrSniffed() bool {
+	return i.IsHTTP() || i.IsUnsupported()
+}
+
 // IsHTTP is true for protocols that use HTTP as transport protocol
 func (i Instance) IsHTTP() bool {
 	switch i {
-	case HTTP, HTTP2, GRPC, GRPCWeb:
+	case HTTP, HTTP2, HTTP_PROXY, GRPC, GRPCWeb:
 		return true
 	default:
 		return false
@@ -120,7 +143,17 @@ func (i Instance) IsTLS() bool {
 	}
 }
 
-// IsGRPC is true for GRCP protocols.
+// IsHTTPS is true if protocol is HTTPS
+func (i Instance) IsHTTPS() bool {
+	switch i {
+	case HTTPS:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsGRPC is true for GRPC protocols.
 func (i Instance) IsGRPC() bool {
 	switch i {
 	case GRPC, GRPCWeb:
@@ -132,4 +165,16 @@ func (i Instance) IsGRPC() bool {
 
 func (i Instance) IsUnsupported() bool {
 	return i == Unsupported
+}
+
+// AfterTLSTermination returns the protocol that will be used if TLS is terminated on the current protocol.
+func (i Instance) AfterTLSTermination() Instance {
+	switch i {
+	case HTTPS:
+		return HTTP
+	case TLS:
+		return TCP
+	default:
+		return i
+	}
 }

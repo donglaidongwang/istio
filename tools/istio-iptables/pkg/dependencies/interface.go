@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,30 +15,22 @@
 package dependencies
 
 import (
-	"net"
-	"os/user"
-)
+	"bytes"
+	"io"
 
-type Cmd string
-
-const (
-	IPTABLES      = "iptables"
-	IPTABLESSAVE  = "iptables-save"
-	IP6TABLES     = "ip6tables"
-	IP6TABLESSAVE = "ip6tables-save"
-	IP            = "ip"
+	istiolog "istio.io/istio/pkg/log"
+	"istio.io/istio/tools/istio-iptables/pkg/constants"
 )
 
 // Dependencies is used as abstraction for the commands used from the operating system
 type Dependencies interface {
-	// GetLocalIP returns the local IP address
-	GetLocalIP() (net.IP, error)
-	// LookupUser returns user, which runs this executable
-	LookupUser() (*user.User, error)
-	// RunOrFail runs a command and panics, if it fails
-	RunOrFail(cmd Cmd, args ...string)
 	// Run runs a command
-	Run(cmd Cmd, args ...string) error
-	// RunQuietlyAndIgnore runs a command quietly and ignores errors
-	RunQuietlyAndIgnore(cmd Cmd, args ...string)
+	Run(log *istiolog.Scope, quietLogging bool, cmd constants.IptablesCmd, iptVer *IptablesVersion, stdin io.ReadSeeker, args ...string) (*bytes.Buffer, error)
+
+	// DetectIptablesVersion consults the available binaries and in-use tables to determine
+	// which iptables variant (legacy, nft, v6, v4) we should use in the current context.
+	// NOTE that this uses existing rules as part of its heuristic when choosing which binary
+	// to use, so detection should typically happen *once-per-netns*, or different results
+	// might be returned on subsequent calls if the rules in the netnamespace have changed.
+	DetectIptablesVersion(ipV6 bool) (IptablesVersion, error)
 }

@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,23 @@
 package util
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"os"
+	"path"
 	"time"
 
-	"go.opencensus.io/stats/view"
+	"istio.io/istio/pkg/env"
+	"istio.io/istio/pkg/file"
 )
 
-// parseCertAndGetExpiryTimestamp parses certificate and returns cert expire time, or return error
-// if fails to parse certificate.
+var k8sInCluster = env.Register("KUBERNETES_SERVICE_HOST", "",
+	"Kubernetes service host, set automatically when running in-cluster")
+
+// ParseCertAndGetExpiryTimestamp parses the first certificate in certByte and returns cert expire
+// time, or return error if fails to parse certificate.
 func ParseCertAndGetExpiryTimestamp(certByte []byte) (time.Time, error) {
 	block, _ := pem.Decode(certByte)
 	if block == nil {
@@ -37,19 +44,47 @@ func ParseCertAndGetExpiryTimestamp(certByte []byte) (time.Time, error) {
 	return cert.NotAfter, nil
 }
 
-// GetMetricsCounterValue returns counter value in float64. For test purpose only.
-func GetMetricsCounterValue(metricName string) (float64, error) {
-	rows, err := view.RetrieveData(metricName)
-	if err != nil {
-		return float64(0), err
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	if len(rows) > 1 {
-		return float64(0), fmt.Errorf("unexpected number of data for view %s: %d",
-			metricName, len(rows))
+// OutputKeyCertToDir output the key and certificate to the given directory.
+// If directory string is empty, return nil.
+func OutputKeyCertToDir(dir string, privateKey, certChain, rootCert []byte) error {
+	var err error
+	if len(dir) == 0 {
+		return nil
 	}
 
-	return rows[0].Data.(*view.SumData).Value, nil
+	certFileMode := os.FileMode(0o600)
+	if k8sInCluster.Get() != "" {
+		// If this is running on k8s, give more permission to the file certs.
+		// This is typically used to share the certs with non-proxy containers in the pod which does not run as root or 1337.
+		// For example, prometheus server could use proxy provisioned certs to scrape application metrics through mTLS.
+		certFileMode = os.FileMode(0o644)
+	}
+	// Depending on the SDS resource to output, some fields may be nil
+	if privateKey == nil && certChain == nil && rootCert == nil {
+		return fmt.Errorf("the input private key, cert chain, and root cert are nil")
+	}
+
+	writeIfNotEqual := func(fileName string, newData []byte) error {
+		if newData == nil {
+			return nil
+		}
+		oldData, _ := os.ReadFile(path.Join(dir, fileName))
+		if !bytes.Equal(oldData, newData) {
+			if err := file.AtomicWrite(path.Join(dir, fileName), newData, certFileMode); err != nil {
+				return fmt.Errorf("failed to write data to file %v: %v", fileName, err)
+			}
+		}
+		return nil
+	}
+
+	if err = writeIfNotEqual("key.pem", privateKey); err != nil {
+		return err
+	}
+	if err = writeIfNotEqual("cert-chain.pem", certChain); err != nil {
+		return err
+	}
+	if err = writeIfNotEqual("root-cert.pem", rootCert); err != nil {
+		return err
+	}
+	return nil
 }

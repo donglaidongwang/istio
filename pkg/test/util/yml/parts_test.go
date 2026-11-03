@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,12 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	"istio.io/istio/pkg/test/util/assert"
 	"istio.io/istio/pkg/test/util/yml"
 )
 
 func TestEmptyDoc(t *testing.T) {
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 
 	yaml := `
 `
@@ -83,8 +84,7 @@ b
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			parts := yml.SplitString(c.doc)
-			g := NewGomegaWithT(t)
-			g.Expect(parts).To(Equal(expected))
+			assert.Equal(t, parts, expected)
 		})
 	}
 }
@@ -103,7 +103,7 @@ b
     b2`,
 	}
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 	parts := yml.SplitString(doc)
 	g.Expect(parts).To(Equal(expected))
 }
@@ -129,7 +129,26 @@ b
 ---
 b`
 
-	g := NewGomegaWithT(t)
+	g := NewWithT(t)
 	doc := yml.JoinString(parts...)
 	g.Expect(doc).To(Equal(expected))
+}
+
+func TestSplitWithLongPart(t *testing.T) {
+	longPartA := ""
+	longPartB := ""
+	for range 70000 {
+		longPartA += "a"
+		longPartB += "b"
+	}
+
+	doc := longPartA + "\n---\n" + longPartB
+
+	parts := yml.SplitString(doc)
+
+	g := NewWithT(t)
+
+	g.Expect(len(parts)).To(Equal(2))
+	g.Expect(parts[0]).To(Equal(longPartA))
+	g.Expect(parts[1]).To(Equal(longPartB))
 }

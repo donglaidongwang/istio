@@ -1,4 +1,4 @@
-// Copyright 2019 Istio Authors
+// Copyright Istio Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,21 +17,25 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/pires/go-proxyproto"
 
+	"istio.io/istio/pkg/test/echo"
 	"istio.io/istio/pkg/test/echo/common"
-	"istio.io/istio/pkg/test/echo/common/response"
 	"istio.io/istio/pkg/test/util/retry"
-	"istio.io/pkg/log"
 )
 
 const (
@@ -39,14 +43,12 @@ const (
 	readyInterval = 2 * time.Second
 )
 
-var (
-	webSocketUpgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			// allow all connections by default
-			return true
-		},
-	}
-)
+var webSocketUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		// allow all connections by default
+		return true
+	},
+}
 
 var _ Instance = &httpInstance{}
 
@@ -61,10 +63,25 @@ func newHTTP(config Config) Instance {
 	}
 }
 
+func (s *httpInstance) GetConfig() Config {
+	return s.Config
+}
+
 func (s *httpInstance) Start(onReady OnReadyFunc) error {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	// Go 1.27: Server.Protocols is authoritative; must set explicitly to serve ALPN "h2" over TLS.
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
+
 	s.server = &http.Server{
+		IdleTimeout: idleTimeout,
 		Handler: &httpHandler{
 			Config: s.Config,
+		},
+		Protocols: protocols,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, ConnContextKey, c)
 		},
 	}
 
@@ -74,31 +91,91 @@ func (s *httpInstance) Start(onReady OnReadyFunc) error {
 	if s.isUDS() {
 		port = 0
 		listener, err = listenOnUDS(s.UDSServer)
+	} else if s.Port.TLS {
+		cert, cerr := tls.LoadX509KeyPair(s.TLSCert, s.TLSKey)
+		if cerr != nil {
+			return fmt.Errorf("could not load TLS keys: %v", cerr)
+		}
+		nextProtos := []string{"h2", "http/1.1", "http/1.0"}
+		if s.DisableALPN {
+			nextProtos = nil
+		}
+		minVersion, err := common.ParseTLSVersion(s.TLSMinVersion)
+		if err != nil {
+			return fmt.Errorf("failed to parse min TLS version: %s", err)
+		}
+		curvePreferences, err := common.ParseTLSCurves(s.TLSCurvePreferences)
+		if err != nil {
+			return fmt.Errorf("failed to parse curve preferences: %s", err)
+		}
+		// nolint: gosec // test only code, TLS version is configurable for testing
+		config := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   nextProtos,
+			GetConfigForClient: func(info *tls.ClientHelloInfo) (*tls.Config, error) {
+				// There isn't a way to pass through all ALPNs presented by the client down to the
+				// HTTP server to return in the response. However, for debugging, we can at least log
+				// them at this level.
+				epLog.Infof("TLS connection with alpn: %v", info.SupportedProtos)
+				return nil, nil
+			},
+			MinVersion:       minVersion,
+			CurvePreferences: curvePreferences,
+		}
+		if s.Port.RequireClientCert {
+			config.ClientAuth = tls.RequireAndVerifyClientCert
+			caCert, err := os.ReadFile(s.TLSCACert)
+			if err != nil {
+				return fmt.Errorf("could not load TLS CA certificate: %v", err)
+			}
+			caCertPool := x509.NewCertPool()
+			if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+				return fmt.Errorf("could not append TLS CA certificate")
+			}
+			config.ClientCAs = caCertPool
+		}
+		// Go 1.27: Protocols is authoritative; http2.ConfigureServer is only called when
+		// TLSConfig is set. Set it here so the server registers TLSNextProto["h2"].
+		s.server.TLSConfig = config
+		// Listen on the given port and update the port if it changed from what was passed in.
+		//nolint:ineffassign,staticcheck // not true, we check all branches for error conditions below
+		listener, port, err = listenOnAddressTLS(s.ListenerIP, s.Port.Port, config)
+		// Store the actual listening port back to the argument.
+		s.Port.Port = port
 	} else {
 		// Listen on the given port and update the port if it changed from what was passed in.
-		listener, port, err = listenOnPort(s.Port.Port)
+		listener, port, err = listenOnAddress(s.ListenerIP, s.Port.Port)
 		// Store the actual listening port back to the argument.
 		s.Port.Port = port
 	}
 
+	// check error for all branches here!
 	if err != nil {
 		return err
 	}
 
 	if s.isUDS() {
-		fmt.Printf("Listening HTTP/1.1 on %v\n", s.UDSServer)
+		epLog.Infof("Listening HTTP/1.1 on %v\n", s.UDSServer)
+	} else if s.Port.TLS {
+		s.server.Addr = fmt.Sprintf(":%d", port)
+		epLog.Infof("Listening HTTPS/1.1 on %v\n", port)
 	} else {
 		s.server.Addr = fmt.Sprintf(":%d", port)
-		fmt.Printf("Listening HTTP/1.1 on %v\n", port)
+		epLog.Infof("Listening HTTP/1.1 on %v\n", port)
+	}
+
+	if s.Port.ProxyProtocol {
+		listener = &proxyproto.Listener{Listener: listener}
 	}
 
 	// Start serving HTTP traffic.
 	go func() {
-		_ = s.server.Serve(listener)
+		err := s.server.Serve(listener)
+		epLog.Warnf("Port %d listener terminated with error: %v", port, err)
 	}()
 
 	// Notify the WaitGroup once the port has transitioned to ready.
-	go s.awaitReady(onReady, port)
+	go s.awaitReady(onReady, listener.Addr().String())
 
 	return nil
 }
@@ -107,7 +184,7 @@ func (s *httpInstance) isUDS() bool {
 	return s.UDSServer != ""
 }
 
-func (s *httpInstance) awaitReady(onReady OnReadyFunc, port int) {
+func (s *httpInstance) awaitReady(onReady OnReadyFunc, address string) {
 	defer onReady()
 
 	client := http.Client{}
@@ -119,15 +196,36 @@ func (s *httpInstance) awaitReady(onReady OnReadyFunc, port int) {
 				return net.Dial("unix", s.UDSServer)
 			},
 		}
+	} else if s.Port.TLS {
+		url = fmt.Sprintf("https://%s", address)
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // nolint: gosec // test only code
+		if s.Port.RequireClientCert {
+			clientCert, err := tls.LoadX509KeyPair(s.TLSCert, s.TLSKey)
+			if err != nil {
+				epLog.Errorf("could not load TLS keys: %v", err)
+			}
+			client.Transport.(*http.Transport).TLSClientConfig.Certificates = []tls.Certificate{clientCert}
+			caCert, err := os.ReadFile(s.TLSCACert)
+			if err != nil {
+				epLog.Errorf("could not load TLS CA certificate: %v", err)
+			}
+			if client.Transport.(*http.Transport).TLSClientConfig.RootCAs == nil {
+				client.Transport.(*http.Transport).TLSClientConfig.RootCAs = x509.NewCertPool()
+			}
+			if ok := client.Transport.(*http.Transport).TLSClientConfig.RootCAs.AppendCertsFromPEM(caCert); !ok {
+				epLog.Errorf("could not append TLS CA certificate: %v", err)
+			}
+		}
 	} else {
-		url = fmt.Sprintf("http://127.0.0.1:%d", port)
+		url = fmt.Sprintf("http://%s", address)
 	}
 
 	err := retry.UntilSuccess(func() error {
-		resp, err := http.Get(url)
+		resp, err := client.Get(url)
 		if err != nil {
 			return err
 		}
+		defer resp.Body.Close()
 
 		// The handler applies server readiness when handling HTTP requests. Since the
 		// server won't become ready until all endpoints (including this one) report
@@ -141,9 +239,9 @@ func (s *httpInstance) awaitReady(onReady OnReadyFunc, port int) {
 	}, retry.Timeout(readyTimeout), retry.Delay(readyInterval))
 
 	if err != nil {
-		log.Errorf("readiness failed for endpoint %s: %v", url, err)
+		epLog.Errorf("readiness failed for endpoint %s: %v", url, err)
 	} else {
-		log.Infof("ready for HTTP endpoint %s", url)
+		epLog.Infof("ready for HTTP endpoint %s", url)
 	}
 }
 
@@ -167,12 +265,21 @@ type codeAndSlices struct {
 }
 
 func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Infof("HTTP Request:\n  Method: %s\n  URL: %v,\n  Host: %s\n  Headers: %v",
-		r.Method, r.URL, r.Host, r.Header)
-
+	h.ReportRequest()
+	id := uuid.New()
+	remoteAddr, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		epLog.Warnf("failed to get host from remote address: %s", err)
+	}
+	epLog.WithLabels("remoteAddr", remoteAddr, "method", r.Method, "url", r.URL, "host", r.Host, "headers", r.Header, "id", id).Infof("%v Request", r.Proto)
+	if h.Port == nil {
+		defer common.Metrics.HTTPRequests.With(common.PortLabel.Value("uds")).Increment()
+	} else {
+		defer common.Metrics.HTTPRequests.With(common.PortLabel.Value(strconv.Itoa(h.Port.Port))).Increment()
+	}
 	if !h.IsServerReady() {
 		// Handle readiness probe failure.
-		log.Infof("HTTP service not ready, returning 503")
+		epLog.Infof("HTTP service not ready, returning 503")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
@@ -180,21 +287,27 @@ func (h *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if common.IsWebSocketRequest(r) {
 		h.webSocketEcho(w, r)
 	} else {
-		h.echo(w, r)
+		h.echo(w, r, id)
 	}
 }
 
 // nolint: interfacer
 func writeError(out *bytes.Buffer, msg string) {
-	log.Warn(msg)
+	epLog.Warn(msg)
 	_, _ = out.WriteString(msg + "\n")
 }
 
-func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request) {
+func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
 	body := bytes.Buffer{}
 
 	if err := r.ParseForm(); err != nil {
 		writeError(&body, "ParseForm() error: "+err.Error())
+	}
+
+	// If the request has form ?delay=[:duration] wait for duration
+	// For example, ?delay=10s will cause the response to wait 10s before responding
+	if err := delayResponse(r); err != nil {
+		writeError(&body, "error delaying response error: "+err.Error())
 	}
 
 	// If the request has form ?headers=name:value[,name:value]* return those headers in response
@@ -205,7 +318,8 @@ func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request) {
 	// If the request has form ?codes=code[:chance][,code[:chance]]* return those codes, rather than 200
 	// For example, ?codes=500:1,200:1 returns 500 1/2 times and 200 1/2 times
 	// For example, ?codes=500:90,200:10 returns 500 90% of times and 200 10% of times
-	if err := setResponseFromCodes(r, w); err != nil {
+	code, err := setResponseFromCodes(r, w)
+	if err != nil {
 		writeError(&body, "codes error: "+err.Error())
 	}
 
@@ -213,9 +327,9 @@ func (h *httpHandler) echo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/text")
 	if _, err := w.Write(body.Bytes()); err != nil {
-		log.Warna(err)
+		epLog.Warn(err)
 	}
-	log.Infof("Response Headers: %+v", w.Header())
+	epLog.WithLabels("code", code, "headers", w.Header(), "id", id).Infof("%v Response", r.Proto)
 }
 
 func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +337,7 @@ func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
 	// First send upgrade headers
 	c, err := webSocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Warn("websocket-echo upgrade failed: " + err.Error())
+		epLog.Warn("websocket-echo upgrade failed: " + err.Error())
 		return
 	}
 
@@ -232,7 +346,7 @@ func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
 	// ping
 	mt, message, err := c.ReadMessage()
 	if err != nil {
-		log.Warn("websocket-echo read failed: " + err.Error())
+		epLog.Warn("websocket-echo read failed: " + err.Error())
 		return
 	}
 
@@ -240,7 +354,7 @@ func (h *httpHandler) webSocketEcho(w http.ResponseWriter, r *http.Request) {
 	h.addResponsePayload(r, &body)
 	body.Write(message)
 
-	writeField(&body, response.StatusCodeField, response.StatusCodeOK)
+	echo.StatusCodeField.Write(&body, strconv.Itoa(http.StatusOK))
 
 	// pong
 	err = c.WriteMessage(mt, body.Bytes())
@@ -257,25 +371,66 @@ func (h *httpHandler) addResponsePayload(r *http.Request, body *bytes.Buffer) {
 		port = strconv.Itoa(h.Port.Port)
 	}
 
-	writeField(body, response.ServiceVersionField, h.Version)
-	writeField(body, response.ServicePortField, port)
-	writeField(body, response.HostField, r.Host)
+	echo.ServiceVersionField.Write(body, h.Version)
+	echo.ServicePortField.Write(body, port)
+	echo.HostField.Write(body, r.Host)
+	// Use raw path, we don't want golang normalizing anything since we use this for testing purposes
+	echo.URLField.Write(body, r.RequestURI)
+	echo.ClusterField.WriteNonEmpty(body, h.Cluster)
+	echo.IstioVersionField.WriteNonEmpty(body, h.IstioVersion)
+	echo.NamespaceField.WriteNonEmpty(body, h.Namespace)
 
-	writeField(body, response.Field("Method"), r.Method)
-	writeField(body, response.Field("URL"), r.URL.String())
-	writeField(body, response.Field("Proto"), r.Proto)
-	writeField(body, response.Field("RemoteAddr"), r.RemoteAddr)
-	writeField(body, response.Field("Method"), r.Method)
+	echo.MethodField.Write(body, r.Method)
+	echo.ProtocolField.Write(body, r.Proto)
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	echo.IPField.Write(body, ip)
 
-	for name, values := range r.Header {
+	if tlsState := requestTLS(r); tlsState != nil {
+		// Note: since this is the NegotiatedProtocol, it will be set to empty if the client sends an ALPN
+		// not supported by the server (ie one of h2,http/1.1,http/1.0)
+		echo.AlpnField.WriteNonEmpty(body, tlsState.NegotiatedProtocol)
+		echo.SNIField.WriteNonEmpty(body, tlsState.ServerName)
+		// If the client cert is present, write the subject to the response
+		if len(tlsState.PeerCertificates) > 0 {
+			echo.ClientCertSubjectField.WriteNonEmpty(body, tlsState.PeerCertificates[0].Subject.String())
+			echo.ClientCertSerialNumberField.WriteNonEmpty(body, tlsState.PeerCertificates[0].SerialNumber.String())
+		}
+	}
+
+	if conn := GetConn(r); conn != nil {
+		if p, ok := conn.(*proxyproto.Conn); ok && p.ProxyHeader() != nil {
+			echo.ProxyProtocolField.Write(body, fmt.Sprint(p.ProxyHeader().Version))
+		}
+	}
+	var keys []string
+	for k := range r.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		values := r.Header[key]
 		for _, value := range values {
-			writeField(body, response.Field(name), value)
+			echo.RequestHeaderField.WriteKeyValue(body, key, value)
 		}
 	}
 
 	if hostname, err := os.Hostname(); err == nil {
-		writeField(body, response.HostnameField, hostname)
+		echo.HostnameField.Write(body, hostname)
 	}
+}
+
+func delayResponse(request *http.Request) error {
+	d := request.FormValue("delay")
+	if len(d) == 0 {
+		return nil
+	}
+
+	t, err := time.ParseDuration(d)
+	if err != nil {
+		return err
+	}
+	time.Sleep(t)
+	return nil
 }
 
 func setHeaderResponseFromHeaders(request *http.Request, response http.ResponseWriter) error {
@@ -292,24 +447,27 @@ func setHeaderResponseFromHeaders(request *http.Request, response http.ResponseW
 		}
 		name := parts[0]
 		value := parts[1]
-		response.Header().Set(name, value)
+		// Avoid using .Set() to allow users to pass non-canonical forms
+		response.Header()[name] = []string{value}
 	}
 	return nil
 }
 
-func setResponseFromCodes(request *http.Request, response http.ResponseWriter) error {
+func setResponseFromCodes(request *http.Request, response http.ResponseWriter) (int, error) {
 	responseCodes := request.FormValue("codes")
 
 	codes, err := validateCodes(responseCodes)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	// Choose a random "slice" from a pie
-	var totalSlices = 0
+	totalSlices := 0
 	for _, flavor := range codes {
 		totalSlices += flavor.slices
 	}
+	// nolint: gosec
+	// Test only code
 	slice := rand.Intn(totalSlices)
 
 	// What flavor is that slice?
@@ -323,9 +481,8 @@ func setResponseFromCodes(request *http.Request, response http.ResponseWriter) e
 		position += flavor.slices
 	}
 
-	log.Infof("Response status code: %d", responseCode)
 	response.WriteHeader(responseCode)
-	return nil
+	return responseCode, nil
 }
 
 // codes must be comma-separated HTTP response code, colon, positive integer
@@ -382,4 +539,48 @@ func validateCodeAndSlices(codecount string) (codeAndSlices, error) {
 	}
 
 	return codeAndSlices{n, count}, nil
+}
+
+type contextKey struct {
+	key string
+}
+
+var ConnContextKey = &contextKey{"http-conn"}
+
+func GetConn(r *http.Request) net.Conn {
+	v, ok := r.Context().Value(ConnContextKey).(net.Conn)
+	if ok {
+		return v
+	}
+	return nil
+}
+
+type connectionStater interface {
+	ConnectionState() tls.ConnectionState
+}
+
+// requestTLS returns the TLS state for r.
+// Go 1.27's HTTP/2 server only sets Request.TLS when :scheme is "https". Envoy TLS
+// origination of an HTTP request keeps :scheme=http, so fall back to the connection
+// stored in ConnContext.
+func requestTLS(r *http.Request) *tls.ConnectionState {
+	if r.TLS != nil {
+		return r.TLS
+	}
+	return connTLS(GetConn(r))
+}
+
+func connTLS(conn net.Conn) *tls.ConnectionState {
+	for conn != nil {
+		if p, ok := conn.(*proxyproto.Conn); ok {
+			conn = p.Raw()
+			continue
+		}
+		if tc, ok := conn.(connectionStater); ok {
+			cs := tc.ConnectionState()
+			return &cs
+		}
+		return nil
+	}
+	return nil
 }
